@@ -4,6 +4,7 @@ const form = document.getElementById('chatForm');
 const input = document.getElementById('chatInput');
 const sendBtn = document.getElementById('sendBtn');
 const suggestions = document.getElementById('suggestions');
+const quickReplies = document.getElementById('quickReplies');
 const clearBtn = document.getElementById('clearBtn');
 const lookupDropdown = document.getElementById('lookupDropdown');
 const flowBar = document.getElementById('flowBar');
@@ -52,6 +53,7 @@ const LOOKUP_ENDPOINTS = {
   pickup: '/api/pickups',
   transfer: '/api/transfers',
   sightseeing: '/api/sightseeing',
+  restaurant: '/api/restaurants',
   vehicle: '/api/vehicles',
 };
 const LOOKUP_EMPTY_TEXT = {
@@ -60,6 +62,7 @@ const LOOKUP_EMPTY_TEXT = {
   pickup: 'No matching pickup/drop-off points found',
   transfer: 'No matching transfers found',
   sightseeing: 'No matching sightseeing options found',
+  restaurant: 'No matching restaurants found',
   vehicle: 'No matching vehicle types found',
 };
 let currentExpecting = null; // { field, params } | null
@@ -75,10 +78,12 @@ function lookupItemLabel(item) {
 
 function lookupItemSub(item) {
   // Agents show a phone number; hotels show their destination; vehicles show their seating
-  // capacity. Pickup/drop-off points and transfers (code already in the main label) show nothing.
+  // capacity; restaurants show their address. Pickup/drop-off points and transfers (code already
+  // in the main label) show nothing.
   if (item.Phone) return item.Phone;
   if (item.Destination) return item.Destination;
   if (item.Capacity != null) return `Capacity: ${item.Capacity}`;
+  if (item.Address) return item.Address;
   return '';
 }
 
@@ -341,6 +346,42 @@ function addDataToggle(wrap, rows, rowCount, rowsTruncated) {
   wrap.appendChild(btn);
 }
 
+// Tap-to-answer shortcuts for a guided-flow step (see quickRepliesFor() in src/chat.js) - same
+// chip look as the fixed suggestions row, but populated per-response from data.quickReplies.
+const QUICK_REPLY_ICONS = {
+  Skip: '⏭️',
+  'Breakfast included': '🍳',
+  'No breakfast': '🚫',
+  'Single sharing': '🛏️',
+  'Double sharing': '🛏️',
+  'Triple sharing': '🛏️',
+};
+
+function renderQuickReplies(list) {
+  if (!list || list.length === 0) {
+    quickReplies.style.display = 'none';
+    quickReplies.innerHTML = '';
+    return;
+  }
+  quickReplies.innerHTML = list
+    .map((text) => `<button type="button" class="chip" data-icon="${QUICK_REPLY_ICONS[text] || '✅'}">${escapeHtml(text)}</button>`)
+    .join('');
+  quickReplies.style.display = 'flex';
+}
+
+// Fills the input rather than sending immediately - these chips cover just ONE of several
+// optional fields the step accepts in a single message, so picking one shouldn't cut off a chance
+// to also type/add the others (e.g. click "Double sharing", then still add "2 adults" before
+// sending). Appends to whatever's already typed instead of overwriting it.
+quickReplies.addEventListener('click', (e) => {
+  const el = e.target.closest('.chip');
+  if (!el) return;
+  const text = el.textContent;
+  input.value = input.value.trim() ? `${input.value.trim()}, ${text}` : text;
+  updateCharCount();
+  input.focus();
+});
+
 function addLoading() {
   const wrap = document.createElement('div');
   wrap.className = 'msg bot';
@@ -365,6 +406,7 @@ async function sendMessage(text) {
   updateCharCount();
   sendBtn.disabled = true;
   suggestions.style.display = 'none';
+  renderQuickReplies(null);
   setExpecting(null);
   const loadingEl = addLoading();
 
@@ -383,6 +425,7 @@ async function sendMessage(text) {
     const { wrap } = addMessage('bot', renderMarkdown(data.answer || ''));
     addDataToggle(wrap, data.rows, data.rowCount, data.rowsTruncated);
     setExpecting(data.expecting || null);
+    renderQuickReplies(data.quickReplies || null);
     setFlowActive(!!data.flowActive);
     if (data.expecting) input.focus();
   } catch (err) {
@@ -421,6 +464,7 @@ cancelFlowBtn.addEventListener('click', async () => {
   } finally {
     setFlowActive(false);
     setExpecting(null);
+    renderQuickReplies(null);
     suggestions.style.display = 'flex';
     input.focus();
   }
@@ -452,12 +496,26 @@ suggestions.addEventListener(
   { passive: false }
 );
 
+// Same horizontal-scroll-via-wheel support as the suggestions row above, for quickReplies.
+quickReplies.addEventListener(
+  'wheel',
+  (e) => {
+    if (e.deltaX !== 0) return;
+    const maxScroll = quickReplies.scrollWidth - quickReplies.clientWidth;
+    if (maxScroll <= 0) return;
+    e.preventDefault();
+    quickReplies.scrollLeft += e.deltaY;
+  },
+  { passive: false }
+);
+
 clearBtn.addEventListener('click', () => {
   sessionId = 'sess-' + Math.random().toString(36).slice(2) + Date.now();
   localStorage.setItem('flythai_session_id', sessionId);
   messagesInner.innerHTML = '';
   addMessage('bot', 'Started a new chat. What would you like to know?');
   suggestions.style.display = 'flex';
+  renderQuickReplies(null);
   setExpecting(null);
   setFlowActive(false);
   input.value = '';

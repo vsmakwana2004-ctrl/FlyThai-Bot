@@ -165,6 +165,26 @@ function computeDayNumber(itemDateStr, travelDateStr) {
   return diffDays >= 1 ? diffDays : 1;
 }
 
+// An itinerary item's date must fall within the trip itself - date/pickup/etc checks only verified
+// "is this a real calendar date", so a date before the travel date (or after the return date, when
+// known) was silently accepted and then silently clamped to Day 1 by computeDayNumber above,
+// masking the mistake instead of catching it. Reproduced live: editing an existing FT... booking
+// (travel 25-12-2026 / return 28-12-2026) and adding a sightseeing item dated 24-12-2026 - before
+// the trip even starts - was accepted with no warning.
+function validateItineraryItemDate(dateStr, draft) {
+  const itemDate = parseDateDDMMYYYY(dateStr);
+  if (!itemDate) return 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?';
+  const travelDate = parseDateDDMMYYYY(draft.fields.travelDate);
+  if (travelDate && itemDate < travelDate) {
+    return `That date is before the trip's travel date (${draft.fields.travelDate}) — could you re-enter it?`;
+  }
+  const returnDate = parseDateDDMMYYYY(draft.fields.returnDate);
+  if (returnDate && itemDate > returnDate) {
+    return `That date is after the trip's return date (${draft.fields.returnDate}) — could you re-enter it?`;
+  }
+  return null;
+}
+
 function formatDest(d) {
   return d.ShortCode ? `${d.Name} (${d.ShortCode})` : d.Name;
 }
@@ -446,12 +466,15 @@ async function stepHotelCollect(draft, userMessage) {
         h._resolvedHotelId = found.length === 1 ? found[0].Id : 0;
         break;
       }
-      case 'checkInDate':
-        if (!parseDateDDMMYYYY(answer)) {
-          return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-        }
+      case 'checkInDate': {
+        // Same trip-range check as itinerary items (see validateItineraryItemDate) - this field
+        // previously only checked "is this a real calendar date", so a check-in before the trip's
+        // travel date (or even in the past) was silently accepted.
+        const err = validateItineraryItemDate(answer, draft);
+        if (err) return { reply: err, draft };
         h.checkInDate = answer;
         break;
+      }
       case 'checkOutDate': {
         const checkOut = parseDateDDMMYYYY(answer);
         if (!checkOut) {
@@ -459,6 +482,10 @@ async function stepHotelCollect(draft, userMessage) {
         }
         if (checkOut <= parseDateDDMMYYYY(h.checkInDate)) {
           return { reply: 'Check-out date must be after check-in date — could you re-enter it?', draft };
+        }
+        const returnDate = parseDateDDMMYYYY(draft.fields.returnDate);
+        if (returnDate && checkOut > returnDate) {
+          return { reply: `Check-out date can't be after the trip's return date (${draft.fields.returnDate}) — could you re-enter it?`, draft };
         }
         h.checkOutDate = answer;
         break;
@@ -646,6 +673,7 @@ function startItineraryEditDraft(raw, code, guestName) {
     phase: 'itineraryChoice',
     fields: {
       travelDate: isoToDDMMYYYY(raw.travelDate),
+      returnDate: isoToDDMMYYYY(raw.returnDate),
       currency: raw.currency || 'THB',
       guestAdults: raw.guestAdults,
       guestChildrens: raw.guestChildrens,
@@ -776,12 +804,12 @@ async function stepTransferCollect(draft, userMessage) {
     if (!res.resolved) return { reply: res.reply, draft };
   } else {
     switch (draft.itemStep) {
-      case 'date':
-        if (!parseDateDDMMYYYY(answer)) {
-          return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-        }
+      case 'date': {
+        const err = validateItineraryItemDate(answer, draft);
+        if (err) return { reply: err, draft };
         t.date = answer;
         break;
+      }
       case 'pickupPointName':
       case 'dropOffPointName':
       case 'transferName':
@@ -924,12 +952,12 @@ async function stepSightseeingCollect(draft, userMessage) {
     if (!res.resolved) return { reply: res.reply, draft };
   } else {
     switch (draft.itemStep) {
-      case 'date':
-        if (!parseDateDDMMYYYY(answer)) {
-          return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-        }
+      case 'date': {
+        const err = validateItineraryItemDate(answer, draft);
+        if (err) return { reply: err, draft };
         s.date = answer;
         break;
+      }
       case 'time':
         if (!parseTimeHHMM(answer)) {
           return { reply: 'That needs to be a real 24-hour time in HH:MM format (e.g. "09:30") — could you re-enter it?', draft };
@@ -1033,9 +1061,8 @@ async function stepLeisureDayCollect(draft, userMessage) {
     draft.phase = 'itineraryChoice';
     return { reply: `Okay, not adding a leisure day. ${askItineraryChoice()}`, draft };
   }
-  if (!parseDateDDMMYYYY(answer)) {
-    return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-  }
+  const dateErr = validateItineraryItemDate(answer, draft);
+  if (dateErr) return { reply: dateErr, draft };
 
   draft.itineraryItems.push({
     type: 'sightseeing',
@@ -1096,12 +1123,12 @@ async function stepRestaurantCollect(draft, userMessage) {
     if (!res.resolved) return { reply: res.reply, draft };
   } else {
     switch (draft.itemStep) {
-      case 'date':
-        if (!parseDateDDMMYYYY(answer)) {
-          return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-        }
+      case 'date': {
+        const err = validateItineraryItemDate(answer, draft);
+        if (err) return { reply: err, draft };
         r.date = answer;
         break;
+      }
       case 'restaurantName': {
         const res = await resolveSequentialLookup(r, 'restaurantName', '_restaurantNameRow', findRestaurant, 'restaurant', answer);
         if (!res.resolved) return { reply: res.reply, draft };
@@ -1447,20 +1474,28 @@ function buildModel(draft) {
     dinnerRemarks: '',
     currency: f.currency || 'THB',
     memberDetails: draft.members,
-    roerate: draft.priceFields.roeRate || '',
-    roecharge: draft.priceFields.roeCharge || '',
-    taxAmount: draft.priceFields.taxAmount || '',
-    taxPercentage: draft.priceFields.taxPercentage || '',
+    // roeRate/roeCharge/taxAmount/taxPercentage/invoiceDiscount are extracted freeform by the LLM
+    // (priceExtrasSystemPrompt), which returns numbers, not strings - unlike LandSelling just below
+    // (already String()'d), these were passed straight through. Reproduced live: a booking with
+    // real values here ("ROE rate 2.5, tax 500, ...") got a bare 500 from the real API with an
+    // empty body - the same "server 500s on a number where it wants a string" failure mode already
+    // seen and fixed elsewhere in this file (pax/price, hotel/itinerary item ids).
+    roerate: draft.priceFields.roeRate != null ? String(draft.priceFields.roeRate) : '',
+    roecharge: draft.priceFields.roeCharge != null ? String(draft.priceFields.roeCharge) : '',
+    taxAmount: draft.priceFields.taxAmount != null ? String(draft.priceFields.taxAmount) : '',
+    taxPercentage: draft.priceFields.taxPercentage != null ? String(draft.priceFields.taxPercentage) : '',
     LandSelling: draft.priceFields.landSelling != null ? String(draft.priceFields.landSelling) : '0',
     LandSellingCurrency: f.currency || 'THB',
     invoiceDueDate: draft.priceFields.invoiceDueDate || '',
-    invoiceDiscount: draft.priceFields.invoiceDiscount || '',
+    invoiceDiscount: draft.priceFields.invoiceDiscount != null ? String(draft.priceFields.invoiceDiscount) : '',
     selfBookedHotel: !!draft.hotelSelfBooked,
     selfBookedItineary: !!draft.itinerarySelfBooked,
     guestName: f.guestName,
     guestPhoneNumber: f.guestPhoneNumber,
     TotalAdults: String(f.guestAdults || 0),
-    emergencyContact: draft.extraFields.emergencyContact || null,
+    // Also LLM-extracted (extraSystemPrompt) - a bare digit string can come back as a JSON number,
+    // same failure mode as roerate/taxAmount above.
+    emergencyContact: draft.extraFields.emergencyContact != null ? String(draft.extraFields.emergencyContact) : null,
     bookingBy: draft.extraFields.bookingBy || '',
     HotelIds: '',
     ItinearyIds: '',

@@ -176,6 +176,19 @@ async function findRestaurant(nameQuery) {
   return result.recordset;
 }
 
+// Wider, typeahead-style listing for the chat UI's live restaurant-name dropdown (mirrors
+// listPickups/listSightseeings) - without this, restaurant name was the one itinerary-item field
+// with no dropdown, so a user with no way to know real restaurant names just kept guessing wrong
+// ones and getting "I couldn't find a restaurant matching ..." on repeat.
+async function listRestaurants(nameQuery = '') {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('q', `%${nameQuery}%`)
+    .query(`SELECT TOP 20 Id, Name, Address FROM RestaurantMaster WHERE IsDelete = 0 AND Name LIKE @q ORDER BY Name`);
+  return result.recordset;
+}
+
 // Full option lists for fields the real site shows as a fixed dropdown/checkbox set (not a
 // type-ahead search over a huge table) - small enough to just show all of, up front.
 async function listDestinations() {
@@ -204,6 +217,7 @@ module.exports = {
   listSightseeings,
   findVehicle,
   findRestaurant,
+  listRestaurants,
   listDestinations,
   listVehicles,
 };

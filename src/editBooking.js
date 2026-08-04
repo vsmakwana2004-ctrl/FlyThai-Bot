@@ -34,13 +34,24 @@ function detectSimpleFieldEditIntent(text, lastBookingCode) {
   return { code, field: field.key, label: field.label, value };
 }
 
-const ITINERARY_EDIT_RE = /\badd\b[\s\S]*\b(itinerary|transfer|restaurant)\b/i;
+// Verb list was just "add" - missed "edit itinerary of FTQ..."/"update the itinerary for FT..."
+// even though that's exactly what this flow does (the only way to "edit" an itinerary here is by
+// adding new items - there's no remove/modify-existing yet). Noun list now also covers sightseeing/
+// leisure (added as itinerary item types later, but never added here) and common misspellings of
+// "itinerary" - "itineary" is literally how the real DB/API spell it (BookingItineary,
+// itinearyDetails), and "itenary"/"itinery" are common everyday typos.
+const ITINERARY_EDIT_RE = /\b(add|append|edit|update|modify|change)\b[\s\S]*\b(itinerary|itineary|itenary|itinery|transfer|sight ?seeing|restaurant|leisure)\b/i;
 
-// Detects "add itinerary to FTQ...", "add a transfer to FT...". Deliberately distinct from
-// bookingFlow.js's own create-intent detection - EXISTING_CODE_RE there already means "a message
-// naming a real code is about THAT record, never a new one", so this only ever fires alongside a
-// real, resolvable code.
+// Detects "add itinerary to FTQ...", "edit the itinerary for FT...", "add a transfer to FT...".
+// Deliberately distinct from bookingFlow.js's own create-intent detection - EXISTING_CODE_RE there
+// already means "a message naming a real code is about THAT record, never a new one", so this only
+// ever fires alongside a real, resolvable code.
 function detectItineraryEditIntent(text, lastBookingCode) {
+  // "update/change the ITINERARY STATUS of FT..." is a completely different, already-working
+  // feature (statusUpdate.js) - broadening the verb list above to include update/change/edit made
+  // it collide with that phrasing (itinerary is one of the 5 real status types), so bail out
+  // whenever "status" appears anywhere in the message rather than trying to out-guess word order.
+  if (/\bstatus\b/i.test(text)) return null;
   if (!ITINERARY_EDIT_RE.test(text)) return null;
   const codeMatch = text.match(CODE_RE);
   const code = codeMatch ? codeMatch[0].toUpperCase() : lastBookingCode;

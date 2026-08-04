@@ -301,6 +301,24 @@ function expectingField(draft) {
       return { field: 'sightseeing', params: weekday ? { weekday } : {} };
     }
   }
+  // Add Restaurant step - was the one itinerary-item field with no dropdown at all, so a wrong
+  // guess just repeated "couldn't find a restaurant matching ..." with no way to discover a real
+  // name, reading as a stuck loop.
+  if (draft && draft.phase === 'restaurantCollect' && draft.itemStep === 'restaurantName') {
+    return { field: 'restaurant' };
+  }
+  return null;
+}
+
+// Tap-to-answer shortcuts for steps that are otherwise a single free-text message covering several
+// optional fields at once ("breakfast option, adults/children/infants staying, currency..."). The
+// user still CAN type a longer answer - these are just common one-line answers rendered as chips
+// above the input, same idea as the lookup dropdowns above but for LLM-extracted free-text steps
+// rather than a DB-backed field. Clicking one sends its exact text, same as typing it.
+function quickRepliesFor(draft) {
+  if (draft && draft.phase === 'hotelOptionalCollect') {
+    return ['Skip', 'Breakfast included', 'No breakfast', 'Single sharing', 'Double sharing', 'Triple sharing'];
+  }
   return null;
 }
 
@@ -520,7 +538,7 @@ async function handleChatInner(sessionId, userMessage) {
     const { reply, draft } = await bookingFlow.step(session.draft, userMessage);
     session.draft = draft;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft) };
+    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
   }
 
   // A "shall I create one?" question was asked last turn — this message answers it.
@@ -532,7 +550,7 @@ async function handleChatInner(sessionId, userMessage) {
       const { reply, draft } = await bookingFlow.step(newDraft, originalMessage);
       session.draft = draft;
       pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft) };
+      return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
     }
     // Anything that isn't a clear "yes" simply falls through and is answered as a normal question -
     // so a mis-detected create intent costs the user one extra line, never a stuck conversation.
@@ -553,7 +571,7 @@ async function handleChatInner(sessionId, userMessage) {
     const { reply, draft } = await bookingFlow.step(newDraft, userMessage);
     session.draft = draft;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft) };
+    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
   }
 
   // Or a request to change one of a booking's status dropdowns (Travel/Invoice/Voucher/

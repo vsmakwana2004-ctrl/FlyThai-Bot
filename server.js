@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { handleChat, cancelFlows } = require('./src/chat');
-const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listVehicles } = require('./src/lookups');
+const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles } = require('./src/lookups');
 
 const app = express();
 app.use(cors());
@@ -143,6 +143,18 @@ app.get('/api/vehicles', async (req, res) => {
     const all = await listVehicles();
     const vehicles = q ? all.filter((v) => v.Name.toLowerCase().includes(q)) : all;
     res.json({ vehicles });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong: ' + err.message });
+  }
+});
+
+// Powers the live Restaurant Name dropdown during Add Restaurant itinerary collection.
+app.get('/api/restaurants', async (req, res) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const restaurants = await listRestaurants(q);
+    res.json({ restaurants });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong: ' + err.message });

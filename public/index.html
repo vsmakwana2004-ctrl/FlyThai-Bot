@@ -53,6 +53,11 @@
             <button class="chip" data-icon="📝">Create a new quotation</button>
           </div>
 
+          <!-- Tap-to-answer shortcuts for a guided-flow step (e.g. the hotel optional-details
+               question) - populated from data.quickReplies, same chip look as the suggestions
+               above but driven by the current step instead of being fixed. -->
+          <div class="suggestions" id="quickReplies" style="display:none"></div>
+
           <div class="flow-bar" id="flowBar" style="display:none">
             <span class="flow-bar-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
