@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fly Thai — AI Assistant</title>
+<!-- Same favicon the booking site serves, so the chatbot tab sits next to it looking like one product. -->
+<link rel="icon" type="image/png" href="img/favicon.png" />
+<link rel="apple-touch-icon" href="img/favicon.png" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="layout" id="layout">
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <img class="brand-logo" src="img/flythai_logo.png" alt="Fly Thai — Destination Management Company" />
+          <span class="brand-divider" aria-hidden="true"></span>
+          <span class="brand-sub"><span class="status-dot"></span><span class="brand-sub-text">AI Database Assistant</span></span>
+        </div>
+
+        <button id="clearBtn" class="clear-btn" title="Clear conversation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          <span>New Chat</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="chat-wrap">
+      <div id="messages" class="messages">
+        <div id="messagesInner" class="messages-inner">
+          <div class="msg bot">
+            <div class="msg-content">
+              <div class="bubble">
+                <div class="welcome-body"><b>Welcome!</b> I'm FlyThai Bot. Ask me anything about Quotations, Bookings, Hotels, Job Sheets, Accounts, or Agents — for example <b>"Show me the details of FTQ05260001"</b> or <b>"List today's upcoming bookings"</b>. I can also <b>create a new booking or quotation</b> for you — just say so and I'll ask for the details.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-bottom">
+        <div class="chat-bottom-inner">
+          <div class="suggestions" id="suggestions">
+            <button class="chip" data-icon="🔎">Show me details of FTQ05260001</button>
+            <button class="chip" data-icon="📅">List today's upcoming bookings</button>
+            <button class="chip" data-icon="💳">Show all pending payments</button>
+            <button class="chip" data-icon="📊">How many quotations were made this month</button>
+            <button class="chip" data-icon="✈️">Create a new booking</button>
+            <button class="chip" data-icon="📝">Create a new quotation</button>
+          </div>
+
+          <div class="flow-bar" id="flowBar" style="display:none">
+            <span class="flow-bar-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" /><path d="M12 8v4M12 16h.01" />
+              </svg>
+            </span>
+            <span class="flow-bar-text">A guided step is in progress — answer the question above, or</span>
+            <button type="button" id="cancelFlowBtn" class="cancel-flow-btn">Cancel it</button>
+          </div>
+
+          <div class="input-wrap">
+            <div id="lookupDropdown" class="lookup-dropdown" style="display:none"></div>
+            <form id="chatForm" class="input-bar">
+              <input id="chatInput" type="text" autocomplete="off" maxlength="2000" placeholder="Ask anything about your bookings, quotations, hotels…" />
+              <button type="submit" id="sendBtn" title="Send">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4 20-7Z" />
+                </svg>
+                <span class="send-label">Send</span>
+              </button>
+            </form>
+            <div id="charCount" class="char-count" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Full record view for "Show records" - a real side-by-side panel, not an overlay. Opening it
+       shrinks .app to the left half and this takes the right half (see .layout.split in
+       style.css); closing it returns .app to full width. Nothing dims or covers the chat. -->
+  <aside id="dataDrawer" class="data-drawer" aria-hidden="true">
+    <div class="data-drawer-header">
+      <span id="dataDrawerTitle" class="data-drawer-title"></span>
+      <button type="button" id="dataDrawerClose" class="data-drawer-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <div id="dataDrawerBody" class="data-drawer-body"></div>
+  </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,740 @@
+/* ==========================================================================
+   FlyThai AI Assistant — UI theme
+   Full-bleed layout: the page IS the app. No floating card, no nested boxes.
+   Content sits in one generous centred reading column; the header, divider
+   and composer run the full width of the viewport.
+   ========================================================================== */
+
+:root {
+  --green-900: #0d3b24;
+  --green-800: #14532d;
+  --green-700: #19693c;
+  --green-600: #1e7d4b;   /* brand green, same as the site's active nav pill */
+  --green-500: #27965b;
+
+  --mint-50:  #f5faf7;
+  --mint-100: #eaf5ef;
+
+  --page: #fcfdfc;
+
+  --ink: #16261f;
+  --muted: #7b8b83;
+
+  --border: #e6ede9;
+  --border-soft: #f0f5f2;
+
+  --danger: #b3261e;
+  --amber-bg: #fff9ee;
+  --amber-border: #f2e0bb;
+  --amber-ink: #7a5c18;
+
+  /* One reading column, shared by the messages and the composer so they line
+     up exactly. */
+  --column: 880px;
+  --gutter: 40px;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: var(--ink);
+  background: var(--page);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* .layout holds .app (the chat) and #dataDrawer (the record panel) side by side. Only .layout
+   grows to the viewport height/width; .app itself just shrinks its flex-basis when the drawer
+   opens; nothing about the chat's own internal layout needs to know the drawer exists. */
+.layout {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app {
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  transition: flex-basis 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* --- header -------------------------------------------------------------- */
+
+.topbar {
+  flex: none;
+  background: #fff;
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar-inner {
+  max-width: var(--column);
+  margin: 0 auto;
+  padding: 20px var(--gutter);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* The real wordmark served by the booking site (dist/img/flythai_logo.png), not a font imitation -
+   it already contains the palm and the "Destination Management Company" line. Height is fixed and
+   width auto so the artwork's own proportions are never distorted. */
+.brand-logo {
+  flex: none;
+  height: 46px;
+  width: auto;
+  display: block;
+}
+
+.brand-divider {
+  flex: none;
+  width: 1px;
+  height: 30px;
+  background: var(--border);
+}
+
+/* overflow/ellipsis lives on .brand-sub-text only, not here - .status-dot's pulse ring expands
+   several px beyond its own box (see @keyframes pulse below), and clipping THIS container cut the
+   glow off flush against the dot. Truncating just the text keeps that ring fully visible. */
+.brand-sub {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  min-width: 0;
+}
+.brand-sub-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.status-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green-500);
+  animation: pulse 2.4s infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(39, 150, 91, 0.5); }
+  70%  { box-shadow: 0 0 0 7px rgba(39, 150, 91, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(39, 150, 91, 0); }
+}
+
+.clear-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 18px;
+  font-size: 13.5px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--green-700);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+.clear-btn svg { width: 15px; height: 15px; }
+.clear-btn:hover {
+  background: var(--mint-100);
+  border-color: var(--green-500);
+  color: var(--green-800);
+}
+
+/* --- message area -------------------------------------------------------- */
+
+.chat-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Scrolls full-bleed so the scrollbar sits at the true right edge of the
+   window; the reading column lives one level in, on .messages-inner. */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: #d7e4dc transparent;
+}
+.messages::-webkit-scrollbar { width: 10px; }
+.messages::-webkit-scrollbar-thumb {
+  background: #d7e4dc;
+  border-radius: 999px;
+  border: 3px solid var(--page);
+}
+.messages::-webkit-scrollbar-thumb:hover { background: #bcd3c6; }
+
+.messages-inner {
+  max-width: var(--column);
+  width: 100%;
+  margin: 0 auto;
+  padding: 44px var(--gutter) 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+}
+
+.chat-bottom {
+  flex: none;
+  background: #fff;
+  border-top: 1px solid var(--border);
+}
+
+.chat-bottom-inner {
+  max-width: var(--column);
+  width: 100%;
+  margin: 0 auto;
+  padding: 20px var(--gutter) 26px;
+}
+
+/* --- messages ------------------------------------------------------------ */
+
+.msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  animation: msgIn 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.msg.user { justify-content: flex-end; }
+
+/* Assistant avatar — the site's own palm favicon, on white so the green artwork reads. Still a
+   pseudo-element, so app.js keeps building plain markup. */
+.msg.bot::before {
+  content: '';
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #fff url('img/favicon.png') center / 21px 21px no-repeat;
+  border: 1px solid var(--border);
+}
+
+.msg-content {
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+.msg.user .msg-content { align-items: flex-end; max-width: 76%; }
+
+.bubble {
+  line-height: 1.72;
+  font-size: 15px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+/* The assistant speaks on the page itself — no container, no border. That is
+   what removes the "boxes inside boxes" feel while keeping the reading rhythm. */
+/* 3px nudges the first text line's optical centre onto the 32px avatar's
+   centre, so the badge and the opening line read as one row. */
+.msg.bot .bubble {
+  padding: 3px 0 0;
+  color: var(--ink);
+}
+
+/* Only the user's own words get a surface, so the two voices stay distinct. */
+.msg.user .bubble {
+  padding: 13px 20px;
+  border-radius: 20px 20px 6px 20px;
+  background: linear-gradient(135deg, var(--green-600), var(--green-800));
+  color: #fff;
+}
+
+/* .bubble is pre-wrap so server replies keep their line breaks. The static
+   welcome copy is authored as indented HTML instead, so it opts back out —
+   otherwise the markup's own newlines and indentation render as blank space.
+   The greeting deliberately stays in the body face at body size: a display
+   script heading here sat in its own oversized line box and never lined up
+   with the avatar, whatever line-height it was given. */
+.welcome-body { white-space: normal; }
+
+.msg-heading {
+  font-weight: 700;
+  color: var(--green-800);
+  margin: 20px 0 6px;
+  letter-spacing: -0.2px;
+  line-height: 1.35;
+}
+.msg-heading:first-child { margin-top: 0; }
+.msg-heading-1 { font-size: 20px; }
+.msg-heading-2 { font-size: 17.5px; }
+.msg-heading-3 { font-size: 16px; }
+.msg.user .msg-heading { color: #fff; }
+
+.bubble ul {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.bubble li { margin: 5px 0; }
+
+.bubble code {
+  font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  font-size: 13px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--mint-100);
+  color: var(--green-800);
+}
+.msg.user .bubble code {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
+.bubble table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  margin: 14px 0;
+  font-size: 13.5px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.bubble th, .bubble td {
+  border-bottom: 1px solid var(--border-soft);
+  padding: 10px 14px;
+  text-align: left;
+}
+.bubble th {
+  background: var(--mint-50);
+  color: var(--green-800);
+  font-weight: 700;
+}
+.bubble tr:last-child td { border-bottom: none; }
+
+.bubble a {
+  color: var(--green-700);
+  font-weight: 600;
+  text-underline-offset: 3px;
+}
+.msg.user .bubble a { color: #fff; text-decoration-color: rgba(255, 255, 255, 0.6); }
+
+/* --- expandable record table -------------------------------------------- */
+
+.show-more-btn {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  color: var(--green-700);
+  padding: 9px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+.show-more-btn:hover {
+  background: var(--mint-100);
+  border-color: var(--green-500);
+}
+/* Signals the click opens a separate panel now, not an inline expand. */
+.show-more-btn::after {
+  content: '⤢';
+  font-size: 12px;
+}
+
+.data-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+}
+.data-table-wrap table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.data-table-wrap th, .data-table-wrap td {
+  border-bottom: 1px solid var(--border-soft);
+  padding: 11px 16px;
+  text-align: left;
+}
+.data-table-wrap th {
+  background: var(--mint-50);
+  color: var(--green-800);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-size: 11px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.data-table-wrap tbody tr:hover { background: var(--mint-50); }
+.data-table-wrap tbody tr:last-child td { border-bottom: none; }
+
+.data-table-note {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 10px 2px 0;
+}
+
+/* --- typing indicator ---------------------------------------------------- */
+
+.bubble.loading {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 14px 0;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green-500);
+  animation: bounce 1.25s infinite ease-in-out;
+}
+.dot:nth-child(2) { animation-delay: 0.15s; }
+.dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0.55); opacity: 0.3; }
+  40%           { transform: scale(1); opacity: 1; }
+}
+
+/* --- suggestion chips ---------------------------------------------------- */
+
+/* One row, always. The six prompts are far wider than the reading column, so
+   the row scrolls sideways instead of wrapping — the chips keep their full
+   text, which matters because chip.textContent IS the query that gets sent. */
+.suggestions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 10px;
+  /* Trailing room so the last chip clears the fade at full scroll. */
+  padding: 0 44px 18px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  /* Fades the trailing chip so it reads as "there is more this way". */
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 44px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 44px), transparent);
+  scrollbar-width: none;
+}
+.suggestions::-webkit-scrollbar { display: none; }
+
+.chip {
+  flex: none;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  color: var(--green-800);
+  padding: 9px 17px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+/* Icons live in a pseudo-element so chip.textContent stays exactly the query
+   that gets sent to the assistant. */
+.chip::before {
+  content: attr(data-icon);
+  font-size: 14px;
+  line-height: 1;
+}
+.chip:hover {
+  background: var(--mint-100);
+  border-color: var(--green-500);
+}
+
+/* --- guided-flow banner -------------------------------------------------- */
+
+.flow-bar {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-border);
+  border-radius: 14px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.flow-bar-icon {
+  display: grid;
+  place-items: center;
+  color: #b98b25;
+}
+.flow-bar-icon svg { width: 17px; height: 17px; }
+.flow-bar-text {
+  font-size: 13px;
+  color: var(--amber-ink);
+}
+.cancel-flow-btn {
+  background: #fff;
+  border: 1px solid #dcc07f;
+  color: #8a6414;
+  padding: 6px 15px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+.cancel-flow-btn:hover { background: #fbf1dc; }
+
+/* --- composer ------------------------------------------------------------ */
+
+.input-wrap { position: relative; }
+
+.input-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 7px 7px 22px;
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: 999px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.input-bar:focus-within {
+  border-color: var(--green-500);
+  box-shadow: 0 0 0 4px rgba(39, 150, 91, 0.12);
+}
+
+#chatInput {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 15px;
+  font-family: inherit;
+  color: var(--ink);
+}
+#chatInput::placeholder { color: #9fada6; }
+
+#sendBtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, var(--green-600), var(--green-800));
+  color: #fff;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 999px;
+  font-size: 14.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: filter 0.16s ease, opacity 0.16s ease;
+}
+#sendBtn svg { width: 17px; height: 17px; }
+#sendBtn:hover:not(:disabled) { filter: brightness(1.12); }
+#sendBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.char-count {
+  text-align: right;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px 16px 0;
+}
+.char-count.over { color: var(--danger); font-weight: 600; }
+
+/* --- lookup dropdown ----------------------------------------------------- */
+
+.lookup-dropdown {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 12px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 -12px 34px -14px rgba(13, 59, 36, 0.35);
+  z-index: 20;
+  animation: msgIn 0.16s ease both;
+  scrollbar-width: thin;
+  scrollbar-color: #d7e4dc transparent;
+}
+.lookup-dropdown .lookup-item {
+  padding: 12px 18px;
+  font-size: 14px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+  transition: background 0.12s ease;
+}
+.lookup-dropdown .lookup-item:last-child { border-bottom: none; }
+.lookup-dropdown .lookup-item:hover,
+.lookup-dropdown .lookup-item.active {
+  background: var(--mint-100);
+  box-shadow: inset 3px 0 0 var(--green-600);
+}
+.lookup-dropdown .lookup-item-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 3px;
+}
+.lookup-dropdown .lookup-empty {
+  padding: 14px 18px;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+.error-note { color: var(--danger); }
+
+/* --- record panel ---------------------------------------------------------
+   Replaces the old inline "expand in place" table (pushed the whole
+   conversation down) AND the overlay-drawer version that followed it (dimmed
+   the chat with a backdrop, covering it). This is a real 50/50 split instead:
+   opening it shrinks .app to the left half and this panel fills the right
+   half, both fully visible and usable at once. Closing it returns .app to
+   full width. See .layout above for the flex row both live in. */
+
+.data-drawer {
+  flex: 0 0 0%;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-left: 1px solid var(--border);
+  box-shadow: inset 10px 0 18px -16px rgba(13, 59, 36, 0.18);
+  visibility: hidden;
+  transition: flex-basis 0.32s cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 0.32s;
+}
+
+.layout.split .app { flex-basis: 50%; }
+.layout.split .data-drawer {
+  flex-basis: 50%;
+  visibility: visible;
+  transition: flex-basis 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* A wide data table in a half-width panel is still workable on a tablet; on a phone it is not, so
+   below this width the panel takes over the full screen instead of splitting it. */
+@media (max-width: 900px) {
+  .layout.split .app { flex: 0 0 0%; }
+  .layout.split .data-drawer { flex: 1 1 100%; }
+}
+
+.data-drawer-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--mint-50), #fff);
+}
+.data-drawer-title {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--green-800);
+}
+.data-drawer-close {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+.data-drawer-close svg { width: 16px; height: 16px; }
+.data-drawer-close:hover {
+  background: var(--mint-100);
+  border-color: var(--green-500);
+  color: var(--green-800);
+}
+
+.data-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 22px 26px;
+  scrollbar-width: thin;
+  scrollbar-color: #d7e4dc transparent;
+}
+.data-drawer-body::-webkit-scrollbar { width: 10px; }
+.data-drawer-body::-webkit-scrollbar-thumb {
+  background: #d7e4dc;
+  border-radius: 999px;
+  border: 3px solid #fff;
+}
+.data-drawer-body .data-table-wrap { border-radius: 14px; }
+
+/* --- responsive ---------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  :root { --gutter: 24px; }
+}
+
+@media (max-width: 640px) {
+  :root { --gutter: 16px; }
+  .layout { height: 100dvh; }
+  .app { height: 100dvh; }
+  .topbar-inner { padding: 14px var(--gutter); }
+  /* The wordmark alone is enough on a phone - the divider and status line would wrap. */
+  .brand-logo { height: 36px; }
+  .brand-divider, .brand-sub { display: none; }
+  .messages-inner { padding: 28px var(--gutter) 22px; gap: 24px; }
+  .chat-bottom-inner { padding: 14px var(--gutter) 18px; }
+  .msg { gap: 10px; }
+  .msg.user .msg-content { max-width: 88%; }
+  .welcome-title { font-size: 25px; }
+  .clear-btn span { display: none; }
+  .clear-btn { padding: 10px 13px; }
+  .send-label { display: none; }
+  #sendBtn { padding: 12px 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

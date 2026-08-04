@@ -1,0 +1,102 @@
+// Curated, human-written description of the FlyThai database schema.
+// This is given to the LLM as context so it can write correct T-SQL (SQL Server) queries.
+// Keep it accurate to the real DB — update if the schema changes.
+
+const SCHEMA_DOC = `
+DATABASE: arkinfo1_flythai (Microsoft SQL Server). All queries MUST be plain T-SQL SELECT statements only.
+
+=== BookingMaster ===  (the central table: holds BOTH quotations and confirmed bookings)
+Columns: Id(int PK), BookingId(varchar, format like 'FT08261781' - set only when IsBooking=1), QuotationId(varchar, format like 'FTQ05260001' - set only when IsBooking=0), IsBooking(bit: 0=this row is a QUOTATION, 1=this row is a confirmed BOOKING), Destinations(varchar, comma-separated Destination.Id values e.g. '3' or '4,3'), GuestName, GuestPhoneNumber, GuestEmail, GuestCompany, GuestAddress, GuestAdults(int), GuestChildrens(int), GuestInfants(int), AgentId(int FK -> Agents.Id), TravelDate(date), ReturnDate(date), Currency, ROERate, TaxAmount, TaxPercentage, TravelStatus(e.g. 'up-coming'), InvoiceStatus(e.g. 'pending'), VoucherStatus, ItineraryStatus, PaymentStatus, BookingBy(varchar, staff member name who made it), CreatedOn(datetime WITH time - when the row was created; this is what the site's list screens label "BOOKING DATE", and it is NOT the travel date), UpdatedOn(datetime WITH time), IsDelete(bit - ALWAYS filter IsDelete=0), LandSelling(decimal), InvoiceDiscount.
+IMPORTANT: "FTQ..." codes = Quotation ID (search QuotationId column). "FT..." codes (no Q) = Booking ID (search BookingId column). The user may just say "FT number" meaning either — if unsure which, check both columns.
+If the user gives only a bare number or a partial/short number WITHOUT the "FT"/"FTQ" prefix (e.g. "261781" instead of the real code "FT08261781"), do NOT assume it's the whole code minus the prefix and reconstruct it as 'FT261781' - that will likely not match, since real codes have extra digits in the middle (month/etc). Instead use a partial match: bm.BookingId LIKE '%261781%' OR bm.QuotationId LIKE '%261781%' (matches the digits appearing anywhere in the real code).
+The int Id column here is the internal primary key referenced as "BookingId" (an INT foreign key) in most other tables below (BookingHotel, BookingItineary, JobSheetMaster, AccountTransaction, HotelMaster, PaymentMaster, etc.) — do not confuse it with the varchar BookingMaster.BookingId code (e.g. 'FT11261760').
+NEVER strip "FT"/"FTQ" from a code and treat the remaining digits as if they were BookingMaster.Id or a related table's BookingId — they are NOT the same number (e.g. 'FT11261760' does NOT mean Id=11261760). This is a real mistake seen before: writing "WHERE bh.BookingId = 11261760" is WRONG. The ONLY correct way to query a related table (BookingHotel, JobSheetMaster, etc.) by a code like 'FT11261760' is to JOIN through BookingMaster first: "FROM BookingHotel bh JOIN BookingMaster bm ON bh.BookingId = bm.Id WHERE bm.BookingId = 'FT11261760'" — always resolve the code to bm.Id via a join/subquery, never guess or derive it from the code's digits.
+
+=== Agents === (travel agents who book on behalf of guests)
+Columns: Id(int PK), Name, Phone, Email, Address, IsDeleted(bit - filter =0). Joined via BookingMaster.AgentId = Agents.Id.
+
+=== Destination === Id(int PK), Name, ShortCode, IsDelete(bit). BookingMaster.Destinations is a comma-separated list of Destination.Id (e.g. '4,3') — it is NEVER a single exact id, so never join with "bm.Destinations = CAST(d.Id AS VARCHAR)" (that only matches single-destination bookings and silently returns NULL/no name for multi-destination ones). Instead use: LEFT JOIN Destination d ON CHARINDEX(',' + CAST(d.Id AS VARCHAR) + ',', ',' + bm.Destinations + ',') > 0 AND d.IsDelete = 0, then STRING_AGG(d.Name, ', ') to combine them per booking.
+CRITICAL — that join matches ONE ROW PER DESTINATION, so a trip covering 4 destinations comes back as 4 identical-looking booking rows unless you collapse it. A plain "LEFT JOIN Destination ... " with no GROUP BY / STRING_AGG silently turns a 3-booking answer into 7 rows. This has actually happened. When listing bookings/quotations, NEVER leave that join un-aggregated. Prefer this self-contained form, which cannot multiply rows and needs no GROUP BY:
+  FROM BookingMaster bm
+  CROSS APPLY (SELECT STRING_AGG(d.Name, ', ') AS DestinationList
+               FROM Destination d
+               WHERE CHARINDEX(',' + CAST(d.Id AS VARCHAR) + ',', ',' + bm.Destinations + ',') > 0
+                 AND d.IsDelete = 0) AS DestList
+The same warning applies to LEFT JOIN BookingHotel / BookingItineary / AccountTransaction in a LIST query: each returns many rows per booking. In a query that lists bookings, one output row must mean one booking — aggregate or use CROSS APPLY, never a bare LEFT JOIN.
+
+=== BookingHotel === (hotels booked for a trip/itinerary)
+Columns: Id, BookingId(int FK -> BookingMaster.Id), DestinationId(FK->Destination.Id), HotelId(FK->Hotel.Id), Name(hotel name text), RoomCategory, TotalRooms, TotalNights, CheckInDate, CheckOutDate, Rate, ConfirmationId, HotelRatePerNight, HotelRatePerNightCurrency, TotalAmount, IsDelete(bit).
+IMPORTANT: TotalAmount already includes any extra charges below - it is the final correct total. But if the user asks for "hotel details" or a cost breakdown, you MUST also check BookingHotelAttributeMapping (join on BookingHotelId = BookingHotel.Id) for extra add-on charges included in that total - e.g. extra bed, extra breakfast, extra lunch/dinner - and list them, otherwise the answer looks incomplete compared to the real booking (this has been missed before - always check this table when showing hotel cost breakdowns).
+
+=== BookingHotelAttributeMapping === (extra/optional charges added to a hotel booking - e.g. extra bed, extra breakfast, extra meals)
+Columns: Id, AttributeTypeId(FK->AttributeType.Id), BookingHotelId(FK->BookingHotel.Id), Adults(int, how many people this charge is for), Children, Infants, Price(decimal, per-person/per-night rate), FinalPrice(decimal, the actual total charged for this line item), Currency, IsDeleted(bit), IsActive(bit).
+=== AttributeType === Id, Type(e.g. 'Extra bed for adult', 'Extra breakfast for adult', 'Extra bed for Child', 'Extra Lunch for Adult', 'Extra Dinner for Adult', etc.), AllowedForAdult(bit), AllowedForChild(bit), AllowedForInfant(bit), IsDelete(bit), IsActive(bit).
+
+=== HotelMaster === (hotel booking confirmation/payment status - ONE ROW PER HOTEL, not per booking)
+Columns: Id, BookingId(int FK->BookingMaster.Id), HotelId(int - DESPITE THE NAME this is actually a FK -> BookingHotel.Id, NOT Hotel.Id - verified against real data), HotelHolding, HotelDeadline, IsConfirm(bit), HotelIsFinalConfirm(bit), HotelVoucher, HotelPaymentStatus, HotelConfirmationId, HotelRate, HotelRateCurrency, HotelPaidOn, IsDelete(bit).
+CRITICAL: A booking can have MULTIPLE hotels (multiple BookingHotel rows), each with its own HotelMaster confirmation/payment row. To get the right confirmation/payment status for a SPECIFIC hotel stay, join HotelMaster.HotelId = BookingHotel.Id (per-hotel), NEVER just HotelMaster.BookingId = BookingMaster.Id alone when BookingHotel is also joined - that produces a cross-product of every hotel × every HotelMaster row for that booking (wrong, duplicated data). If you only need BookingId-level info without per-hotel detail, joining on BookingId alone is fine, but be aware one booking may have several HotelMaster rows (one per hotel).
+
+=== Hotel === (hotel master directory) Id(PK), Name, PhoneNumber, Address, Destination(FK->Destination.Id), Email, RatePerNight, RatePerNightCurrency, IsDelete(bit).
+=== HotelRoomType === Id, HotelId(FK->Hotel.Id), RoomName, RatePerNight, Currency, IsActive, IsDelete.
+
+=== BookingItineary === (day-by-day itinerary / activities for a trip)
+Columns: Id, BookingId(int FK->BookingMaster.Id), Date, Time, Particular(activity/place name), Type, PickupPointId(FK->Pickup.Id), VehicleType, FinalPrice, TotalAdult, TotalChild, TotalInfant, FlightNo, IsDelete(bit).
+
+=== BookingItineraryRestaurant === Id, BookingId(int FK->BookingMaster.Id), RestaurantId(FK->RestaurantMaster.Id), Date, AdultsForLunch, ChildrenForLunch, AdultsForDinner, ChildrenForDinner, FinalPrice, IsDelete(bit).
+
+=== BookingMemberType === Id, BookingId(int FK->BookingMaster.Id), Type, Price, PAX, IsDelete(bit). (pricing per traveler type)
+
+=== JobSheetMaster === (operations job sheet — vendor/vehicle/meal dispatch status for each itinerary line item)
+Columns: Id, BookingId(int FK->BookingMaster.Id), ItineraryId(FK->BookingItineary.Id), VendorName, BookingSentStatus, CustomerSentStatus, LunchStatus, DinnerStatus, VehicleName, GeneralRemarks, Status(overall status), IsDelete(bit).
+
+=== AccountMaster === (chart of accounts / ledger accounts — e.g. hotels, vendors, agents as accounts)
+Columns: Id(PK), AccountGroupId(FK->AccountGroup.Id), AccountType(values seen: 'Hotel', 'Agent', 'Vender', 'OfficeExpense', 'Salary', or NULL), Name, AccountNo, Mobile, Email, Address, City, State, Country, OpeningBalance, Currency, IsActive(bit).
+=== AccountGroup === Id(PK), Name, GroupType, IsActive.
+
+=== AccountTransaction === (ledger transactions / payments — the core accounting table)
+Columns: Id(PK), VoucherNo, TransactionDate, BookingId(int FK->BookingMaster.Id, nullable), AccountId(FK->AccountMaster.Id), TransactionAmount(decimal), TransactionType('Credit' or 'Debit'), Currency, ROE, Remark, TransactionFor(values seen: 'Bank Payment', 'Bank Receipt', 'Cash Payment', 'Cash Receipt', 'Purchase Form', 'Sale Form', 'Opening Balance' — this is what the site's "Transaction" menu filters by), InvoiceNo, JobSheetId(FK->JobSheetMaster.Id, nullable), IsDeleted(bit - filter =0).
+
+ACCOUNT BALANCE (Credit/Debit/Balance) — read carefully, this was verified empirically against the real app, twice:
+- For a **Hotel-type vendor account** (AccountMaster.AccountType='Hotel'), on the site's "Account Master" screen (filtered to one Financial Year's date range), the displayed columns are: UI "CREDIT" = SUM(TransactionAmount) WHERE TransactionType='Debit', UI "DEBIT" = SUM(TransactionAmount) WHERE TransactionType='Credit', UI "BALANCE" = (that Debit-sum) - (that Credit-sum). Yes, the UI's Credit/Debit column labels are the OPPOSITE of the raw TransactionType value — verified against 5 real accounts, exact match to the cent. If asked for a hotel/vendor account's balance for a given financial year, you may compute it this way, filtering TransactionDate to that FinancialYear's StartDate/EndDate (join FinancialYear, or use the active one — IsActive=1 — if no year is specified), and clearly present it as "Credit / Debit / Balance" matching the site's own labels (i.e. already swapped per this formula, don't swap again).
+- For any OTHER account type (Bank, Cash, Credit Card, Agent, etc.) or for the summary figures on the main "Account Dashboard" page — DO NOT compute a balance. It is verified NOT reliable there (e.g. account "TBO" nets to 0 from its own transactions but the real dashboard shows a non-zero balance for it) — some depend on business logic outside this table. Say balance isn't reliably computable for that account type and suggest checking the relevant page directly.
+- You CAN and SHOULD always answer questions about the raw transaction list itself (e.g. "show transactions for account X", "list payments for booking Y", "show Purchase Form transactions this month") since that's just reading real rows, not a derived calculation.
+
+=== PaymentMaster === Id, BookingId(int FK->BookingMaster.Id), PaymentStatus, PaidAmount, Currency, IsDelete(bit).
+=== ReceivableMaster === Id, BookingId(int FK->BookingMaster.Id), Type, Name, Currency, Value, JobsheetId, VendorName, IsDelete(bit).
+=== FinancialYear === Id, StartDate, EndDate, DisplayFinYear, IsActive.
+
+=== Inquiry === (pre-sales customer inquiries, may later convert into a BookingMaster row)
+Columns: Id, EmailId, MailSubject, MailBody, ReceivedDateTime, FromDate, ToDate, NoOfPersons, Destination(text), Remarks, AssignedUserId, StatusId(FK->InquiryStatus.Id), IsClosed(bit), AgentId(FK->Agents.Id), BookingId(FK->BookingMaster.Id, nullable), PhoneNo, IsDeleted(bit).
+=== InquiryStatus === Id, StatusName, IsFinalStatus.
+=== InquiryTaskLog === Id, InquiryId(FK->Inquiry.Id), BookingId, FollowUpType, Remarks, CreatedOn.
+
+=== Pickup === Id, Name, Destination(text), HotelId, IsDelete.
+=== VehicalMaster === Id, Name, Capacity, IsActive, IsDeleted.
+=== TransferVehicalMapping === Id, TransferId, VehicalId(FK->VehicalMaster.Id), Price, Currency, IsActive, IsDeleted.
+=== RestaurantMaster === Id, Name, PhoneNumber, Address, Destination(FK->Destination.Id), LunchPriceForAdults, DinnerPriceForAdults, IsDelete.
+=== RoomPricing === Id, RoomId(FK->HotelRoomType.Id), FromDate, ToDate, Price, IsActive, IsDelete.
+=== Particular === Id, Name, Destination(text), AdultsPrice, ChildrenPrice, Currency, Category, IsDeleted.
+=== ConversionMaster === Id, FromDate, ToDate, THBPrice, USDPrice (currency conversion rates).
+
+GENERAL RULES FOR WRITING SQL:
+- Always filter out soft-deleted rows: use "IsDelete = 0" or "IsDeleted = 0" (check the exact column name per table above — some tables use IsDelete, some IsDeleted).
+- Prefer TOP 50 unless the user clearly wants an aggregate/count/sum. BUT when the user asks for ALL matching records ("all bookings", "every quotation", "provide me all ..."), use TOP 300 instead — TOP 50 silently caps the result, and the answer then reports 50 as if it were the true total when there are more.
+- Use LEFT JOIN to Agents / Destination / Hotel / AccountMaster etc. when the user wants readable names instead of raw IDs.
+- Dates are SQL 'date'/'datetime' — use CONVERT/FORMAT for display comparisons; compare using >=, <=, or CAST(GETDATE() AS date) for "today".
+- ONE DATE vs A RANGE — decide by the preposition, and be consistent (the same wording must always produce the same filter):
+  * "FROM <date>" with no end date means ON OR AFTER that date: bm.TravelDate >= '2026-08-02'. "from 02-Aug-2026", "starting 02-Aug-2026", "onwards from 02-Aug-2026", "on or after", "after", "since" — all of these are open-ended ranges, NOT a single day. Do not narrow them to one date.
+  * "ON <date>", "OF <date>", "<date> this date", or a bare date with no preposition means THAT EXACT DAY: bm.TravelDate = '2026-08-02'.
+  * "FROM <date> TO <date>", "BETWEEN X AND Y" means a closed range: >= X AND <= Y.
+  * "BEFORE <date>", "UP TO <date>", "TILL <date>" means <= (or < for "before").
+  Always word the answer so the interpretation is visible — say "travelling on or after 02-Aug-2026" for a range and "travelling on 02-Aug-2026" for a single day, so the user can see which reading was used.
+- DATE LITERALS: when the user names a specific date in ANY format ("02-Aug-2026", "2-8-2026", "2 August 2026", "02-Aug-2026 this date"), convert it to an ISO literal and use it directly: bm.TravelDate = '2026-08-02'. Only use CAST(GETDATE() AS date) when the user actually says "today"/"now"/"tonight" (or GETDATE() +/- 1 for "tomorrow"/"yesterday"). NEVER substitute GETDATE() for a date the user typed out — that silently answers about the wrong day. A trailing "this date"/"is date"/"on this date" is just filler referring to the date already given in the same sentence, not a request for today.
+- WHICH DATE COLUMN: BookingMaster.TravelDate is the date the trip departs, and it is the column the site's own Booking list "From Date"/"To Date" filter uses. A question that names a date without saying which date it means ("bookings on 02-Aug-2026", "booking list of 2 August", "who is travelling tomorrow") ALWAYS means TravelDate. Use CreatedOn ONLY when the user explicitly says the record was created/made/entered/added on that date. Never pick the date column based on what an earlier answer in the conversation happened to mention.
+- CreatedOn / UpdatedOn are datetime values WITH a real time component (e.g. 2026-07-29T06:57:26.580). Comparing them to a bare date with "=" matches only rows stored at exactly midnight, so it silently returns zero rows even on days that do have records. Always wrap them: CAST(bm.CreatedOn AS date) = '2026-08-02'. TravelDate and ReturnDate are pure 'date' columns, so a plain "=" is correct for those.
+- Names (agents, hotels, guests, destinations) can themselves contain common words like "and"/"the" (e.g. an agent literally named "Cliq and Fly"). When the user gives a single name phrase, match it as ONE value with LIKE '%whole phrase%' — do NOT split it into multiple separate names/an IN-list just because it contains a word like "and", unless the user clearly separates multiple distinct names with a comma or "or".
+- A bare person's name in a booking/quotation question (e.g. "Priya's bookings", "show me Ranu booking") is AMBIGUOUS — it could be the GUEST (BookingMaster.GuestName), the AGENT (Agents.Name via AgentId), or the STAFF MEMBER who created it (BookingMaster.BookingBy — e.g. "Priya", "Nidhi", "Dhruman" are staff names, not guests or agents). Unless the user's wording makes the role explicit ("guest named X", "agent X", "booked by X"/"who made X"), search ALL THREE with OR: (bm.GuestName LIKE '%X%' OR a.Name LIKE '%X%' OR bm.BookingBy LIKE '%X%'). Do not assume it's only a guest name — that is the single most common wrong-result cause here.
+- Money columns can be in different currencies (Currency column next to each amount). NEVER SUM or AVERAGE a money column across rows without also GROUP BY the Currency column — adding THB and INR amounts together produces a meaningless number. Always show/group totals per currency (e.g. "SUM(TransactionAmount) ... GROUP BY Currency"), and include the currency column in results when showing amounts.
+- Never write INSERT/UPDATE/DELETE/DROP/ALTER/EXEC or any statement other than a single SELECT — you are strictly read-only.
+- When the user broadly asks for a booking's/quotation's "details", "full details", "all details", or just "share/give me info about X" (without narrowing to one specific area like just payments or just job sheet), that means give a COMPLETE picture like the real Invoice/Itinerary PDF would show — not just the bare BookingMaster row. In that case ALSO pull hotel info (LEFT JOIN BookingHotel, and BookingHotelAttributeMapping for any extra charges) and a short itinerary summary (LEFT JOIN BookingItineary), not just guest/status fields. Only skip these extra joins if the user's question is clearly narrow (e.g. explicitly just asks about payment status or just job sheet status).
+`;
+
+module.exports = { SCHEMA_DOC };

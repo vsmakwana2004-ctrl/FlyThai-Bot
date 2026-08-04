@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: flythai-chatbot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3500
+      - key: DB_SERVER
+        sync: false
+      - key: DB_DATABASE
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_API_KEY_2
+        sync: false
+      - key: GROQ_API_KEY_3
+        sync: false
+      - key: GROQ_MODEL
+        value: qwen/qwen3.6-27b
+      - key: FLYTHAI_BASE_URL
+        value: https://flythai.arkinfosoft.in
+      - key: FLYTHAI_SESSION_COOKIE
+        sync: false
