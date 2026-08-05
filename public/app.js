@@ -7,6 +7,32 @@ const suggestions = document.getElementById('suggestions');
 const quickReplies = document.getElementById('quickReplies');
 const clearBtn = document.getElementById('clearBtn');
 const lookupDropdown = document.getElementById('lookupDropdown');
+const datePickerBox = document.getElementById('datePickerBox');
+const calPrev = document.getElementById('calPrev');
+const calNext = document.getElementById('calNext');
+const calTitle = document.getElementById('calTitle');
+const calGrid = document.getElementById('calGrid');
+const paxPickerBox = document.getElementById('paxPickerBox');
+const paxAdultsInput = document.getElementById('paxAdults');
+const paxChildrenInput = document.getElementById('paxChildren');
+const paxInfantsInput = document.getElementById('paxInfants');
+const calBackToForm = document.getElementById('calBackToForm');
+const priceExtrasBox = document.getElementById('priceExtrasBox');
+const peRoeRate = document.getElementById('peRoeRate');
+const peRoeCharge = document.getElementById('peRoeCharge');
+const peTaxAmount = document.getElementById('peTaxAmount');
+const peTaxPercentage = document.getElementById('peTaxPercentage');
+const peDiscount = document.getElementById('peDiscount');
+const peFinalRate = document.getElementById('peFinalRate');
+const peDueDateBtn = document.getElementById('peDueDateBtn');
+const peDueDateLabel = document.getElementById('peDueDateLabel');
+const extraDetailsBox = document.getElementById('extraDetailsBox');
+const edNote = document.getElementById('edNote');
+const edContactChips = document.getElementById('edContactChips');
+const edBookingBy = document.getElementById('edBookingBy');
+const edAllowVoucher = document.getElementById('edAllowVoucher');
+const edAllowInvoice = document.getElementById('edAllowInvoice');
+const edAllowItinerary = document.getElementById('edAllowItinerary');
 const flowBar = document.getElementById('flowBar');
 const cancelFlowBtn = document.getElementById('cancelFlowBtn');
 const charCount = document.getElementById('charCount');
@@ -17,6 +43,7 @@ const dataDrawerBody = document.getElementById('dataDrawerBody');
 const dataDrawerClose = document.getElementById('dataDrawerClose');
 
 const MAX_MESSAGE_CHARS = 2000; // must match MAX_MESSAGE_CHARS in server.js
+const INPUT_MAX_HEIGHT = 160; // px - #chatInput grows to fit pasted multi-line text up to this, then scrolls
 
 // The server always answers /api/* with JSON, but a proxy, a dropped connection or a crash can
 // still put HTML or nothing at all on the wire. Parsing blindly turned those into
@@ -55,6 +82,8 @@ const LOOKUP_ENDPOINTS = {
   sightseeing: '/api/sightseeing',
   restaurant: '/api/restaurants',
   vehicle: '/api/vehicles',
+  destination: '/api/destinations',
+  roomType: '/api/hotel-room-types',
 };
 const LOOKUP_EMPTY_TEXT = {
   agent: 'No matching agents found',
@@ -64,44 +93,90 @@ const LOOKUP_EMPTY_TEXT = {
   sightseeing: 'No matching sightseeing options found',
   restaurant: 'No matching restaurants found',
   vehicle: 'No matching vehicle types found',
+  destination: 'No matching destinations found',
+  roomType: 'No registered room types for this hotel — just type the category',
 };
-let currentExpecting = null; // { field, params } | null
+let currentExpecting = null; // { field, params, multi } | null
 let lookupDebounceTimer = null;
 let lookupItems = [];
 let lookupActiveIndex = -1;
+// Multi-select destination checklist state (Id -> Name) - lets the user tick several destinations
+// instead of typing a comma-separated list by hand. Cleared whenever the field stops being asked.
+let selectedDestinations = new Map();
 
 // Transfers show their code as part of the main label (mirrors the real form's separate
 // Transfer Code column) rather than buried in the sub-line, since staff often search by code.
+// Destinations show their short code the same way the real form's checkbox labels do ("Bangkok (BKK)").
 function lookupItemLabel(item) {
-  return item.Code ? `${item.Code} — ${item.Name}` : item.Name;
+  if (item.Code) return `${item.Code} — ${item.Name}`;
+  if (item.ShortCode) return `${item.Name} (${item.ShortCode})`;
+  return item.Name;
+}
+
+// Keeps the chat input in sync with the ticked checkboxes - checking a box adds its name, unticking
+// removes it, and the ordinary Send/Enter path submits whatever ends up in the box.
+function syncDestinationInputValue() {
+  input.value = Array.from(selectedDestinations.values()).join(', ');
+  updateCharCount();
+}
+
+// Every popover above the input (lookup dropdown, calendar, pax spinners, pricing-extras form) is
+// position:absolute and floats upward out of .chat-bottom's own box - with nothing reserving that
+// space, it renders on top of (hiding) whichever chat messages happen to be scrolled to the bottom,
+// including the very question it's answering. Reserving that height as extra scroll padding, then
+// re-scrolling to the true bottom, keeps the latest message visible above the popover instead.
+const MESSAGES_BASE_PADDING_BOTTOM = 32; // must match .messages-inner's own CSS padding-bottom
+function reserveSpaceForVisiblePopover() {
+  const popovers = [lookupDropdown, datePickerBox, paxPickerBox, priceExtrasBox];
+  const visible = popovers.find((el) => el.style.display && el.style.display !== 'none');
+  const extra = visible ? visible.offsetHeight + 12 : 0; // +12 matches the popover's own margin-bottom
+  messagesInner.style.paddingBottom = extra ? `${MESSAGES_BASE_PADDING_BOTTOM + extra}px` : '';
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function lookupItemSub(item) {
   // Agents show a phone number; hotels show their destination; vehicles show their seating
-  // capacity; restaurants show their address. Pickup/drop-off points and transfers (code already
-  // in the main label) show nothing.
+  // capacity; restaurants show their address; room types show their own rate per night. Pickup/
+  // drop-off points and transfers (code already in the main label) show nothing.
   if (item.Phone) return item.Phone;
   if (item.Destination) return item.Destination;
   if (item.Capacity != null) return `Capacity: ${item.Capacity}`;
   if (item.Address) return item.Address;
+  if (item.RatePerNight != null) return `${item.RatePerNight} ${item.Currency || ''}`.trim();
   return '';
 }
 
-function renderLookupDropdown(items, emptyText) {
+function renderLookupDropdown(items, emptyText, multi) {
   lookupItems = items;
   lookupActiveIndex = -1;
+
   if (items.length === 0) {
     lookupDropdown.innerHTML = `<div class="lookup-empty">${escapeHtml(emptyText || 'No matches')}</div>`;
-    lookupDropdown.style.display = 'block';
-    return;
+  } else if (multi) {
+    const rows = items
+      .map((item) => {
+        const id = String(item.Id);
+        const checked = selectedDestinations.has(id);
+        return `<div class="lookup-item lookup-item-multi${checked ? ' checked' : ''}" data-id="${id}" data-name="${escapeHtml(item.Name)}">
+          <span class="lookup-checkbox" aria-hidden="true"></span>
+          <span>${escapeHtml(lookupItemLabel(item))}</span>
+        </div>`;
+      })
+      .join('');
+    const count = selectedDestinations.size;
+    lookupDropdown.innerHTML = `<div class="lookup-multi-list">${rows}</div><div class="lookup-multi-footer">${
+      count ? `${count} selected — press Enter to submit` : 'Tick one or more destinations'
+    }</div>`;
+  } else {
+    lookupDropdown.innerHTML = items
+      .map((item, i) => {
+        const sub = lookupItemSub(item);
+        return `<div class="lookup-item" data-index="${i}">${escapeHtml(lookupItemLabel(item))}${sub ? `<div class="lookup-item-sub">${escapeHtml(sub)}</div>` : ''}</div>`;
+      })
+      .join('');
   }
-  lookupDropdown.innerHTML = items
-    .map((item, i) => {
-      const sub = lookupItemSub(item);
-      return `<div class="lookup-item" data-index="${i}">${escapeHtml(lookupItemLabel(item))}${sub ? `<div class="lookup-item-sub">${escapeHtml(sub)}</div>` : ''}</div>`;
-    })
-    .join('');
   lookupDropdown.style.display = 'block';
+  reserveSpaceForVisiblePopover();
 }
 
 function hideLookupDropdown() {
@@ -109,11 +184,25 @@ function hideLookupDropdown() {
   lookupDropdown.innerHTML = '';
   lookupItems = [];
   lookupActiveIndex = -1;
+  reserveSpaceForVisiblePopover();
 }
 
 async function fetchLookupOptions(expecting, query) {
   if (!expecting) return;
-  const { field, params } = expecting;
+  const { field, params, multi, options } = expecting;
+
+  // Some fields (e.g. a hotel row's destination, scoped to just this trip's own destinations)
+  // come as a small list already resolved server-side - filter it client-side instead of hitting
+  // an API endpoint at all.
+  if (options) {
+    const q = query.trim().toLowerCase();
+    const filtered = q
+      ? options.filter((o) => o.Name.toLowerCase().includes(q) || (o.ShortCode && o.ShortCode.toLowerCase().includes(q)))
+      : options;
+    renderLookupDropdown(filtered, LOOKUP_EMPTY_TEXT[field], multi);
+    return;
+  }
+
   const endpoint = LOOKUP_ENDPOINTS[field];
   if (!endpoint) return;
   try {
@@ -121,14 +210,327 @@ async function fetchLookupOptions(expecting, query) {
     const res = await fetch(`${endpoint}?${qs.toString()}`);
     const data = await res.json();
     const key = Object.keys(data).find((k) => Array.isArray(data[k]));
-    renderLookupDropdown(key ? data[key] : [], LOOKUP_EMPTY_TEXT[field]);
+    renderLookupDropdown(key ? data[key] : [], LOOKUP_EMPTY_TEXT[field], multi);
   } catch (err) {
     hideLookupDropdown();
   }
 }
 
+// Real calendar picker for travel/return/check-in/check-out date steps, in place of typing
+// "DD-MM-YYYY" by hand - styled to match the real FlyThai site's own travel-date calendar rather
+// than each browser's inconsistent native <input type="date"> control. params.min/max (YYYY-MM-DD
+// strings from the server) disable day cells outside that range - e.g. a hotel's check-in/check-out
+// can't fall before the trip's travel date or after its return date.
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+let calendarViewYear = null;
+let calendarViewMonth = null; // 0-based
+let calendarMinDate = null; // Date (day precision) - cells before this are disabled
+let calendarMaxDate = null; // Date (day precision) - cells after this are disabled
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function dateKey(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function isoToDateOnly(iso) {
+  if (!iso) return null;
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function renderCalendarGrid() {
+  calTitle.textContent = `${MONTH_NAMES[calendarViewMonth]} ${calendarViewYear}`;
+  const startWeekday = new Date(calendarViewYear, calendarViewMonth, 1).getDay();
+  const daysInMonth = new Date(calendarViewYear, calendarViewMonth + 1, 0).getDate();
+  const daysInPrevMonth = new Date(calendarViewYear, calendarViewMonth, 0).getDate();
+  const totalCells = Math.ceil((startWeekday + daysInMonth) / 7) * 7;
+  const todayKey = dateKey(new Date());
+
+  const cells = [];
+  for (let i = 0; i < totalCells; i++) {
+    const dayNum = i - startWeekday + 1;
+    let date;
+    let muted;
+    if (dayNum < 1) {
+      date = new Date(calendarViewYear, calendarViewMonth - 1, daysInPrevMonth + dayNum);
+      muted = true;
+    } else if (dayNum > daysInMonth) {
+      date = new Date(calendarViewYear, calendarViewMonth + 1, dayNum - daysInMonth);
+      muted = true;
+    } else {
+      date = new Date(calendarViewYear, calendarViewMonth, dayNum);
+      muted = false;
+    }
+    cells.push({ date, muted });
+  }
+
+  calGrid.innerHTML = cells
+    .map(({ date, muted }) => {
+      const key = dateKey(date);
+      const disabled = muted || (calendarMinDate && date < calendarMinDate) || (calendarMaxDate && date > calendarMaxDate);
+      const cls = ['cal-day'];
+      if (muted) cls.push('cal-day-muted');
+      if (!muted && key === todayKey) cls.push('cal-day-today');
+      return `<button type="button" class="${cls.join(' ')}" data-date="${key}"${disabled ? ' disabled' : ''}>${date.getDate()}</button>`;
+    })
+    .join('');
+}
+
+function showDatePicker(params) {
+  calendarMinDate = isoToDateOnly(params && params.min);
+  calendarMaxDate = isoToDateOnly(params && params.max);
+  const start = calendarMinDate || new Date();
+  calendarViewYear = start.getFullYear();
+  calendarViewMonth = start.getMonth();
+  renderCalendarGrid();
+  datePickerBox.style.display = 'block';
+  reserveSpaceForVisiblePopover();
+}
+
+function hideDatePicker() {
+  datePickerBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
+calPrev.addEventListener('click', () => {
+  calendarViewMonth--;
+  if (calendarViewMonth < 0) {
+    calendarViewMonth = 11;
+    calendarViewYear--;
+  }
+  renderCalendarGrid();
+  reserveSpaceForVisiblePopover(); // a 5-row vs 6-row month changes the popover's height slightly
+});
+
+calNext.addEventListener('click', () => {
+  calendarViewMonth++;
+  if (calendarViewMonth > 11) {
+    calendarViewMonth = 0;
+    calendarViewYear++;
+  }
+  renderCalendarGrid();
+  reserveSpaceForVisiblePopover();
+});
+
+// Adults/children/infants step gets three number spinners instead of typing "4 adults, 1 child" -
+// digits only (native number input plus a keydown filter blocking e/+/-/.), adults floored at 1
+// since a booking needs at least one adult traveller. Every change re-syncs the chat input text so
+// the existing Send/Enter path (and the backend's own regex parsing) is untouched.
+function clampPax(el, min) {
+  const v = parseInt(el.value, 10);
+  el.value = String(Number.isNaN(v) || v < min ? min : v);
+}
+
+function blockNonDigitKeys(e) {
+  if (['e', 'E', '+', '-', '.'].includes(e.key)) e.preventDefault();
+}
+
+function pluralize(n, singular, plural) {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
+function syncPaxInputValue() {
+  const adults = Math.max(1, parseInt(paxAdultsInput.value, 10) || 0);
+  const children = Math.max(0, parseInt(paxChildrenInput.value, 10) || 0);
+  const infants = Math.max(0, parseInt(paxInfantsInput.value, 10) || 0);
+  const parts = [pluralize(adults, 'adult', 'adults')];
+  if (children > 0) parts.push(pluralize(children, 'child', 'children'));
+  if (infants > 0) parts.push(pluralize(infants, 'infant', 'infants'));
+  input.value = parts.join(', ');
+  updateCharCount();
+}
+
+function showPaxPicker() {
+  paxAdultsInput.value = '1';
+  paxChildrenInput.value = '0';
+  paxInfantsInput.value = '0';
+  syncPaxInputValue();
+  paxPickerBox.style.display = 'flex';
+  reserveSpaceForVisiblePopover();
+}
+
+function hidePaxPicker() {
+  paxPickerBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
+[paxAdultsInput, paxChildrenInput, paxInfantsInput].forEach((el) => {
+  el.addEventListener('keydown', blockNonDigitKeys);
+  el.addEventListener('input', syncPaxInputValue);
+});
+paxAdultsInput.addEventListener('blur', () => {
+  clampPax(paxAdultsInput, 1);
+  syncPaxInputValue();
+});
+paxChildrenInput.addEventListener('blur', () => {
+  clampPax(paxChildrenInput, 0);
+  syncPaxInputValue();
+});
+paxInfantsInput.addEventListener('blur', () => {
+  clampPax(paxInfantsInput, 0);
+  syncPaxInputValue();
+});
+
+// Optional pricing-extras form (ROE/tax/discount/final rate + invoice due date) - lands on the
+// same free-text, LLM-parsed stepPriceExtras() the bot always used, just composed from labelled
+// fields instead of typed from memory. All fields optional; blank ones are simply left out of the
+// composed sentence (an all-blank form has nothing to send - the "Skip" quick-reply chip covers
+// that, same convention as the hotel-optional-details step).
+const PE_INPUTS = [
+  [peRoeRate, 'ROE rate'],
+  [peRoeCharge, 'ROE charge'],
+  [peTaxAmount, 'tax amount'],
+  [peTaxPercentage, 'tax percentage'],
+  [peDiscount, 'discount'],
+  [peFinalRate, 'final selling rate'],
+];
+let priceExtrasDueDate = ''; // DD-MM-YYYY, or '' if not set
+let priceExtrasDatePickMode = false; // true while datePickerBox is being borrowed for the due-date sub-field
+
+function updatePeDueDateLabel() {
+  peDueDateLabel.textContent = priceExtrasDueDate ? `Invoice due date: ${priceExtrasDueDate}` : 'Set invoice due date';
+}
+
+function syncPriceExtrasInputValue() {
+  const parts = PE_INPUTS.filter(([el]) => el.value.trim()).map(([el, label]) => `${label} ${el.value.trim()}`);
+  if (priceExtrasDueDate) parts.push(`invoice due date ${priceExtrasDueDate}`);
+  input.value = parts.join(', ');
+  updateCharCount();
+}
+
+function showPriceExtrasPicker() {
+  PE_INPUTS.forEach(([el]) => (el.value = ''));
+  priceExtrasDueDate = '';
+  updatePeDueDateLabel();
+  syncPriceExtrasInputValue();
+  priceExtrasBox.style.display = 'block';
+  reserveSpaceForVisiblePopover();
+}
+
+function hidePriceExtrasPicker() {
+  priceExtrasBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
+PE_INPUTS.forEach(([el]) => el.addEventListener('input', syncPriceExtrasInputValue));
+
+// Borrows the same calendar used for travel/return/etc. dates, rather than building a second one -
+// only this form's due-date field ever turns priceExtrasDatePickMode on, so calGrid's click handler
+// below knows to write back into the form instead of submitting the date as a whole message.
+peDueDateBtn.addEventListener('click', () => {
+  priceExtrasDatePickMode = true;
+  priceExtrasBox.style.display = 'none';
+  calBackToForm.style.display = 'block';
+  showDatePicker({});
+});
+
+calBackToForm.addEventListener('click', () => {
+  priceExtrasDatePickMode = false;
+  calBackToForm.style.display = 'none';
+  hideDatePicker();
+  priceExtrasBox.style.display = 'block';
+  reserveSpaceForVisiblePopover();
+});
+
+// Final optional-details form (note/emergency contact/booked by/PDF permission) - only ever shown
+// after the extraGate question's "Yes, add details" reply, same free-text-composing pattern as the
+// pricing-extras form above, landing on the same LLM-parsed stepExtraCollect() as before.
+let extraDetailsContact = ''; // selected emergency-contact chip value, or ''
+
+function syncExtraDetailsInputValue() {
+  const parts = [];
+  if (edNote.value.trim()) parts.push(`note: ${edNote.value.trim()}`);
+  if (extraDetailsContact) parts.push(`emergency contact ${extraDetailsContact}`);
+  if (edBookingBy.value.trim()) parts.push(`booking by ${edBookingBy.value.trim()}`);
+  const pdfTypes = [];
+  if (edAllowVoucher.checked) pdfTypes.push('voucher');
+  if (edAllowInvoice.checked) pdfTypes.push('invoice');
+  if (edAllowItinerary.checked) pdfTypes.push('itinerary');
+  if (pdfTypes.length) parts.push(`allow agent to download ${pdfTypes.join('/')} pdf`);
+  input.value = parts.join(', ');
+  updateCharCount();
+}
+
+function showExtraDetailsPicker() {
+  edNote.value = '';
+  edBookingBy.value = '';
+  edAllowVoucher.checked = false;
+  edAllowInvoice.checked = false;
+  edAllowItinerary.checked = false;
+  extraDetailsContact = '';
+  edContactChips.querySelectorAll('.ed-contact-chip').forEach((el) => el.classList.remove('selected'));
+  syncExtraDetailsInputValue();
+  extraDetailsBox.style.display = 'flex';
+  reserveSpaceForVisiblePopover();
+}
+
+function hideExtraDetailsPicker() {
+  extraDetailsBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
+[edNote, edBookingBy].forEach((el) => el.addEventListener('input', syncExtraDetailsInputValue));
+[edAllowVoucher, edAllowInvoice, edAllowItinerary].forEach((el) => el.addEventListener('change', syncExtraDetailsInputValue));
+
+// Single-select toggle: clicking the already-selected contact deselects it, clicking another swaps.
+edContactChips.addEventListener('click', (e) => {
+  const el = e.target.closest('.ed-contact-chip');
+  if (!el) return;
+  const value = el.dataset.value;
+  const wasSelected = el.classList.contains('selected');
+  edContactChips.querySelectorAll('.ed-contact-chip').forEach((chip) => chip.classList.remove('selected'));
+  extraDetailsContact = wasSelected ? '' : value;
+  if (!wasSelected) el.classList.add('selected');
+  syncExtraDetailsInputValue();
+});
+
 function setExpecting(expecting) {
+  // Leaving the destination checklist (answer submitted, or a different field is now being asked)
+  // clears the ticks so a later booking's checklist doesn't start pre-checked from a previous one.
+  if (currentExpecting && currentExpecting.field === 'destination' && (!expecting || expecting.field !== 'destination')) {
+    selectedDestinations.clear();
+  }
   currentExpecting = expecting;
+
+  if (expecting && expecting.field === 'date') {
+    hideLookupDropdown();
+    hidePaxPicker();
+    hidePriceExtrasPicker();
+    hideExtraDetailsPicker();
+    priceExtrasDatePickMode = false;
+    calBackToForm.style.display = 'none';
+    showDatePicker(expecting.params);
+    return;
+  }
+  hideDatePicker();
+
+  if (expecting && expecting.field === 'pax') {
+    hideLookupDropdown();
+    hidePriceExtrasPicker();
+    hideExtraDetailsPicker();
+    showPaxPicker();
+    return;
+  }
+  hidePaxPicker();
+
+  if (expecting && expecting.field === 'priceExtras') {
+    hideLookupDropdown();
+    hideExtraDetailsPicker();
+    showPriceExtrasPicker();
+    return;
+  }
+  hidePriceExtrasPicker();
+
+  if (expecting && expecting.field === 'extraDetails') {
+    hideLookupDropdown();
+    showExtraDetailsPicker();
+    return;
+  }
+  hideExtraDetailsPicker();
+
   if (!expecting) {
     hideLookupDropdown();
     return;
@@ -136,8 +538,42 @@ function setExpecting(expecting) {
   fetchLookupOptions(expecting, input.value.trim());
 }
 
+// Picking a day either submits it immediately (same as clicking an agent/hotel dropdown item - a
+// single date is an unambiguous complete answer) or, when borrowed by the pricing-extras form's
+// due-date field, writes back into that form instead and returns to it.
+calGrid.addEventListener('click', (e) => {
+  const btn = e.target.closest('.cal-day');
+  if (!btn || btn.disabled) return;
+  const [y, m, d] = btn.dataset.date.split('-');
+  const ddmmyyyy = `${d}-${m}-${y}`;
+  hideDatePicker();
+  if (priceExtrasDatePickMode) {
+    priceExtrasDatePickMode = false;
+    calBackToForm.style.display = 'none';
+    priceExtrasDueDate = ddmmyyyy;
+    updatePeDueDateLabel();
+    syncPriceExtrasInputValue();
+    priceExtrasBox.style.display = 'block';
+    reserveSpaceForVisiblePopover();
+    return;
+  }
+  sendMessage(ddmmyyyy);
+});
+
 lookupDropdown.addEventListener('mousedown', (e) => {
   // mousedown (not click) so this fires before the input's blur event hides the dropdown
+  const multiRow = e.target.closest('.lookup-item-multi');
+  if (multiRow) {
+    e.preventDefault();
+    const id = multiRow.dataset.id;
+    if (selectedDestinations.has(id)) selectedDestinations.delete(id);
+    else selectedDestinations.set(id, multiRow.dataset.name);
+    syncDestinationInputValue();
+    renderLookupDropdown(lookupItems, LOOKUP_EMPTY_TEXT.destination, true);
+    input.focus();
+    return;
+  }
+
   const el = e.target.closest('.lookup-item');
   if (!el) return;
   e.preventDefault();
@@ -163,6 +599,27 @@ input.addEventListener('blur', () => {
 });
 
 input.addEventListener('keydown', (e) => {
+  // #chatInput is a <textarea> (so pasting a multi-line message keeps its line breaks - a plain
+  // <input> silently drops them), which means Enter no longer submits the form on its own the way
+  // it did on the old <input>. Shift+Enter (and IME composition, e.g. mid-pick in an Indic input
+  // method) still inserts a real newline; a plain Enter sends, matching the old input's behavior -
+  // except when the lookup dropdown has an active item, where it picks that item instead (unchanged).
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    const dropdownOpen = !(currentExpecting && currentExpecting.multi) && lookupDropdown.style.display === 'block' && lookupItems.length > 0;
+    if (dropdownOpen && lookupActiveIndex >= 0) {
+      e.preventDefault();
+      const item = lookupItems[lookupActiveIndex];
+      hideLookupDropdown();
+      sendMessage(item.Name);
+      return;
+    }
+    e.preventDefault();
+    sendMessage(input.value);
+    return;
+  }
+
+  // Multi-select fields (destination checklist) are driven by clicking checkboxes, not keyboard nav.
+  if (currentExpecting && currentExpecting.multi) return;
   if (lookupDropdown.style.display !== 'block' || lookupItems.length === 0) return;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
@@ -172,11 +629,6 @@ input.addEventListener('keydown', (e) => {
     e.preventDefault();
     lookupActiveIndex = Math.max(lookupActiveIndex - 1, 0);
     updateLookupActiveHighlight();
-  } else if (e.key === 'Enter' && lookupActiveIndex >= 0) {
-    e.preventDefault();
-    const item = lookupItems[lookupActiveIndex];
-    hideLookupDropdown();
-    sendMessage(item.Name);
   } else if (e.key === 'Escape') {
     hideLookupDropdown();
   }
@@ -358,6 +810,16 @@ const QUICK_REPLY_ICONS = {
   'Single sharing': '🛏️',
   'Double sharing': '🛏️',
   'Triple sharing': '🛏️',
+  'Add pricing line': '➕',
+  'Adult / Single': '🧑',
+  'Adult / Double': '👥',
+  'Adult / Triple': '👨‍👩‍👦',
+  'Child With Bed': '🛏️',
+  'Child Without Bed': '🧒',
+  Infant: '👶',
+  'With FlyThai Logo': '🌴',
+  'With Agent Logo': '🏢',
+  'No Logo': '🚫',
 };
 
 function renderQuickReplies(list) {
@@ -376,10 +838,18 @@ function renderQuickReplies(list) {
 // optional fields the step accepts in a single message, so picking one shouldn't cut off a chance
 // to also type/add the others (e.g. click "Double sharing", then still add "2 adults" before
 // sending). Appends to whatever's already typed instead of overwriting it.
+//
+// Exception: the logo-choice step (which PDF logo version) is a single complete answer, not one
+// of several fields to combine - clicking a chip there sends it immediately instead, so choosing
+// a PDF version is one tap, not a tap-then-Send.
 quickReplies.addEventListener('click', (e) => {
   const el = e.target.closest('.chip');
   if (!el) return;
   const text = el.textContent;
+  if (currentExpecting && currentExpecting.field === 'logoChoice') {
+    sendMessage(text);
+    return;
+  }
   input.value = input.value.trim() ? `${input.value.trim()}, ${text}` : text;
   updateCharCount();
   input.focus();
@@ -449,6 +919,17 @@ function updateCharCount() {
   } else {
     charCount.style.display = 'none';
   }
+  autoResizeInput();
+}
+
+// Grows #chatInput to fit its content (typed or pasted, including multi-line paste - see the
+// textarea note in style.css) up to INPUT_MAX_HEIGHT, then leaves it to scroll internally rather
+// than pushing the rest of the page around. Called from updateCharCount so every existing
+// `input.value = ...` call site (chips, destination checklist, pax spinners, ...) picks this up
+// automatically instead of needing its own resize call.
+function autoResizeInput() {
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(input.scrollHeight, INPUT_MAX_HEIGHT)}px`;
 }
 
 input.addEventListener('input', updateCharCount);

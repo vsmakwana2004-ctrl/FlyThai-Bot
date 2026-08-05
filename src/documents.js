@@ -58,17 +58,36 @@ const LOGO_LABELS = { 1: 'With FlyThai Logo', 2: 'With Agent Logo', 3: 'No Logo'
 
 // Detects requests like "download invoice for FT08261781", "get itinerary pdf FTQ05260001", or
 // "give me quotation of FTQ12260001 in pdf". Deliberately narrow/regex-based (not LLM) so we
-// never construct a document link from a hallucinated booking id - the code must be literally
-// present in the user's message.
-function detectDocumentIntent(text) {
+// never construct a document link from a hallucinated booking id - a code must either be literally
+// present in the user's message, or resolvable from fallbackCode (the last booking/quotation code
+// mentioned in this chat session - same convention statusUpdate.js/accountTransactions.js use), so
+// a follow-up like "give me invoice of this" right after discussing a booking still resolves
+// instead of erroring out with no code to work with.
+function detectDocumentIntent(text, fallbackCode) {
   const codeMatch = text.match(CODE_RE);
-  if (!codeMatch) return null;
-  if (!DOWNLOAD_VERB_RE.test(text)) return null;
+  const isHotelVoucher = HOTEL_VOUCHER_RE.test(text);
+  const isItinerary = ITINERARY_RE.test(text);
+  const isReport = REPORT_RE.test(text);
 
-  const code = codeMatch[0].toUpperCase();
-  if (HOTEL_VOUCHER_RE.test(text)) return { type: 'hotelVoucher', code };
-  if (ITINERARY_RE.test(text)) return { type: 'itinerary', code };
-  if (REPORT_RE.test(text)) return { type: 'report', code };
+  // "download"/"pdf"/"generate" alone are always a strong enough signal, even for a vague/unknown
+  // document type (handled below). "give"/"send" are too ambiguous on their own - "give me the
+  // details" is a normal text lookup, not a file request - so those only count when paired with a
+  // specific document word (invoice/itinerary/hotel voucher) that removes the ambiguity.
+  const hasStrongVerb = DOWNLOAD_VERB_RE.test(text);
+  const hasWeakVerb = (isHotelVoucher || isItinerary || isReport) && fuzzyWordMatch(text, ['give', 'send']);
+  if (!hasStrongVerb && !hasWeakVerb) return null;
+
+  // A real file request was made (strong or weak verb matched above) but there's no code to work
+  // with - neither in this message nor from an earlier one in the session. Rather than let this
+  // fall through to the LLM planner (which has no booking to build a query around and was seen
+  // failing with a confusing raw DB error - "Multiple statements are not allowed" - instead of a
+  // clear ask), hand back a distinct signal so chat.js can ask for the code directly.
+  const code = codeMatch ? codeMatch[0].toUpperCase() : fallbackCode;
+  if (!code) return { type: 'needsCode' };
+
+  if (isHotelVoucher) return { type: 'hotelVoucher', code };
+  if (isItinerary) return { type: 'itinerary', code };
+  if (isReport) return { type: 'report', code };
   // An explicit file request ("... in pdf") was made but it's unclear which document is meant -
   // ask instead of silently falling back to a plain-text answer.
   return { type: 'unknown', code };

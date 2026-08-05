@@ -6,6 +6,7 @@ const documents = require('./documents');
 const bookingDetails = require('./bookingDetails');
 const statusUpdate = require('./statusUpdate');
 const accountTransactions = require('./accountTransactions');
+const financeReports = require('./financeReports');
 const convertBooking = require('./convertBooking');
 const editBooking = require('./editBooking');
 const { findBookingById } = require('./bookingApi');
@@ -231,6 +232,34 @@ function nowTimeIST() {
   return new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit' }); // HH:MM:SS
 }
 
+// Converts a stored DD-MM-YYYY field value to the YYYY-MM-DD an HTML <input type="date">'s min/
+// value attributes need. Pads single-digit day/month since a raw user answer like "5-1-2026" is
+// stored as-is, unpadded.
+function ddmmyyyyToISO(str) {
+  if (!str || typeof str !== 'string') return null;
+  const parts = str.trim().split('-');
+  if (parts.length !== 3) return null;
+  const [d, m, y] = parts;
+  return `${y.padStart(4, '0')}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+}
+
+function addDaysISO(iso, days) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  date.setDate(date.getDate() + days);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+// Shared min/max for every itinerary-item date field (hotel check-in/out, transfer/sightseeing/
+// restaurant/leisure-day date) - matches validateItineraryItemDate's own rule that an item date
+// can't fall before the trip's travel date or after its return date. minOverride lets check-out
+// tighten the floor to the day after check-in instead of the trip's travel date.
+function itineraryDateParams(draft, minOverride) {
+  const min = minOverride || ddmmyyyyToISO(draft.fields.travelDate) || todayIST();
+  const max = ddmmyyyyToISO(draft.fields.returnDate);
+  return max ? { min, max } : { min };
+}
+
 function extractSql(text) {
   const m = text.match(/```sql\s*([\s\S]*?)```/i);
   if (m) return m[1].trim();
@@ -292,20 +321,72 @@ Use this same structure consistently whether the user asks for "full details," j
 
 const ANY_CODE_RE = /\bFTQ?\d+\b/i;
 
+// The itinerary/hotel-voucher "which logo version?" question - same fixed 3-way choice every
+// time. Shown as chips (quickReplies) rather than the lookup dropdown, but unlike every other
+// quickReplies chip set (which fill the input for a multi-field message) the frontend auto-sends
+// on click here - it's a single, complete, unambiguous answer, and parseLogoChoice in documents.js
+// already accepts the label text exactly as-is - so there's nothing to add to before sending.
+const LOGO_CHOICE_LABELS = ['With FlyThai Logo', 'With Agent Logo', 'No Logo'];
+function logoChoiceExpecting(session) {
+  return session.pendingItinerary ? { field: 'logoChoice' } : null;
+}
+function logoChoiceQuickReplies(session) {
+  return session.pendingItinerary ? LOGO_CHOICE_LABELS : null;
+}
+
 // Tells the frontend which live-lookup dropdown (if any) to show above the chat input, so the
 // user can pick from real registered records instead of typing blind - mirrors the real site's
 // own autocomplete fields. Covers the agent/company field and, during hotel collection, the
 // hotel-name field (scoped to the destination already picked for that hotel row, if resolved).
 function expectingField(draft) {
   if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'agentName') return { field: 'agent' };
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'destinationNames') return { field: 'destination', multi: true };
+  // Travel/return date steps get a real calendar picker instead of free typing - min is today's
+  // date for travel date, and the trip's own travel date for return date (matching the same
+  // "can't be in the past" / "return can't be before travel" rules bookingFlow.js enforces itself).
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'travelDate') {
+    return { field: 'date', params: { min: todayIST() } };
+  }
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'returnDate') {
+    return { field: 'date', params: { min: ddmmyyyyToISO(draft.fields.travelDate) || todayIST() } };
+  }
+  // Adults/children/infants step gets three number spinners instead of free-text counting -
+  // adults is enforced to be at least 1 (a booking needs at least one adult traveller).
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'travelCount') return { field: 'pax' };
   if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'hotelName') {
     const destinationId = draft.currentHotelDraft && draft.currentHotelDraft._destId;
     return { field: 'hotel', params: destinationId ? { destinationId } : {} };
   }
+  // Room category dropdown, scoped to whichever hotel was just resolved - only shown when that
+  // hotel has a real Id (a brand-new hotel typed fresh has none yet, so this just falls through
+  // to plain typing, same as before).
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'roomCategory') {
+    const hotelId = draft.currentHotelDraft && draft.currentHotelDraft._resolvedHotelId;
+    if (hotelId) return { field: 'roomType', params: { hotelId } };
+  }
+  // A hotel row's destination question only comes up at all when the trip has more than one
+  // destination (bookingFlow.js auto-picks the single one otherwise) - a plain single-select
+  // dropdown, not the multi-checklist basic collection uses, scoped to just this trip's own
+  // destinations rather than every destination in the database.
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'destinationName') {
+    return { field: 'destination', options: draft.resolvedDestinations.map((d) => ({ Id: d.Id, Name: d.Name, ShortCode: d.ShortCode })) };
+  }
+  // Check-in/check-out get the same calendar picker as travel/return date, bounded to stay inside
+  // the trip's own travel/return range - matching validateItineraryItemDate's own rules (check-in
+  // can't be before travel date or after return date; check-out must be strictly after check-in).
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'checkInDate') {
+    return { field: 'date', params: itineraryDateParams(draft) };
+  }
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'checkOutDate') {
+    const checkInISO = draft.currentHotelDraft && ddmmyyyyToISO(draft.currentHotelDraft.checkInDate);
+    return { field: 'date', params: itineraryDateParams(draft, checkInISO ? addDaysISO(checkInISO, 1) : null) };
+  }
   // Add Transfer step - same Pickup Point / DropOff Point / Transfer Code+Name / Vehicle Type
   // dropdowns the real site's own Add Transfer form shows, resolved against draft.itemStep
-  // (the field currently being collected) rather than draft.phase alone.
+  // (the field currently being collected) rather than draft.phase alone. The date field (asked
+  // first, before any of those) gets the same trip-bounded calendar as every other itinerary date.
   if (draft && draft.phase === 'transferCollect') {
+    if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
     if (draft.itemStep === 'pickupPointName' || draft.itemStep === 'dropOffPointName') return { field: 'pickup' };
     if (draft.itemStep === 'transferName') return { field: 'transfer' };
     if (draft.itemStep === 'vehicleTypeName') return { field: 'vehicle' };
@@ -313,6 +394,7 @@ function expectingField(draft) {
   // Add Sightseeing step - Pickup Point / Sightseeing Code+Name dropdowns, the latter scoped to
   // the weekday of the date already picked for this item (mirrors the real form's own filtering).
   if (draft && draft.phase === 'sightseeingCollect') {
+    if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
     if (draft.itemStep === 'pickupPointName') return { field: 'pickup' };
     if (draft.itemStep === 'sightseeingName') {
       const weekday = weekdayNameFromDDMMYYYY(draft.currentItemDraft && draft.currentItemDraft.date);
@@ -322,9 +404,22 @@ function expectingField(draft) {
   // Add Restaurant step - was the one itinerary-item field with no dropdown at all, so a wrong
   // guess just repeated "couldn't find a restaurant matching ..." with no way to discover a real
   // name, reading as a stuck loop.
-  if (draft && draft.phase === 'restaurantCollect' && draft.itemStep === 'restaurantName') {
-    return { field: 'restaurant' };
+  if (draft && draft.phase === 'restaurantCollect') {
+    if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
+    if (draft.itemStep === 'restaurantName') return { field: 'restaurant' };
   }
+  // Leisure Day is a single-question phase (just the date) - draft.phase alone identifies it,
+  // there's no itemStep to check.
+  if (draft && draft.phase === 'leisureDayCollect') {
+    return { field: 'date', params: itineraryDateParams(draft) };
+  }
+  // Optional pricing extras (ROE/tax/discount/due date/final rate) get one small multi-field form
+  // instead of a single free-text message the user has to phrase from memory - it still lands on
+  // the same LLM-parsed stepPriceExtras() as before, just pre-composed for them.
+  if (draft && draft.phase === 'priceExtras') return { field: 'priceExtras' };
+  // Final optional details (note/emergency contact/booked by/PDF permissions) - same idea, only
+  // shown once the user has actually said they want to add any (see the extraGate quick replies).
+  if (draft && draft.phase === 'extraCollect') return { field: 'extraDetails' };
   return null;
 }
 
@@ -334,9 +429,34 @@ function expectingField(draft) {
 // above the input, same idea as the lookup dropdowns above but for LLM-extracted free-text steps
 // rather than a DB-backed field. Clicking one sends its exact text, same as typing it.
 function quickRepliesFor(draft) {
+  // First question of any new booking/quotation - manual entry vs pre-filling from a pasted
+  // travel-agent message (see bookingFlow.js stepSource/stepAgentPaste).
+  if (draft && draft.phase === 'source') {
+    return ['Manual Booking', 'Travel Agent Booking'];
+  }
+  if (draft && draft.phase === 'agentPasteConfirm') {
+    return ['Yes, use these', 'No, enter manually'];
+  }
   if (draft && draft.phase === 'hotelOptionalCollect') {
     return ['Skip', 'Breakfast included', 'No breakfast', 'Single sharing', 'Double sharing', 'Triple sharing'];
   }
+  if (draft && draft.phase === 'hotelChoice') {
+    return ['Self-booked', 'Add hotel details'];
+  }
+  // Traveller-type field: the real site's own #member-type autocomplete only ever offers these six
+  // values (managebookings.js bindMemberType()) - chips beat typing one out from memory.
+  if (draft && draft.phase === 'priceCollect' && draft.itemStep === 'type') {
+    return ['Adult / Single', 'Adult / Double', 'Adult / Triple', 'Child With Bed', 'Child Without Bed', 'Infant'];
+  }
+  // First entry into pricing collection - "Skip" is a one-tap way out for staff with nothing to
+  // add (the form below has no submit button of its own for an all-blank answer); "Add pricing
+  // line" mirrors what typing anything other than a "no" here already does in stepPriceCollect.
+  if (draft && draft.phase === 'priceCollect' && !draft.currentItemDraft) return ['Skip', 'Add pricing line'];
+  if (draft && draft.phase === 'priceExtras') return ['Skip'];
+  // Gate before the final note/emergency-contact/booked-by/PDF-permission form - most bookings
+  // need none of it, so "Skip" goes straight to confirm without ever opening the form.
+  if (draft && draft.phase === 'extraGate') return ['Skip', 'Yes, add details'];
+  if (draft && draft.phase === 'extraCollect') return ['Skip'];
   return null;
 }
 
@@ -389,7 +509,7 @@ async function handleChatInner(sessionId, userMessage) {
     const { reply, pending } = documents.stepLogoChoice(session.pendingItinerary, userMessage);
     session.pendingItinerary = pending;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
   }
 
   // If we previously asked "which PDF - invoice/quotation, itinerary, or hotel voucher?" this
@@ -400,7 +520,7 @@ async function handleChatInner(sessionId, userMessage) {
     if (pendingItinerary) session.pendingItinerary = pendingItinerary;
     if (pendingHotelChoice) session.pendingHotelChoice = pendingHotelChoice;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
   }
 
   // If a booking has more than one hotel stay, we previously asked "which hotel's voucher?" -
@@ -410,7 +530,7 @@ async function handleChatInner(sessionId, userMessage) {
     session.pendingHotelChoice = pendingHotelChoice;
     if (pendingItinerary) session.pendingItinerary = pendingItinerary;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
   }
 
   // A "convert this quotation to a booking?" confirmation was asked last turn - this answers it.
@@ -606,12 +726,57 @@ async function handleChatInner(sessionId, userMessage) {
   // Or a request for an invoice/itinerary/hotel voucher PDF - handled deterministically (no
   // LLM/SQL needed), since the download link must be built from a real, verified booking id (and
   // for hotel vouchers, a real BookingHotel id), never guessed.
-  const docIntent = documents.detectDocumentIntent(userMessage);
+  const docIntent = documents.detectDocumentIntent(userMessage, session.lastBookingCode);
   if (docIntent) {
+    if (docIntent.type === 'needsCode') {
+      const reply = `Which booking or quotation is that for? Please give me the code (e.g. FT08261781 or FTQ05260001).`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
     const { reply, pendingItinerary, pendingDocChoice, pendingHotelChoice } = await documents.handleDocumentRequest(docIntent);
     if (pendingItinerary) session.pendingItinerary = pendingItinerary;
     if (pendingDocChoice) session.pendingDocChoice = pendingDocChoice;
     if (pendingHotelChoice) session.pendingHotelChoice = pendingHotelChoice;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
+  }
+
+  // Cross-booking financial totals ("this month's income", "how much is receivable") - checked
+  // before the per-booking account-transactions/full-detail intents below and well before the
+  // generic LLM planner, which would silently double-count AccountTransaction's paired debit/
+  // credit legs or mis-sign the numbers - the same risk class the ledger module below and
+  // financeReports.js itself were built to avoid. Skipped entirely when an FT/FTQ code is present -
+  // "amount due for FT08261781" is a per-booking question (handled below/by the planner), not an
+  // aggregate one, even though it matches the same wording.
+  const financeIntent = !ANY_CODE_RE.test(userMessage) ? financeReports.detectFinanceReportIntent(userMessage) : null;
+  if (financeIntent) {
+    if (financeIntent.kind === 'income') {
+      const result = await financeReports.fetchIncomeReport(financeIntent.period);
+      const reply = financeReports.formatIncomeAnswer(result);
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    if (financeIntent.kind === 'paymentReceived') {
+      const result = await financeReports.fetchPaymentReceivedReport(financeIntent.period);
+      const reply = financeReports.formatPaymentReceivedAnswer(result);
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: result.byCurrency.length, rows: result.byCurrency.length ? result.byCurrency : undefined };
+    }
+    if (financeIntent.kind === 'receivable') {
+      const result = await financeReports.fetchReceivableReport();
+      const reply = financeReports.formatReceivableAnswer(result);
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    if (financeIntent.kind === 'profitUnsupported') {
+      const reply = financeReports.formatProfitUnsupportedAnswer();
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    // 'summary' - the catch-all for any other finance/account-shaped question (total purchase,
+    // expenses, net balance, ...) that isn't one of the three specific formats above.
+    const result = await financeReports.fetchAccountSummary(financeIntent.period);
+    const reply = financeReports.formatAccountSummaryAnswer(result);
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0 };
   }

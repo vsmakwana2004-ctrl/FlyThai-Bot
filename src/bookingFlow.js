@@ -1,5 +1,5 @@
 const { callLLM } = require('./llm');
-const { findAgent, findDestinations, findHotel, findPickup, findVehicle, findPickupOrParticular, findSightseeing, findRestaurant, listDestinations, listVehicles } = require('./lookups');
+const { findAgent, findDestinations, findHotel, findPickup, findVehicle, findPickupOrParticular, findSightseeing, findRestaurant, listDestinations, listVehicles, findHotelRoomType } = require('./lookups');
 const { submitBooking, findBookingById } = require('./bookingApi');
 const { isWholeFlowCancel, isBareCancel } = require('./cancel');
 
@@ -47,7 +47,8 @@ function detectCreateIntent(text) {
 function startDraft(kind) {
   return {
     kind,
-    phase: 'basic',
+    phase: 'source',
+    sourceStarted: false,
     fields: {},
     resolvedDestinations: null, // [{Id, Name}, ...] once resolved in trySubmitBasic
     hotelSelfBooked: null,
@@ -233,6 +234,205 @@ function nextBasicStep(draft) {
   });
 }
 
+// ---------- phase: source (manual vs travel-agent-provided) ----------
+// The very first question of any new booking/quotation: was this typed in from scratch, or is it
+// based on a message a travel agent already sent with (partial) trip details? Picking "travel
+// agent" routes through stepAgentPaste below to pre-fill whatever it can from that message, then
+// drops into the exact same phase: 'basic' flow the manual path uses - stepBasic itself, and
+// everything after it (hotel/itinerary/pricing), is completely untouched by this addition.
+
+function sourceChoicePrompt(draft) {
+  return `Let's create a new ${draft.kind}. First — is this a **manual booking**, or based on details a **travel agent** already sent you?\n\n_(You can say **cancel** at any point to stop.)_`;
+}
+
+async function stepSource(draft, userMessage) {
+  if (!draft.sourceStarted) {
+    draft.sourceStarted = true;
+    return { reply: sourceChoicePrompt(draft), draft };
+  }
+
+  const t = userMessage.trim().toLowerCase();
+  if (/travel\s*agent|agent\s*booking/.test(t)) {
+    draft.phase = 'agentPaste';
+    if (!draft.destinationOptions) draft.destinationOptions = await listDestinations();
+    return { reply: "Please paste the travel agent's message with the trip details, and I'll pull out whatever I can from it — then I'll ask for anything that's still missing.", draft };
+  }
+  if (/manual/.test(t)) {
+    draft.phase = 'basic';
+    return stepBasic(draft, userMessage);
+  }
+  return { reply: 'Please reply "manual booking" or "travel agent booking".', draft };
+}
+
+// ---------- phase: agentPaste (pre-fill basic fields from a pasted travel-agent message) ----------
+// Only pre-fills fields that are either free text (guestName) or already confirmed against real
+// records the same way the manual flow does (findDestinations) - destinations are only auto-filled
+// when EVERY one resolves cleanly and unambiguously, same standard the manual destinationNames
+// step itself enforces, so a bad guess never silently attaches the wrong destination Id. Anything
+// the model can't confidently map to a real field (hotel categories, room-wise pax splits, day-by-
+// day itinerary, special requests) is preserved verbatim as an extra note rather than dropped, since
+// this codebase has no safe way to auto-resolve those against hotel/transfer/sightseeing master
+// records without risking a wrong DB match on a real booking.
+
+function agentPasteSystemPrompt(destinationOptions) {
+  const d = todayDateObjIST();
+  const todayStr = `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+  return `You are reading a raw message forwarded from a travel agent describing a trip they want booked. This message may be complete or partial - it may mention MORE or FEWER details than a typical booking needs. Extract ONLY what is literally stated. Never guess, infer, assume a default, or invent a value that isn't actually supported by the text - if you are not sure about a field, or it simply isn't mentioned, leave that field out of the JSON entirely. Getting a field wrong is worse than leaving it blank, since a blank field just gets asked about normally afterwards.
+
+Today's date is ${todayStr} (DD-MM-YYYY). Use it only to resolve a stated date that omits its year (pick the nearest sensible upcoming date) and to compute a return date from an explicit check-in date plus an explicit list of "<place> - N Nights" covering every destination mentioned - if either the check-in date or the full list of nights isn't clearly present, leave travelDate/returnDate out rather than guess.
+
+Known destinations in the system - match the agent's place names to these (closest match only; never include a destination that the message doesn't actually name, and never invent one that isn't in this list): ${destinationOptions.map((dd) => dd.Name).join(', ')}
+
+Fields:
+- guestName: the actual traveller/guest's name, ONLY if a specific person's name is clearly given as the traveller (not the travel agent's own name/company, and not guessed from context)
+- destinationNames: array of destination names (from the list above) the trip covers, in visiting order if determinable - only ones actually named in the message
+- travelDate: DD-MM-YYYY, only if clearly stated or unambiguously computable as described above
+- returnDate: DD-MM-YYYY, only if clearly stated or unambiguously computable as described above
+- guestAdults: number of adults, only if a number of adults is explicitly stated
+- guestChildrens: number of children, only if explicitly stated - do NOT default to 0 just because adults were mentioned without children being mentioned; omit this field instead
+- guestInfants: number of infants, only if explicitly stated - same rule, do NOT default to 0
+- notes: a thorough plain-text summary of everything else mentioned that isn't already captured above - hotel names/categories requested, room-wise pax breakdown, specific hotel preferences, day-by-day itinerary/activities, special requests (gala dinner, pool party, shows, transfers, etc). This is kept as a reference note for staff, so include detail rather than drop it - unlike the fields above, being thorough here carries no risk since nothing here is auto-saved into a structured field.
+
+Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "notes": "..."}`;
+}
+
+// Builds the shared "what's still missing" prompt used both when the agent-provided extraction is
+// accepted (stepAgentPasteConfirm) and when nothing usable was extracted at all (stepAgentPaste) -
+// same end-of-basic-phase logic stepBasic itself uses (nextBasicStep -> pax question -> hotel
+// choice), duplicated here rather than shared so stepBasic's own manual-flow code path is never
+// touched by this feature.
+function basicNextPrompt(draft) {
+  const next = nextBasicStep(draft);
+  if (next) {
+    draft.basicCurrentStep = next;
+    return basicStepPrompt(next, draft);
+  }
+  if (!draft.basicPaxAsked) {
+    draft.basicPaxAsked = true;
+    draft.basicCurrentStep = 'travelCount';
+    return 'How many Adults/Children/Infants are travelling? e.g. "4 adults, 1 child" (optional — reply "skip" to leave this for now)';
+  }
+  draft.phase = 'hotelChoice';
+  return `Got the basic details for **${draft.fields.guestName}**. Now — is the hotel self-booked (guest arranging their own), or would you like to add hotel details? (reply "self-booked" or "add hotel")`;
+}
+
+// Extraction only ever writes into a staging object here, never straight into draft.fields - the
+// LLM can misread or over/under-count a partial message, so nothing it produces is trusted onto a
+// real field until a human explicitly confirms it in stepAgentPasteConfirm below. Destinations are
+// additionally re-verified against real records (findDestinations) before being offered, same as
+// the manual destinationNames step - a name the model got wrong or that matches ambiguously simply
+// isn't offered at all, exactly like the manual flow's own behaviour on a bad/ambiguous match.
+async function stepAgentPaste(draft, userMessage) {
+  if (!draft.destinationOptions) draft.destinationOptions = await listDestinations();
+  const answer = userMessage.trim();
+
+  let parsed = {};
+  try {
+    parsed = await extractFields(agentPasteSystemPrompt(draft.destinationOptions), answer);
+  } catch (e) {
+    parsed = {};
+  }
+
+  const staged = {};
+  const filled = [];
+  let resolvedDestinations = null;
+  let stagedPaxAsked = false;
+
+  if (parsed.guestName && String(parsed.guestName).trim()) {
+    staged.guestName = String(parsed.guestName).trim();
+    filled.push(`Guest Name: ${staged.guestName}`);
+  }
+
+  if (Array.isArray(parsed.destinationNames) && parsed.destinationNames.length > 0) {
+    try {
+      const { matches, notFound } = await findDestinations(parsed.destinationNames);
+      const ambiguous = matches.filter((m) => m.ambiguous);
+      if (notFound.length === 0 && ambiguous.length === 0 && matches.length > 0) {
+        resolvedDestinations = matches;
+        staged.destinationNames = matches.map((m) => m.Name);
+        filled.push(`Destinations: ${matches.map(formatDest).join(', ')}`);
+      }
+    } catch (e) {
+      // leave unresolved - the normal destinationNames question below will ask for it
+    }
+  }
+
+  const travelDateObj = parsed.travelDate ? parseDateDDMMYYYY(parsed.travelDate) : null;
+  if (travelDateObj && travelDateObj >= todayDateObjIST()) {
+    staged.travelDate = parsed.travelDate;
+    filled.push(`Travel Date: ${parsed.travelDate}`);
+  }
+  const returnDateObj = parsed.returnDate ? parseDateDDMMYYYY(parsed.returnDate) : null;
+  if (returnDateObj && staged.travelDate && returnDateObj > parseDateDDMMYYYY(staged.travelDate)) {
+    staged.returnDate = parsed.returnDate;
+    filled.push(`Return Date: ${parsed.returnDate}`);
+  }
+
+  const adultsNum = Number(parsed.guestAdults);
+  if (parsed.guestAdults != null && Number.isFinite(adultsNum) && adultsNum > 0) {
+    staged.guestAdults = adultsNum;
+    stagedPaxAsked = true;
+    filled.push(`Adults: ${adultsNum}`);
+  }
+  const childrenNum = Number(parsed.guestChildrens);
+  if (parsed.guestChildrens != null && Number.isFinite(childrenNum) && childrenNum >= 0) {
+    staged.guestChildrens = childrenNum;
+    filled.push(`Children: ${childrenNum}`);
+  }
+  const infantsNum = Number(parsed.guestInfants);
+  if (parsed.guestInfants != null && Number.isFinite(infantsNum) && infantsNum >= 0) {
+    staged.guestInfants = infantsNum;
+    filled.push(`Infants: ${infantsNum}`);
+  }
+
+  // Free-text reference note - not a structured field the rest of the flow trusts or acts on, so
+  // it's kept regardless of whether the human accepts/rejects the structured fields above.
+  if (parsed.notes && String(parsed.notes).trim()) {
+    const note = String(parsed.notes).trim();
+    draft.extraFields.extraNote = draft.extraFields.extraNote ? `${draft.extraFields.extraNote}\n${note}` : note;
+  }
+  draft.agentRawMessage = answer;
+
+  if (filled.length === 0) {
+    draft.basicStarted = true;
+    draft.phase = 'basic';
+    const prompt = basicNextPrompt(draft);
+    return { reply: `I couldn't confidently pull any structured details from that message, so I'll ask for everything as usual.\n\n${prompt}`, draft };
+  }
+
+  draft._pendingAgentExtract = { fields: staged, resolvedDestinations, basicPaxAsked: stagedPaxAsked };
+  draft.phase = 'agentPasteConfirm';
+  return {
+    reply: `I read this from the message — please double-check it against what the agent actually sent before I use it:\n${filled.map((f) => `- ${f}`).join('\n')}\n\nUse these details? Reply "yes" to continue with them, or "no" to enter the basic details manually instead.`,
+    draft,
+  };
+}
+
+// The human checkpoint that the staged extraction above waits on - nothing it produced reaches
+// draft.fields (and therefore the eventual saved booking) unless explicitly accepted here.
+async function stepAgentPasteConfirm(draft, userMessage) {
+  const yn = parseYesNo(userMessage);
+  if (yn === null) {
+    return { reply: 'Reply "yes" to use these details, or "no" to enter the basic details manually instead.', draft };
+  }
+
+  const staged = draft._pendingAgentExtract || { fields: {}, resolvedDestinations: null, basicPaxAsked: false };
+  delete draft._pendingAgentExtract;
+
+  if (yn === true) {
+    Object.assign(draft.fields, staged.fields);
+    if (staged.resolvedDestinations) draft.resolvedDestinations = staged.resolvedDestinations;
+    if (staged.basicPaxAsked) draft.basicPaxAsked = true;
+  }
+  // yn === false: staged data is simply discarded - draft.fields is untouched, so every field just
+  // gets asked about normally below, same as if nothing had ever been extracted.
+
+  draft.basicStarted = true;
+  draft.phase = 'basic';
+  const prompt = basicNextPrompt(draft);
+  return { reply: prompt, draft };
+}
+
 async function stepBasic(draft, userMessage) {
   if (!draft.destinationOptions) draft.destinationOptions = await listDestinations();
 
@@ -381,9 +581,7 @@ async function stepHotelChoice(draft, userMessage) {
   if (wantsAdd || parseYesNo(userMessage) === true) {
     draft.hotelSelfBooked = false;
     draft.phase = 'hotelCollect';
-    draft.currentHotelDraft = {};
-    draft.hotelStep = 'destinationName';
-    return { reply: hotelStepPrompt('destinationName', draft), draft };
+    return { reply: startHotelCollect(draft), draft };
   }
   return { reply: 'Sorry, could you clarify — reply "self-booked" or "add hotel"?', draft };
 }
@@ -404,11 +602,34 @@ function hotelStepPrompt(stepKey, draft) {
       return 'What is the room category? (e.g. "Superior Room Sin/Dou")';
     case 'totalRooms':
       return 'How many rooms?';
-    case 'ratePerNight':
+    case 'ratePerNight': {
+      const h = draft.currentHotelDraft;
+      if (h && h._roomTypeRate != null) {
+        return `What is the rate per night? (reply "same" to use this room type's own rate: ${h._roomTypeRate} ${h._roomTypeCurrency || draft.fields.currency || 'THB'})`;
+      }
       return `What is the rate per night? (just the number - currency defaults to ${draft.fields.currency || 'THB'})`;
+    }
     default:
       return '';
   }
+}
+
+// Starts (or restarts, for a second/third hotel) collection of one hotel row. If the trip only
+// has one destination there's nothing to choose, so "which destination is this hotel for?" is
+// skipped entirely and that destination is used directly - only trips with several destinations
+// still ask, via a single-select dropdown scoped to just this trip's own destinations.
+function startHotelCollect(draft) {
+  draft.currentHotelDraft = {};
+  const h = draft.currentHotelDraft;
+  if (draft.resolvedDestinations.length === 1) {
+    const dest = draft.resolvedDestinations[0];
+    h.destinationName = dest.Name;
+    h._destId = dest.Id;
+    draft.hotelStep = 'hotelName';
+    return hotelStepPrompt('hotelName', draft);
+  }
+  draft.hotelStep = 'destinationName';
+  return hotelStepPrompt('destinationName', draft);
 }
 
 async function stepHotelCollect(draft, userMessage) {
@@ -490,9 +711,18 @@ async function stepHotelCollect(draft, userMessage) {
         h.checkOutDate = answer;
         break;
       }
-      case 'roomCategory':
+      case 'roomCategory': {
         h.roomCategory = answer;
+        // Not a strict lookup - roomCategory stays free text either way (BookingHotel.RoomCategory
+        // has no FK) - this only captures the rate/currency for the "same" shortcut below, when the
+        // typed/picked name happens to match one of this hotel's own registered room types exactly.
+        const roomType = h._resolvedHotelId ? await findHotelRoomType(h._resolvedHotelId, answer) : null;
+        if (roomType) {
+          h._roomTypeRate = roomType.RatePerNight;
+          h._roomTypeCurrency = roomType.Currency;
+        }
         break;
+      }
       case 'totalRooms': {
         const n = parseInt(answer, 10);
         if (!Number.isFinite(n) || n <= 0) return { reply: 'That needs to be a whole number greater than 0 — how many rooms?', draft };
@@ -500,7 +730,7 @@ async function stepHotelCollect(draft, userMessage) {
         break;
       }
       case 'ratePerNight': {
-        const n = parseFloat(answer);
+        const n = /^same$/i.test(answer) && h._roomTypeRate != null ? Number(h._roomTypeRate) : parseFloat(answer);
         if (!Number.isFinite(n) || n < 0) return { reply: 'That needs to be a number — what is the rate per night?', draft };
         h.ratePerNight = n;
         break;
@@ -588,9 +818,7 @@ async function stepHotelAddAnother(draft, userMessage) {
   const yn = parseYesNo(userMessage);
   if (yn === true) {
     draft.phase = 'hotelCollect';
-    draft.currentHotelDraft = {};
-    draft.hotelStep = 'destinationName';
-    return { reply: hotelStepPrompt('destinationName', draft), draft };
+    return { reply: startHotelCollect(draft), draft };
   }
   draft.phase = 'itineraryChoice';
   return { reply: askItineraryChoice(), draft };
@@ -1349,18 +1577,34 @@ async function stepPriceExtras(draft, userMessage) {
     delete mergedFields.invoiceDueDate;
   }
   draft.priceFields = mergedFields;
-  draft.phase = 'extraCollect';
-  return { reply: askExtras(), draft };
+  draft.phase = 'extraGate';
+  return { reply: askExtraGate(), draft };
 }
 
 // ---------- phase: extra note / emergency contact / booking by / PDF permissions ----------
 
+// A one-tap gate before the actual form - most bookings need none of this, so staff with nothing
+// to add get straight to confirm instead of being shown a form to skip. Only saying yes/otherwise
+// opens askExtras()'s actual field-collection step below.
+function askExtraGate() {
+  return `Last bit (all optional): extra note, emergency contact, who this is booked by, and PDF download permissions for the agent. Want to add any of these?`;
+}
+
+async function stepExtraGate(draft, userMessage) {
+  if (parseYesNo(userMessage) === false) {
+    draft.phase = 'confirm';
+    return { reply: buildConfirmationSummary(draft), draft };
+  }
+  draft.phase = 'extraCollect';
+  return { reply: askExtras(), draft };
+}
+
 function askExtras() {
-  return `Last bit (all optional): any extra note, emergency contact, who this is booked by, and should the agent be allowed to download the hotel voucher/invoice/itinerary PDFs? Reply with any of these, or "skip".`;
+  return `Extra note, emergency contact, who this is booked by, and/or PDF download permissions — reply with any of these, or "skip".`;
 }
 
 function extraSystemPrompt(fields) {
-  return `You are collecting optional final details for a booking: extraNote, emergencyContact, bookingBy, allowPdfDownloads (boolean - whether the agent may download hotel voucher/invoice/itinerary PDFs, default false if not mentioned).
+  return `You are collecting optional final details for a booking: extraNote, emergencyContact, bookingBy, allowVoucherPdf (boolean), allowInvoicePdf (boolean), allowItineraryPdf (boolean) - each independently whether the agent may download that specific PDF type (hotel voucher / invoice / itinerary), default false if not mentioned.
 Fields so far (JSON): ${JSON.stringify(fields)}
 Merge the user's latest message (only fields the user actually mentioned). This is a single-turn optional step - always set done true.
 Respond with ONLY JSON: {"reply": "", "fields": {...merged...}, "done": true}`;
@@ -1429,6 +1673,11 @@ function buildConfirmationSummary(draft) {
   if (draft.extraFields.extraNote) extraLines.push(`Note: ${draft.extraFields.extraNote}`);
   if (draft.extraFields.emergencyContact) extraLines.push(`Emergency Contact: ${draft.extraFields.emergencyContact}`);
   if (draft.extraFields.bookingBy) extraLines.push(`Booking By: ${draft.extraFields.bookingBy}`);
+  const allowedPdfs = [];
+  if (draft.extraFields.allowVoucherPdf) allowedPdfs.push('Voucher');
+  if (draft.extraFields.allowInvoicePdf) allowedPdfs.push('Invoice');
+  if (draft.extraFields.allowItineraryPdf) allowedPdfs.push('Itinerary');
+  if (allowedPdfs.length > 0) extraLines.push(`Agent may download PDFs: ${allowedPdfs.join(', ')}`);
   if (extraLines.length > 0) {
     out += `### Payments / Job Sheet / Other\n${extraLines.join('\n')}\n\n`;
   }
@@ -1497,11 +1746,18 @@ function buildModel(draft) {
     // same failure mode as roerate/taxAmount above.
     emergencyContact: draft.extraFields.emergencyContact != null ? String(draft.extraFields.emergencyContact) : null,
     bookingBy: draft.extraFields.bookingBy || '',
+    // Was missing entirely - extraNote was captured, shown back in the confirmation summary (so it
+    // LOOKED saved), but never actually included in the payload sent to the real API. Every note
+    // anyone typed through this flow was silently discarded before this fix.
+    extraNote: draft.extraFields.extraNote || '',
     HotelIds: '',
     ItinearyIds: '',
-    IsAllowForInvoice: !!draft.extraFields.allowPdfDownloads,
-    IsAllowForItinerary: !!draft.extraFields.allowPdfDownloads,
-    IsAllowForVoucher: !!draft.extraFields.allowPdfDownloads,
+    // The real site (managebookings.js) submits these as three independent checkboxes
+    // (allowVoucher/allowInvoice/allowItinerary) - previously this used one combined
+    // allowPdfDownloads flag for all three, so there was no way to allow just one PDF type.
+    IsAllowForInvoice: !!draft.extraFields.allowInvoicePdf,
+    IsAllowForItinerary: !!draft.extraFields.allowItineraryPdf,
+    IsAllowForVoucher: !!draft.extraFields.allowVoucherPdf,
     itinearies,
     inquiryId: 0,
   };
@@ -1574,6 +1830,12 @@ async function step(draft, userMessage) {
   }
 
   switch (draft.phase) {
+    case 'source':
+      return stepSource(draft, userMessage);
+    case 'agentPaste':
+      return stepAgentPaste(draft, userMessage);
+    case 'agentPasteConfirm':
+      return stepAgentPasteConfirm(draft, userMessage);
     case 'basic':
       return stepBasic(draft, userMessage);
     case 'hotelChoice':
@@ -1606,6 +1868,8 @@ async function step(draft, userMessage) {
       return stepPriceCollectAnother(draft, userMessage);
     case 'priceExtras':
       return stepPriceExtras(draft, userMessage);
+    case 'extraGate':
+      return stepExtraGate(draft, userMessage);
     case 'extraCollect':
       return stepExtraCollect(draft, userMessage);
     case 'confirm':

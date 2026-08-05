@@ -191,10 +191,41 @@ async function listRestaurants(nameQuery = '') {
 
 // Full option lists for fields the real site shows as a fixed dropdown/checkbox set (not a
 // type-ahead search over a huge table) - small enough to just show all of, up front.
-async function listDestinations() {
+async function listDestinations(nameQuery = '') {
   const pool = await getPool();
-  const result = await pool.request().query(`SELECT Id, Name, ShortCode FROM Destination WHERE IsDelete = 0 ORDER BY Name`);
+  const result = await pool
+    .request()
+    .input('q', `%${nameQuery}%`)
+    .query(`SELECT Id, Name, ShortCode FROM Destination WHERE IsDelete = 0 AND (Name LIKE @q OR ShortCode LIKE @q) ORDER BY Name`);
   return result.recordset;
+}
+
+// Wider, typeahead-style listing for the chat UI's live room-category dropdown, scoped to one
+// hotel (a room type only makes sense in the context of the specific hotel it belongs to) - real
+// registered HotelRoomType rows, so "Superior Room Sin/Dou" no longer has to be typed from memory.
+// Aliased to Name (not RoomName) so it fits the same {Id, Name, ...} shape every other lookup uses.
+async function listHotelRoomTypes(hotelId, nameQuery = '') {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('hotelId', hotelId)
+    .input('q', `%${nameQuery}%`)
+    .query(
+      `SELECT TOP 20 Id, RoomName AS Name, RatePerNight, Currency FROM HotelRoomType WHERE IsDelete = 0 AND IsActive = 1 AND HotelId = @hotelId AND RoomName LIKE @q ORDER BY RoomName`
+    );
+  return result.recordset;
+}
+
+// Strict single lookup used to auto-fill the rate-per-night step once a room type has been picked
+// (either from the dropdown or typed to match one exactly) - not the wider typeahead above.
+async function findHotelRoomType(hotelId, roomName) {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('hotelId', hotelId)
+    .input('name', roomName)
+    .query(`SELECT TOP 1 Id, RoomName, RatePerNight, Currency FROM HotelRoomType WHERE IsDelete = 0 AND IsActive = 1 AND HotelId = @hotelId AND RoomName = @name`);
+  return result.recordset[0] || null;
 }
 
 async function listVehicles() {
@@ -220,4 +251,6 @@ module.exports = {
   listRestaurants,
   listDestinations,
   listVehicles,
+  listHotelRoomTypes,
+  findHotelRoomType,
 };

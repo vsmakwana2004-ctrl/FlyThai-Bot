@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { handleChat, cancelFlows } = require('./src/chat');
-const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles } = require('./src/lookups');
+const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles, listDestinations, listHotelRoomTypes } = require('./src/lookups');
 
 const app = express();
 app.use(cors());
@@ -77,6 +77,37 @@ app.get('/api/agents', async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q : '';
     const agents = await listAgents(q);
     res.json({ agents });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong: ' + err.message });
+  }
+});
+
+// Powers the live multi-select destination checklist shown above the chat input while the bot is
+// collecting a new booking/quotation's destination(s) - the real site shows this same fixed list
+// as checkboxes rather than a free-text field.
+app.get('/api/destinations', async (req, res) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const destinations = await listDestinations(q);
+    res.json({ destinations });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong: ' + err.message });
+  }
+});
+
+// Powers the live room-category dropdown shown above the chat input while a hotel row is being
+// collected - scoped to whichever hotel was just picked, since a room type only makes sense in
+// that hotel's own context. Returns an empty list (never an error) for a brand-new hotel with no
+// resolved Id yet, or one with no registered room types - the chat flow just falls back to typing.
+app.get('/api/hotel-room-types', async (req, res) => {
+  try {
+    const hotelId = req.query.hotelId ? Number(req.query.hotelId) : null;
+    if (!hotelId) return res.json({ roomTypes: [] });
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const roomTypes = await listHotelRoomTypes(hotelId, q);
+    res.json({ roomTypes });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong: ' + err.message });

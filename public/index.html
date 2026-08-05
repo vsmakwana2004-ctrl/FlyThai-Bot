@@ -70,8 +70,92 @@
 
           <div class="input-wrap">
             <div id="lookupDropdown" class="lookup-dropdown" style="display:none"></div>
+            <div id="datePickerBox" class="date-picker-box" style="display:none">
+              <button type="button" id="calBackToForm" class="cal-back" style="display:none">&lsaquo; Back to pricing fields</button>
+              <div class="cal-header">
+                <button type="button" id="calPrev" class="cal-nav" aria-label="Previous month">&lsaquo;</button>
+                <span id="calTitle" class="cal-title"></span>
+                <button type="button" id="calNext" class="cal-nav" aria-label="Next month">&rsaquo;</button>
+              </div>
+              <div class="cal-weekdays">
+                <span>SU</span><span>MO</span><span>TU</span><span>WE</span><span>TH</span><span>FR</span><span>SA</span>
+              </div>
+              <div id="calGrid" class="cal-grid"></div>
+            </div>
+            <div id="paxPickerBox" class="pax-picker-box" style="display:none">
+              <div class="pax-field">
+                <label for="paxAdults">Adults</label>
+                <input type="number" id="paxAdults" inputmode="numeric" min="1" step="1" value="1" />
+              </div>
+              <div class="pax-field">
+                <label for="paxChildren">Children</label>
+                <input type="number" id="paxChildren" inputmode="numeric" min="0" step="1" value="0" />
+              </div>
+              <div class="pax-field">
+                <label for="paxInfants">Infants</label>
+                <input type="number" id="paxInfants" inputmode="numeric" min="0" step="1" value="0" />
+              </div>
+            </div>
+            <div id="priceExtrasBox" class="price-extras-box" style="display:none">
+              <div class="price-extras-grid">
+                <div class="pe-field">
+                  <label for="peRoeRate">ROE Rate</label>
+                  <input type="number" id="peRoeRate" inputmode="decimal" step="any" placeholder="0" />
+                </div>
+                <div class="pe-field">
+                  <label for="peRoeCharge">ROE Charge</label>
+                  <input type="number" id="peRoeCharge" inputmode="decimal" step="any" placeholder="0" />
+                </div>
+                <div class="pe-field">
+                  <label for="peTaxAmount">Tax Amount</label>
+                  <input type="number" id="peTaxAmount" inputmode="decimal" step="any" placeholder="0" />
+                </div>
+                <div class="pe-field">
+                  <label for="peTaxPercentage">Tax %</label>
+                  <input type="number" id="peTaxPercentage" inputmode="decimal" step="any" min="0" max="100" placeholder="0" />
+                </div>
+                <div class="pe-field">
+                  <label for="peDiscount">Discount</label>
+                  <input type="number" id="peDiscount" inputmode="decimal" step="any" placeholder="0" />
+                </div>
+                <div class="pe-field">
+                  <label for="peFinalRate">Final Selling Rate</label>
+                  <input type="number" id="peFinalRate" inputmode="decimal" step="any" placeholder="0" />
+                </div>
+              </div>
+              <button type="button" id="peDueDateBtn" class="pe-due-date-btn">
+                <span id="peDueDateLabel">Set invoice due date</span>
+              </button>
+            </div>
+            <div id="extraDetailsBox" class="extra-details-box" style="display:none">
+              <div class="ed-field">
+                <label for="edNote">Extra Note</label>
+                <input type="text" id="edNote" placeholder="Any note for this booking..." />
+              </div>
+              <div class="ed-field">
+                <label>Emergency Contact</label>
+                <div id="edContactChips" class="ed-contact-chips">
+                  <button type="button" class="ed-contact-chip" data-value="+66971342040">+66971342040</button>
+                  <button type="button" class="ed-contact-chip" data-value="+66807154971">+66807154971</button>
+                  <button type="button" class="ed-contact-chip" data-value="+918460266981">+918460266981</button>
+                  <button type="button" class="ed-contact-chip" data-value="+919664708635">+919664708635</button>
+                </div>
+              </div>
+              <div class="ed-field">
+                <label for="edBookingBy">Booking By</label>
+                <input type="text" id="edBookingBy" placeholder="Name" />
+              </div>
+              <div class="ed-field">
+                <label>Allow agent to download PDFs</label>
+                <div class="ed-pdf-checks">
+                  <label class="ed-check"><input type="checkbox" id="edAllowVoucher" /> Voucher</label>
+                  <label class="ed-check"><input type="checkbox" id="edAllowInvoice" /> Invoice</label>
+                  <label class="ed-check"><input type="checkbox" id="edAllowItinerary" /> Itinerary</label>
+                </div>
+              </div>
+            </div>
             <form id="chatForm" class="input-bar">
-              <input id="chatInput" type="text" autocomplete="off" maxlength="2000" placeholder="Ask anything about your bookings, quotations, hotels…" />
+              <textarea id="chatInput" rows="1" autocomplete="off" maxlength="2000" placeholder="Ask anything about your bookings, quotations, hotels…"></textarea>
               <button type="submit" id="sendBtn" title="Send">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4 20-7Z" />
