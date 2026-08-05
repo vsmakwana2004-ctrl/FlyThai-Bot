@@ -230,7 +230,10 @@ function renderMarkdown(text) {
         i++;
       }
       tbl += '</tbody></table>';
-      html += tbl;
+      // Wide tables (many columns, long words that no longer break mid-word) can need more room
+      // than the chat column has - this wrapper lets the table itself scroll sideways instead of
+      // pushing the whole page wider (see .bubble-table-scroll in style.css).
+      html += `<div class="bubble-table-scroll">${tbl}</div>`;
       continue;
     }
     if (/^\s*[-*]\s+/.test(line)) {

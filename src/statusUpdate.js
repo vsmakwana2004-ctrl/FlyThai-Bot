@@ -138,6 +138,11 @@ async function start(intent, userMessage) {
   return mergeAndAdvance(pending, statusType, value);
 }
 
+// Normalizes away spaces/hyphens/case so "self booked" / "self-booked" / "selfBooked" all match.
+function normalizeValue(s) {
+  return s.trim().toLowerCase().replace(/[\s-]+/g, '');
+}
+
 // Continues an in-progress status-change conversation (collecting missing fields, or confirming).
 async function step(pending, userMessage) {
   if (pending.awaitingConfirm) {
@@ -157,6 +162,19 @@ async function step(pending, userMessage) {
       reply: `Please reply "yes" to confirm changing **${pending.code}**'s ${pending.statusType} status to ${pending.value}, or "no" to cancel.`,
       pending,
     };
+  }
+
+  // Fast path: the user is answering a specific field we just asked about with a bare word
+  // (e.g. "sent"). Match it directly against the allowed list instead of asking the LLM, which
+  // has no idea which field is pending and can't disambiguate a value word shared by multiple
+  // status types (e.g. "sent" is valid for Invoice, Voucher, and Itinerary alike).
+  const normalized = normalizeValue(userMessage);
+  if (pending.statusType && !pending.value) {
+    const match = STATUS_TYPES[pending.statusType].find((v) => normalizeValue(v) === normalized);
+    if (match) return mergeAndAdvance(pending, null, match);
+  } else if (!pending.statusType) {
+    const match = Object.keys(STATUS_TYPES).find((t) => normalizeValue(t) === normalized);
+    if (match) return mergeAndAdvance(pending, match, null);
   }
 
   const { statusType, value } = await extractStatusChange(userMessage);

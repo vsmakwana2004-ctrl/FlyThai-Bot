@@ -125,6 +125,24 @@ function compactForHistory(text) {
   return compact.length > 1200 ? `${compact.slice(0, 1200)}\n…` : compact;
 }
 
+// Collapses rows that are fully identical across every selected column - the artefact of a JOIN
+// against a one-to-many table (itinerary items, hotels, ...) that the query never actually SELECTed
+// anything from, so the fan-out produces exact copies of the same row instead of genuinely
+// different ones. A row that differs in ANY column is left alone - this only removes true
+// duplicates, never a legitimately distinct sub-row (e.g. one row per hotel with different names).
+function dedupeExactRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const seen = new Set();
+  const result = [];
+  for (const row of rows) {
+    const key = JSON.stringify(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(row);
+  }
+  return result;
+}
+
 // A LEFT JOIN to Destination (or hotels/itinerary) returns one row per joined child, so the same
 // booking legitimately appears several times in a result set - a 3-booking query was seen coming
 // back as 7 rows because one trip covers four destinations. The planner is told to aggregate those
@@ -697,6 +715,24 @@ async function handleChatInner(sessionId, userMessage) {
     pushTurn(sessionId, userMessage, apology);
     return { answer: apology, sql, rowCount: 0, error: lastError?.message };
   }
+
+  // A JOIN across a one-to-many table (itinerary items, hotels, etc.) that the query didn't need
+  // to actually SELECT anything from still fans a booking out into several rows - byte-identical
+  // across every column that WAS selected. That's invisible to the prose answer (rowCountRule
+  // already tells the model to merge them into one line there), but the raw rows/rowCount sent to
+  // the client feed the "View N records" side-drawer directly - reproduced live: a 2-booking answer
+  // whose drawer showed "20 records" with the same row repeated up to 10x. Only collapses rows that
+  // are fully identical (every selected column, not just the booking code), so a query that
+  // legitimately returns several different rows per booking (e.g. one per hotel) is untouched.
+  const dedupedRows = dedupeExactRows(queryResult.rows);
+  queryResult = {
+    ...queryResult,
+    rows: dedupedRows,
+    // rowCount otherwise feeds the "Showing X of Y total" truncated-result message - only safe to
+    // replace with the deduped count when rows is the COMPLETE result (untruncated), since we can't
+    // know how much duplication is hiding beyond whatever we capped the fetch at.
+    rowCount: queryResult.truncated ? queryResult.rowCount : dedupedRows.length,
+  };
 
   const SAMPLE_ROWS_FOR_LLM = 20;
   const sampleRows = buildSample(queryResult.rows, SAMPLE_ROWS_FOR_LLM);

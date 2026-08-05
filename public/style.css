@@ -316,11 +316,20 @@ body {
   color: #fff;
 }
 
+/* A wide table (many columns, or long words that no longer break mid-word after the fix above)
+   can need more horizontal room than the chat column has. Without this wrapper the table just
+   overflowed the bubble/page instead of respecting the column - this scrolls the table itself
+   sideways, the same way the "view records" side-drawer table already does. */
+.bubble-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 14px 0;
+  -webkit-overflow-scrolling: touch;
+}
 .bubble table {
   border-collapse: separate;
   border-spacing: 0;
   width: 100%;
-  margin: 14px 0;
   font-size: 13.5px;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -330,6 +339,12 @@ body {
   border-bottom: 1px solid var(--border-soft);
   padding: 10px 14px;
   text-align: left;
+  /* .bubble sets overflow-wrap: anywhere so long server replies never overflow the message
+     column - but inherited into a table cell, that breaks ordinary words mid-character to save
+     space ("Mylastmin"/"utetrip") instead of just wrapping at the word boundary. break-word only
+     splits a word if it truly can't fit the cell on its own line at all. */
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .bubble th {
   background: var(--mint-50);

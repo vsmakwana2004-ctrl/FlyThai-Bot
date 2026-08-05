@@ -23,6 +23,11 @@ CRITICAL — that join matches ONE ROW PER DESTINATION, so a trip covering 4 des
                WHERE CHARINDEX(',' + CAST(d.Id AS VARCHAR) + ',', ',' + bm.Destinations + ',') > 0
                  AND d.IsDelete = 0) AS DestList
 The same warning applies to LEFT JOIN BookingHotel / BookingItineary / AccountTransaction in a LIST query: each returns many rows per booking. In a query that lists bookings, one output row must mean one booking — aggregate or use CROSS APPLY, never a bare LEFT JOIN.
+COMPOUND JOIN TRAP - worse than the single-join case above: joining BookingHotel AND BookingItineary (or BookingItineraryRestaurant) together in the same query multiplies rows AGAINST EACH OTHER, not just against BookingMaster - 2 hotels × 9 itinerary items becomes 18 rows for ONE booking, not 11. Reproduced live: "give me info about guest X" (one guest, 2 real bookings) returned 20 raw rows because both tables were joined together unaggregated - the answer text correctly said "2 bookings" but the underlying row data looked like 20 different records. When a question needs a per-booking summary touching hotel and/or itinerary details, aggregate EACH one-to-many table separately via its own CROSS/OUTER APPLY (same idea as the Destination example above) - never let BookingHotel and BookingItineary sit in the same FROM/JOIN chain together:
+  FROM BookingMaster bm
+  OUTER APPLY (SELECT STRING_AGG(Name, ', ') AS HotelList FROM BookingHotel WHERE BookingId = bm.Id AND IsDelete = 0) AS h
+  OUTER APPLY (SELECT STRING_AGG(Particular, ', ') AS ItineraryList FROM BookingItineary WHERE BookingId = bm.Id AND IsDelete = 0) AS it
+This returns exactly one row per booking no matter how many hotels or itinerary items it has.
 
 === BookingHotel === (hotels booked for a trip/itinerary)
 Columns: Id, BookingId(int FK -> BookingMaster.Id), DestinationId(FK->Destination.Id), HotelId(FK->Hotel.Id), Name(hotel name text), RoomCategory, TotalRooms, TotalNights, CheckInDate, CheckOutDate, Rate, ConfirmationId, HotelRatePerNight, HotelRatePerNightCurrency, TotalAmount, IsDelete(bit).
