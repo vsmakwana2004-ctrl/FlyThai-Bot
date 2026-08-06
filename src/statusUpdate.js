@@ -1,6 +1,7 @@
 const { getPool } = require('./db');
 const { updateBookingStatus } = require('./bookingApi');
 const { callLLM } = require('./llm');
+const { resolveBookingByCode } = require('./documents');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 const BARE_NUMBER_RE = /\b\d{4,}\b/;
@@ -51,21 +52,25 @@ function detectStatusUpdateIntent(text, fallbackCode) {
   return null;
 }
 
+// Returns { status: 'not_found' } | { status: 'ambiguous', matches } | { status: 'ok', booking }.
 async function resolveBooking(intent) {
-  const pool = await getPool();
   if (intent.exact) {
-    const r = await pool.request().input('code', intent.code).query(`
-      SELECT TOP 1 Id, BookingId, QuotationId, GuestName, IsBooking FROM BookingMaster
-      WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
-    `);
-    return r.recordset[0] || null;
+    // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode, which this
+    // reuses, for the confirmed live example of 3 rows sharing one code) - a bare TOP 1 here
+    // previously picked an arbitrary one of them silently, risking changing a completely different
+    // booking's status than the one asked about. Callers must handle 'ambiguous' themselves.
+    const matches = await resolveBookingByCode(intent.code);
+    if (matches.length === 0) return { status: 'not_found' };
+    if (matches.length > 1) return { status: 'ambiguous', matches };
+    return { status: 'ok', booking: matches[0] };
   }
+  const pool = await getPool();
   const r = await pool.request().input('digits', `%${intent.code}%`).query(`
     SELECT TOP 5 Id, BookingId, QuotationId, GuestName, IsBooking FROM BookingMaster
     WHERE IsDelete = 0 AND (BookingId LIKE @digits OR QuotationId LIKE @digits)
   `);
-  if (r.recordset.length !== 1) return null; // not found or ambiguous - fail closed, ask for the full code
-  return r.recordset[0];
+  if (r.recordset.length !== 1) return { status: 'not_found' }; // not found or ambiguous - fail closed, ask for the full code
+  return { status: 'ok', booking: r.recordset[0] };
 }
 
 async function extractStatusChange(userMessage) {
@@ -121,12 +126,10 @@ function mergeAndAdvance(pending, statusType, value) {
   return askForConfirmation(pending);
 }
 
-// Entry point - called once when detectStatusUpdateIntent first matches a fresh message.
-async function start(intent, userMessage) {
-  const booking = await resolveBooking(intent);
-  if (!booking) {
-    return { reply: `I couldn't uniquely find that booking. Please give the full booking code (e.g. FT07261782).`, pending: null };
-  }
+// Runs the actual "start collecting statusType/value" step once a single, unambiguous row has
+// already been resolved - shared by start() below and by chat.js's post-disambiguation
+// continuation (once the user has picked which of several same-coded records they meant).
+async function startWithBooking(booking, userMessage) {
   const code = booking.BookingId || booking.QuotationId;
 
   if (!booking.IsBooking) {
@@ -136,6 +139,20 @@ async function start(intent, userMessage) {
   const { statusType, value } = await extractStatusChange(userMessage);
   const pending = { internalId: booking.Id, code, statusType: null, value: null, awaitingConfirm: false };
   return mergeAndAdvance(pending, statusType, value);
+}
+
+// Entry point - called once when detectStatusUpdateIntent first matches a fresh message.
+// Returns { reply, pending } normally, or { ambiguous: true, matches } when the code needs
+// disambiguating first - chat.js must check for that before touching .reply/.pending.
+async function start(intent, userMessage) {
+  const resolved = await resolveBooking(intent);
+  if (resolved.status === 'not_found') {
+    return { reply: `I couldn't uniquely find that booking. Please give the full booking code (e.g. FT07261782).`, pending: null };
+  }
+  if (resolved.status === 'ambiguous') {
+    return { ambiguous: true, matches: resolved.matches };
+  }
+  return startWithBooking(resolved.booking, userMessage);
 }
 
 // Normalizes away spaces/hyphens/case so "self booked" / "self-booked" / "selfBooked" all match.
@@ -181,4 +198,4 @@ async function step(pending, userMessage) {
   return mergeAndAdvance(pending, statusType, value);
 }
 
-module.exports = { detectStatusUpdateIntent, start, step };
+module.exports = { detectStatusUpdateIntent, start, startWithBooking, step };

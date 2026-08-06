@@ -17,14 +17,14 @@ const sessions = new Map();
 const MAX_TURNS = 6; // user+assistant pairs kept for context
 
 function getSession(sessionId) {
-  if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], draft: null, pendingItinerary: null, pendingDocChoice: null, pendingHotelChoice: null, pendingStatusChange: null, pendingCreateConfirm: null, pendingConvertConfirm: null, pendingFieldEditConfirm: null, lastBookingCode: null });
+  if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], draft: null, pendingItinerary: null, pendingDocChoice: null, pendingHotelChoice: null, pendingCodeChoice: null, pendingRecordChoice: null, pendingStatusChange: null, pendingCreateConfirm: null, pendingConvertConfirm: null, pendingFieldEditConfirm: null, lastBookingCode: null });
   return sessions.get(sessionId);
 }
 
 // True while the session is inside a guided multi-message flow, so the UI can offer a visible
 // "Cancel" button instead of relying on the user knowing the right word to type.
 function isFlowActive(session) {
-  return !!(session.draft || session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingCreateConfirm || session.pendingConvertConfirm || session.pendingFieldEditConfirm);
+  return !!(session.draft || session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingCodeChoice || session.pendingRecordChoice || session.pendingCreateConfirm || session.pendingConvertConfirm || session.pendingFieldEditConfirm);
 }
 
 // Hard reset of every guided flow - what the UI's Cancel button calls. Deliberately unconditional
@@ -36,6 +36,8 @@ function cancelFlows(sessionId) {
   session.pendingItinerary = null;
   session.pendingDocChoice = null;
   session.pendingHotelChoice = null;
+  session.pendingCodeChoice = null;
+  session.pendingRecordChoice = null;
   session.pendingStatusChange = null;
   session.pendingCreateConfirm = null;
   session.pendingConvertConfirm = null;
@@ -395,6 +397,8 @@ function expectingField(draft) {
   // the weekday of the date already picked for this item (mirrors the real form's own filtering).
   if (draft && draft.phase === 'sightseeingCollect') {
     if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
+    // A grid of common 30-min tour-start slots above the input, instead of typing "HH:MM" blind.
+    if (draft.itemStep === 'time') return { field: 'time' };
     if (draft.itemStep === 'pickupPointName') return { field: 'pickup' };
     if (draft.itemStep === 'sightseeingName') {
       const weekday = weekdayNameFromDDMMYYYY(draft.currentItemDraft && draft.currentItemDraft.date);
@@ -475,13 +479,110 @@ async function handleChat(sessionId, userMessage) {
   return { ...result, flowActive: isFlowActive(getSession(sessionId)) };
 }
 
+// Shared "which one did you mean?" prompt for a code that matched more than one real row (convert/
+// field-edit/itinerary-edit/status-change all hit this the same way - see documents.js's
+// resolveBookingByCode for why QuotationId isn't guaranteed unique). kind/extra are stashed on
+// session.pendingRecordChoice so the next message can resume the right flow via resumeRecordChoice.
+function askWhichRecord(sessionId, session, userMessage, code, matches, kind, extra) {
+  const list = matches.map((m, i) => `${i + 1}. ${documents.describeMatch(m)}`).join('\n');
+  const reply = `More than one record uses the code **${code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`;
+  session.pendingRecordChoice = { code, matches, kind, extra };
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Finishes a convert-to-booking check (not_found/already_booking/invalid/ok) - shared by the fresh
+// convertIntent path and the post-disambiguation continuation in resumeRecordChoice.
+function finishConvertResult(sessionId, session, userMessage, result) {
+  if (result.status === 'not_found') {
+    const reply = `I couldn't find any quotation matching **${result.code}** in the database.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (result.status === 'already_booking') {
+    const reply = `**${result.code}** is already a booking, not a quotation — there's nothing to convert.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (result.status === 'invalid') {
+    const list = result.errors.map((e) => `- ${e}`).join('\n');
+    const reply = `Please correct the following before **${result.code}** (${result.guestName}) can be converted to a booking:\n\n${list}`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  const reply = `**${result.code}** (${result.guestName}) has everything required and is ready to convert to a booking. This cannot be undone from here — proceed? (yes/no)`;
+  session.pendingConvertConfirm = { code: result.code, guestName: result.guestName, raw: result.raw };
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Finishes a simple field-edit resolve (not_found/ok) - shared by the fresh fieldEditIntent path
+// and the post-disambiguation continuation in resumeRecordChoice. `intentLike` just needs
+// .code/.field/.label/.value.
+function finishFieldEditResolve(sessionId, session, userMessage, resolved, intentLike) {
+  if (resolved.status === 'not_found') {
+    const reply = `I couldn't find any booking or quotation matching **${intentLike.code}** in the database.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  const reply = `Set **${intentLike.label}** for **${resolved.code}** (${resolved.guestName}) to "${intentLike.value}"? (yes/no)`;
+  session.pendingFieldEditConfirm = {
+    code: resolved.code,
+    guestName: resolved.guestName,
+    raw: resolved.raw,
+    fieldKey: intentLike.field,
+    label: intentLike.label,
+    value: intentLike.value,
+  };
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Finishes an itinerary-edit resolve (not_found/ok) - shared by the fresh itineraryEditIntent path
+// and the post-disambiguation continuation in resumeRecordChoice.
+function finishItineraryEditResolve(sessionId, session, userMessage, resolved, fallbackCode) {
+  if (resolved.status === 'not_found') {
+    const reply = `I couldn't find any booking or quotation matching **${fallbackCode}** in the database.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  const draft = bookingFlow.startItineraryEditDraft(resolved.raw, resolved.code, resolved.guestName);
+  session.draft = draft;
+  const reply = `Let's add itinerary details to **${resolved.code}** (${resolved.guestName}).\n\n${bookingFlow.askItineraryChoice()}`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Resumes whichever flow asked "which one did you mean?" (session.pendingRecordChoice) once the
+// user has picked a specific row - dispatches by .kind to the same "finish" helper the fresh-intent
+// path itself uses, so the two paths can never drift apart.
+async function resumeRecordChoice(sessionId, session, pending, chosen, userMessage) {
+  if (pending.kind === 'convert') {
+    const result = await convertBooking.checkConversionForBooking(chosen);
+    return finishConvertResult(sessionId, session, userMessage, result);
+  }
+  if (pending.kind === 'fieldEdit') {
+    const resolved = await editBooking.resolveForEditBooking(chosen);
+    return finishFieldEditResolve(sessionId, session, userMessage, resolved, { code: pending.code, ...pending.extra });
+  }
+  if (pending.kind === 'itineraryEdit') {
+    const resolved = await editBooking.resolveForEditBooking(chosen);
+    return finishItineraryEditResolve(sessionId, session, userMessage, resolved, pending.code);
+  }
+  // 'statusUpdate'
+  const result = await statusUpdate.startWithBooking(chosen, pending.extra.userMessage);
+  session.pendingStatusChange = result.pending;
+  pushTurn(sessionId, userMessage, result.reply);
+  return { answer: result.reply, sql: null, rowCount: 0 };
+}
+
 async function handleChatInner(sessionId, userMessage) {
   const session = getSession(sessionId);
 
   // Any pending question ("which logo?", "which status?") is a dead end if the user changes their
   // mind — each of those handlers just re-asks forever on an unrecognised reply. One shared check
   // in front of all of them means "cancel" always works, whatever we happen to be waiting on.
-  if ((session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingConvertConfirm || session.pendingFieldEditConfirm) && isAnyCancel(userMessage)) {
+  if ((session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingCodeChoice || session.pendingRecordChoice || session.pendingConvertConfirm || session.pendingFieldEditConfirm) && isAnyCancel(userMessage)) {
     cancelFlows(sessionId);
     const reply = 'Okay, cancelled — nothing was changed. What would you like to know?';
     pushTurn(sessionId, userMessage, reply);
@@ -494,6 +595,32 @@ async function handleChatInner(sessionId, userMessage) {
   const codeInMessage = userMessage.match(ANY_CODE_RE);
   if (codeInMessage) session.lastBookingCode = codeInMessage[0].toUpperCase();
 
+  // A pending narrow follow-up question ("which PDF type?", "which logo?", "confirm converting
+  // X?") only makes sense as a reply about the SAME record it was originally asked about. If this
+  // message names a DIFFERENT FT/FTQ code, the user has moved on to a new request rather than
+  // answering the old one - reproduced live: asking "get itinerary pdf for FTQ12260001" while a
+  // "which PDF type?" question about an unrelated earlier booking was still pending got silently
+  // answered using that STALE booking's code (wrong guest, wrong PDF), because stepDocChoice only
+  // pattern-matches keywords in the reply and never re-checks which record it's actually about.
+  // Each pending state's own .code is compared independently and cleared only on a mismatch, so a
+  // reply that doesn't name a code at all ("1", "agent logo", "yes") still lands on whatever's
+  // still pending exactly as before - this only interrupts on a genuinely different explicit code.
+  if (codeInMessage) {
+    const newCode = codeInMessage[0].toUpperCase();
+    for (const key of ['pendingStatusChange', 'pendingDocChoice', 'pendingHotelChoice', 'pendingCodeChoice', 'pendingRecordChoice', 'pendingItinerary', 'pendingConvertConfirm', 'pendingFieldEditConfirm']) {
+      if (session[key] && session[key].code && session[key].code !== newCode) {
+        session[key] = null;
+      }
+    }
+    // An active itinerary-edit draft (session.draft with editMode true) carries its own record's
+    // code the same way the pending-question states above do, but wasn't covered by this guard -
+    // a stray message naming a DIFFERENT booking mid-edit could otherwise get swallowed into the
+    // itinerary Q&A instead of interrupting it (see bookingFlow.js's editContext).
+    if (session.draft && session.draft.editContext && session.draft.editContext.code && session.draft.editContext.code !== newCode) {
+      session.draft = null;
+    }
+  }
+
   // If a status-change request is mid-conversation (collecting fields, or awaiting yes/no
   // confirmation), this message continues that - checked first so it can't be misread as
   // something else while we're mid-flow.
@@ -502,6 +629,20 @@ async function handleChatInner(sessionId, userMessage) {
     session.pendingStatusChange = pending;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0 };
+  }
+
+  // If we previously asked "which record did you mean?" (the same code matched more than one real
+  // row - see documents.js's resolveBookingByCode), this message answers that, then continues into
+  // whatever that record's document request itself produces (a direct answer, or a further "which
+  // PDF type?"/"which logo?"/"which hotel?" question).
+  if (session.pendingCodeChoice) {
+    const { reply, pendingCodeChoice, pendingDocChoice, pendingItinerary, pendingHotelChoice } = await documents.stepCodeChoice(session.pendingCodeChoice, userMessage);
+    session.pendingCodeChoice = pendingCodeChoice;
+    if (pendingDocChoice) session.pendingDocChoice = pendingDocChoice;
+    if (pendingItinerary) session.pendingItinerary = pendingItinerary;
+    if (pendingHotelChoice) session.pendingHotelChoice = pendingHotelChoice;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
   }
 
   // If we previously asked "which logo version?" for an itinerary PDF, this message answers that.
@@ -531,6 +672,45 @@ async function handleChatInner(sessionId, userMessage) {
     if (pendingItinerary) session.pendingItinerary = pendingItinerary;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
+  }
+
+  // A "shall I create one?" question was asked last turn — this message answers it. Checked here,
+  // grouped with the other "continue a pending question" handlers above/below (not further down
+  // near createIntent detection, where it used to live) - convertIntent/fieldEditIntent/
+  // itineraryEditIntent detection all run further below and none of them used to clear this on a
+  // match, so a reply that happened to match one of THOSE instead left this dangling indefinitely;
+  // a later, unrelated "yes" could then silently resurrect it and start an unwanted new booking.
+  if (session.pendingCreateConfirm) {
+    const { kind, originalMessage } = session.pendingCreateConfirm;
+    session.pendingCreateConfirm = null;
+    if (bookingFlow.parseYesNo(userMessage) === true) {
+      const newDraft = bookingFlow.startDraft(kind);
+      const { reply, draft, createdCode } = await bookingFlow.step(newDraft, originalMessage);
+      session.draft = draft;
+      if (createdCode) session.lastBookingCode = createdCode;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
+    }
+    // Anything that isn't a clear "yes" simply falls through and is answered as a normal question -
+    // so a mis-detected create intent costs the user one extra line, never a stuck conversation.
+  }
+
+  // If we previously asked "which one did you mean?" for a convert/field-edit/itinerary-edit/
+  // status-change request whose code matched more than one real row (QuotationId isn't guaranteed
+  // unique - see documents.js's resolveBookingByCode), this message answers that, then resumes
+  // whichever of those flows asked the question in the first place.
+  if (session.pendingRecordChoice) {
+    const pending = session.pendingRecordChoice;
+    const t = userMessage.trim();
+    const chosen = /^\d+$/.test(t) ? pending.matches[Number(t) - 1] : null;
+    if (!chosen) {
+      const list = pending.matches.map((m, i) => `${i + 1}. ${documents.describeMatch(m)}`).join('\n');
+      const reply = `Please reply with just the number of the record you meant:\n\n${list}`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    session.pendingRecordChoice = null;
+    return resumeRecordChoice(sessionId, session, pending, chosen, userMessage);
   }
 
   // A "convert this quotation to a booking?" confirmation was asked last turn - this answers it.
@@ -574,30 +754,12 @@ async function handleChatInner(sessionId, userMessage) {
   // LLM/SQL) so the required-field validation always matches the real site's own rules exactly,
   // and so the actual write only ever happens after an explicit yes.
   const convertIntent = convertBooking.detectConvertIntent(userMessage, session.lastBookingCode);
-  if (convertIntent) {
+  if (convertIntent && !session.draft) {
     const result = await convertBooking.checkConversion(convertIntent.code);
-
-    if (result.status === 'not_found') {
-      const reply = `I couldn't find any quotation matching **${convertIntent.code}** in the database.`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
+    if (result.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, result.code, result.matches, 'convert', {});
     }
-    if (result.status === 'already_booking') {
-      const reply = `**${result.code}** is already a booking, not a quotation — there's nothing to convert.`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
-    }
-    if (result.status === 'invalid') {
-      const list = result.errors.map((e) => `- ${e}`).join('\n');
-      const reply = `Please correct the following before **${result.code}** (${result.guestName}) can be converted to a booking:\n\n${list}`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
-    }
-
-    const reply = `**${result.code}** (${result.guestName}) has everything required and is ready to convert to a booking. This cannot be undone from here — proceed? (yes/no)`;
-    session.pendingConvertConfirm = { code: result.code, guestName: result.guestName, raw: result.raw };
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return finishConvertResult(sessionId, session, userMessage, result);
   }
 
   // A "set this field to X?" confirmation was asked last turn - this message answers it.
@@ -632,24 +794,16 @@ async function handleChatInner(sessionId, userMessage) {
   // existing booking/quotation - deterministic (regex, no LLM), reusing the same live-record
   // read/write path as convert-to-booking so the "current state" it edits is never stale/guessed.
   const fieldEditIntent = editBooking.detectSimpleFieldEditIntent(userMessage, session.lastBookingCode);
-  if (fieldEditIntent) {
+  if (fieldEditIntent && !session.draft) {
     const resolved = await editBooking.resolveForEdit(fieldEditIntent.code);
-    if (resolved.status === 'not_found') {
-      const reply = `I couldn't find any booking or quotation matching **${fieldEditIntent.code}** in the database.`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'fieldEdit', {
+        field: fieldEditIntent.field,
+        label: fieldEditIntent.label,
+        value: fieldEditIntent.value,
+      });
     }
-    const reply = `Set **${fieldEditIntent.label}** for **${resolved.code}** (${resolved.guestName}) to "${fieldEditIntent.value}"? (yes/no)`;
-    session.pendingFieldEditConfirm = {
-      code: resolved.code,
-      guestName: resolved.guestName,
-      raw: resolved.raw,
-      fieldKey: fieldEditIntent.field,
-      label: fieldEditIntent.label,
-      value: fieldEditIntent.value,
-    };
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return finishFieldEditResolve(sessionId, session, userMessage, resolved, fieldEditIntent);
   }
 
   // A request to add itinerary items to an existing booking/quotation - hands off to the SAME
@@ -659,39 +813,19 @@ async function handleChatInner(sessionId, userMessage) {
   const itineraryEditIntent = editBooking.detectItineraryEditIntent(userMessage, session.lastBookingCode);
   if (itineraryEditIntent && !session.draft) {
     const resolved = await editBooking.resolveForEdit(itineraryEditIntent.code);
-    if (resolved.status === 'not_found') {
-      const reply = `I couldn't find any booking or quotation matching **${itineraryEditIntent.code}** in the database.`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'itineraryEdit', {});
     }
-    const draft = bookingFlow.startItineraryEditDraft(resolved.raw, resolved.code, resolved.guestName);
-    session.draft = draft;
-    const reply = `Let's add itinerary details to **${resolved.code}** (${resolved.guestName}).\n\n${bookingFlow.askItineraryChoice()}`;
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return finishItineraryEditResolve(sessionId, session, userMessage, resolved, itineraryEditIntent.code);
   }
 
   // If a booking/quotation is already being collected in this session, stay in that flow.
   if (session.draft) {
-    const { reply, draft } = await bookingFlow.step(session.draft, userMessage);
+    const { reply, draft, createdCode } = await bookingFlow.step(session.draft, userMessage);
     session.draft = draft;
+    if (createdCode) session.lastBookingCode = createdCode;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
-  }
-
-  // A "shall I create one?" question was asked last turn — this message answers it.
-  if (session.pendingCreateConfirm) {
-    const { kind, originalMessage } = session.pendingCreateConfirm;
-    session.pendingCreateConfirm = null;
-    if (bookingFlow.parseYesNo(userMessage) === true) {
-      const newDraft = bookingFlow.startDraft(kind);
-      const { reply, draft } = await bookingFlow.step(newDraft, originalMessage);
-      session.draft = draft;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
-    }
-    // Anything that isn't a clear "yes" simply falls through and is answered as a normal question -
-    // so a mis-detected create intent costs the user one extra line, never a stuck conversation.
   }
 
   // Otherwise check if this message wants to start a new booking/quotation.
@@ -706,8 +840,9 @@ async function handleChatInner(sessionId, userMessage) {
       return { answer: reply, sql: null, rowCount: 0 };
     }
     const newDraft = bookingFlow.startDraft(createIntent.kind);
-    const { reply, draft } = await bookingFlow.step(newDraft, userMessage);
+    const { reply, draft, createdCode } = await bookingFlow.step(newDraft, userMessage);
     session.draft = draft;
+    if (createdCode) session.lastBookingCode = createdCode;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
   }
@@ -717,10 +852,13 @@ async function handleChatInner(sessionId, userMessage) {
   // updateStatus endpoint with allow-listed values only, and always confirms before submitting.
   const statusIntent = statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode);
   if (statusIntent) {
-    const { reply, pending } = await statusUpdate.start(statusIntent, userMessage);
-    session.pendingStatusChange = pending;
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    const result = await statusUpdate.start(statusIntent, userMessage);
+    if (result.ambiguous) {
+      return askWhichRecord(sessionId, session, userMessage, statusIntent.code, result.matches, 'statusUpdate', { userMessage });
+    }
+    session.pendingStatusChange = result.pending;
+    pushTurn(sessionId, userMessage, result.reply);
+    return { answer: result.reply, sql: null, rowCount: 0 };
   }
 
   // Or a request for an invoice/itinerary/hotel voucher PDF - handled deterministically (no
@@ -733,10 +871,11 @@ async function handleChatInner(sessionId, userMessage) {
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
     }
-    const { reply, pendingItinerary, pendingDocChoice, pendingHotelChoice } = await documents.handleDocumentRequest(docIntent);
+    const { reply, pendingItinerary, pendingDocChoice, pendingHotelChoice, pendingCodeChoice } = await documents.handleDocumentRequest(docIntent);
     if (pendingItinerary) session.pendingItinerary = pendingItinerary;
     if (pendingDocChoice) session.pendingDocChoice = pendingDocChoice;
     if (pendingHotelChoice) session.pendingHotelChoice = pendingHotelChoice;
+    if (pendingCodeChoice) session.pendingCodeChoice = pendingCodeChoice;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, expecting: logoChoiceExpecting(session), quickReplies: logoChoiceQuickReplies(session) };
   }
@@ -794,6 +933,12 @@ async function handleChatInner(sessionId, userMessage) {
       const reply = `I couldn't find any booking or quotation matching **${acctTxnIntent.code}** in the database.`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
+    }
+    if (result.status === 'ambiguous') {
+      const list = result.matches.map((m) => `- **${m.BookingId || m.QuotationId}** (${m.GuestName})`).join('\n');
+      const reply = `More than one record uses the code **${acctTxnIntent.code}** — which one did you mean?\n\n${list}\n\nPlease ask again including the guest's name too.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: result.matches.length };
     }
     const reply = accountTransactions.formatAccountTransactionsAnswer(result);
     const rows = [...result.salePurchase, ...result.receiptPayment];

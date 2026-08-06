@@ -16,12 +16,18 @@ function detectAccountTransactionsIntent(text, lastBookingCode) {
   return { code };
 }
 
+// Returns { status: 'not_found' } | { status: 'ambiguous', matches } | { status: 'ok', booking }.
 async function resolveBooking(pool, code) {
+  // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode for the
+  // confirmed live example of 3 rows sharing one code) - a bare TOP 1 here previously picked an
+  // arbitrary one of them silently, showing the wrong guest's ledger.
   const r = await pool.request().input('code', code).query(`
-    SELECT TOP 1 Id, BookingId, QuotationId FROM BookingMaster
+    SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
     WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
   `);
-  return r.recordset[0] || null;
+  if (r.recordset.length === 0) return { status: 'not_found' };
+  if (r.recordset.length > 1) return { status: 'ambiguous', matches: r.recordset };
+  return { status: 'ok', booking: r.recordset[0] };
 }
 
 const SALE_PURCHASE_FOR = new Set(['Sale Form', 'Purchase Form']);
@@ -93,8 +99,9 @@ function pairVoucherLegs(rows) {
 
 async function fetchAccountTransactions(intent) {
   const pool = await getPool();
-  const booking = await resolveBooking(pool, intent.code);
-  if (!booking) return { status: 'not_found' };
+  const resolved = await resolveBooking(pool, intent.code);
+  if (resolved.status !== 'ok') return resolved;
+  const booking = resolved.booking;
 
   const result = await pool.request().input('id', booking.Id).query(`
     SELECT at.VoucherNo, at.TransactionDate, at.TransactionFor, at.TransactionType,

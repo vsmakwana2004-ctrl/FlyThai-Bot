@@ -22,10 +22,23 @@ function getPool() {
   if (!poolPromise) {
     // If the connection attempt fails, clear the cached promise so the *next* call gets a fresh
     // attempt instead of forever replaying the same failure (SQL Server hiccups are often transient).
-    poolPromise = new sql.ConnectionPool(config).connect().catch((err) => {
-      poolPromise = null;
-      throw err;
-    });
+    poolPromise = new sql.ConnectionPool(config)
+      .connect()
+      .then((pool) => {
+        // mssql's ConnectionPool is an EventEmitter that emits 'error' on background acquire
+        // failures even after the initial connect succeeded (e.g. a sustained SQL Server outage) -
+        // without this listener that error was unhandled and the pool was cached forever with no
+        // way to recover, so every later getPool() kept returning the same stale, broken pool.
+        pool.on('error', (err) => {
+          console.warn('SQL pool error, will reconnect on next query:', err.message);
+          poolPromise = null;
+        });
+        return pool;
+      })
+      .catch((err) => {
+        poolPromise = null;
+        throw err;
+      });
   }
   return poolPromise;
 }

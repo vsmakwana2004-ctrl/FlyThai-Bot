@@ -291,9 +291,11 @@ Fields:
 - guestAdults: number of adults, only if a number of adults is explicitly stated
 - guestChildrens: number of children, only if explicitly stated - do NOT default to 0 just because adults were mentioned without children being mentioned; omit this field instead
 - guestInfants: number of infants, only if explicitly stated - same rule, do NOT default to 0
-- notes: a thorough plain-text summary of everything else mentioned that isn't already captured above - hotel names/categories requested, room-wise pax breakdown, specific hotel preferences, day-by-day itinerary/activities, special requests (gala dinner, pool party, shows, transfers, etc). This is kept as a reference note for staff, so include detail rather than drop it - unlike the fields above, being thorough here carries no risk since nothing here is auto-saved into a structured field.
+- itineraryLines: if the message has a day-by-day plan ("Day 1: ...", "Day 2: ...", etc), one entry per day-line: {"day": <number>, "type": "transfer" | "sightseeing" | "leisure", "pickupHint": <short literal place name to search for as the start point - transfer only, else null>, "dropoffHint": <short literal place name to search for as the end point - transfer only, else null>, "transferNameHint": <a short generic transfer label like "Airport to Hotel", "Hotel to Airport", "Inter Hotel Transfer" - transfer only, else null>, "activityHint": <short literal name of the tour/activity - sightseeing only, else null>}. A day that's explicitly a free/leisure day is type "leisure" (no hints needed - and don't invent an activity for it). A day that moves between an airport and a hotel, or between two hotels/islands, is type "transfer". A day naming a specific activity/tour is type "sightseeing". If one day's line actually describes TWO separate movements (e.g. "X to Y transfer + A to B transfer"), emit TWO entries with that same day number. These hints are only used to search real records already in the system - if nothing matches, that one field is simply asked about normally afterwards, so keep each hint a short literal place/activity name, not a full sentence, and never invent one that isn't grounded in the text.
+- hotelPreferences: array of {"destinationName": <one of the known destinations above>, "hotelName": <the specific hotel name mentioned for that destination, with qualifiers like "or similar"/"or similar category" stripped off>} for each destination where the message names a preferred/requested hotel. Omit a destination entirely if no specific hotel name is given for it.
+- notes: a thorough plain-text summary of everything else mentioned that isn't already captured above - hotel categories requested (star rating etc, not a specific name - those go in hotelPreferences), room-wise pax breakdown (including any children's ages), special requests (gala dinner, pool party, shows, etc). This is kept as a reference note for staff, so include detail rather than drop it - unlike the fields above, being thorough here carries no risk since nothing here is auto-saved into a structured field.
 
-Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "notes": "..."}`;
+Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "itineraryLines": [...], "hotelPreferences": [...], "notes": "..."}`;
 }
 
 // Builds the shared "what's still missing" prompt used both when the agent-provided extraction is
@@ -385,6 +387,26 @@ async function stepAgentPaste(draft, userMessage) {
     filled.push(`Infants: ${infantsNum}`);
   }
 
+  // Day-by-day itinerary lines and per-destination hotel preferences - also staged, not applied,
+  // until the same yes/no gate below. Only well-formed entries are kept (a real day number and a
+  // recognised type) - anything the model returned outside that shape is dropped rather than risk
+  // acting on it. Actually resolving these against real hotel/pickup/transfer/sightseeing records
+  // happens later, lazily, once the itinerary/hotel phase is actually reached (see
+  // processAgentItineraryQueue and applyAgentHotelPreference) - never here, and never against
+  // anything other than the same lookup functions/matching rules the manual flow itself uses.
+  const itineraryLines = Array.isArray(parsed.itineraryLines)
+    ? parsed.itineraryLines.filter((l) => l && Number.isFinite(Number(l.day)) && ['transfer', 'sightseeing', 'leisure'].includes(l.type))
+    : [];
+  const hotelPreferences = Array.isArray(parsed.hotelPreferences)
+    ? parsed.hotelPreferences.filter((p) => p && p.destinationName && p.hotelName)
+    : [];
+  if (itineraryLines.length > 0) {
+    filled.push(`Itinerary: ${itineraryLines.length} day-item(s) detected — I'll try to build these automatically once we reach that step, and only ask about whatever doesn't match a real record.`);
+  }
+  if (hotelPreferences.length > 0) {
+    filled.push(`Hotel preferences: ${hotelPreferences.map((p) => `${p.destinationName} → ${p.hotelName}`).join(', ')}`);
+  }
+
   // Free-text reference note - not a structured field the rest of the flow trusts or acts on, so
   // it's kept regardless of whether the human accepts/rejects the structured fields above.
   if (parsed.notes && String(parsed.notes).trim()) {
@@ -400,7 +422,7 @@ async function stepAgentPaste(draft, userMessage) {
     return { reply: `I couldn't confidently pull any structured details from that message, so I'll ask for everything as usual.\n\n${prompt}`, draft };
   }
 
-  draft._pendingAgentExtract = { fields: staged, resolvedDestinations, basicPaxAsked: stagedPaxAsked };
+  draft._pendingAgentExtract = { fields: staged, resolvedDestinations, basicPaxAsked: stagedPaxAsked, itineraryLines, hotelPreferences };
   draft.phase = 'agentPasteConfirm';
   return {
     reply: `I read this from the message — please double-check it against what the agent actually sent before I use it:\n${filled.map((f) => `- ${f}`).join('\n')}\n\nUse these details? Reply "yes" to continue with them, or "no" to enter the basic details manually instead.`,
@@ -416,13 +438,17 @@ async function stepAgentPasteConfirm(draft, userMessage) {
     return { reply: 'Reply "yes" to use these details, or "no" to enter the basic details manually instead.', draft };
   }
 
-  const staged = draft._pendingAgentExtract || { fields: {}, resolvedDestinations: null, basicPaxAsked: false };
+  const staged = draft._pendingAgentExtract || { fields: {}, resolvedDestinations: null, basicPaxAsked: false, itineraryLines: [], hotelPreferences: [] };
   delete draft._pendingAgentExtract;
 
   if (yn === true) {
     Object.assign(draft.fields, staged.fields);
     if (staged.resolvedDestinations) draft.resolvedDestinations = staged.resolvedDestinations;
     if (staged.basicPaxAsked) draft.basicPaxAsked = true;
+    // Only set when non-empty, so every later check (draft._agentItineraryQueue && ...length > 0)
+    // stays a single cheap truthiness test and this is provably never present for a manual draft.
+    if (Array.isArray(staged.itineraryLines) && staged.itineraryLines.length > 0) draft._agentItineraryQueue = staged.itineraryLines;
+    if (Array.isArray(staged.hotelPreferences) && staged.hotelPreferences.length > 0) draft._agentHotelPrefs = staged.hotelPreferences;
   }
   // yn === false: staged data is simply discarded - draft.fields is untouched, so every field just
   // gets asked about normally below, same as if nothing had ever been extracted.
@@ -431,6 +457,189 @@ async function stepAgentPasteConfirm(draft, userMessage) {
   draft.phase = 'basic';
   const prompt = basicNextPrompt(draft);
   return { reply: prompt, draft };
+}
+
+// ---------- travel-agent auto-fill: hotel name preference + day-by-day itinerary queue ----------
+// Both draft._agentHotelPrefs and draft._agentItineraryQueue are set ONLY from
+// stepAgentPasteConfirm above (and only when non-empty) - every function below is a no-op/never
+// called for a manual draft, since those properties are simply never present on one. Everything
+// here resolves against real records using the exact same lookup functions and "only act on an
+// unambiguous match" rule the manual per-field questions already use (resolveSequentialLookup,
+// findHotel) - a hint that doesn't resolve just leaves that one field to be asked about normally,
+// exactly as if the user had typed the same partial info by hand. Nothing here bypasses the
+// booking-level confirm-before-save summary (buildConfirmationSummary) - every auto-added hotel/
+// itinerary row still shows up there for a final human check before anything is saved.
+
+function addDaysToDDMMYYYY(dateStr, days) {
+  const d = parseDateDDMMYYYY(dateStr);
+  if (!d) return null;
+  const result = new Date(d.getFullYear(), d.getMonth(), d.getDate() + days);
+  return `${String(result.getDate()).padStart(2, '0')}-${String(result.getMonth() + 1).padStart(2, '0')}-${result.getFullYear()}`;
+}
+
+// Same "0 matches -> treat the typed name as a new hotel entry, 1 match -> use it, 2+ -> don't
+// guess" convention the manual hotelName question already applies (see stepHotelCollect) - reused
+// here verbatim rather than reimplemented, so a preference resolves exactly the way the same name
+// would if the user had typed it themselves.
+async function tryResolveHotelName(candidateName) {
+  const found = await findHotel(candidateName);
+  if (found.length === 1) return { hotelName: found[0].Name, resolvedHotelId: found[0].Id };
+  if (found.length === 0) return { hotelName: candidateName, resolvedHotelId: 0 };
+  return null; // ambiguous - leave it to the normal hotelName question instead of guessing
+}
+
+// Called once a hotel row's destination is known (either auto-picked for a single-destination
+// trip, or just answered for a multi-destination one) - looks up whether the travel agent named a
+// preferred hotel for that destination and, if so, pre-fills it onto the in-progress hotel draft.
+async function applyAgentHotelPreference(draft, h) {
+  if (!draft._agentHotelPrefs || !h._destId) return false;
+  const dest = draft.resolvedDestinations.find((d) => d.Id === h._destId);
+  if (!dest) return false;
+  const pref = draft._agentHotelPrefs.find((p) => p.destinationName && dest.Name.toLowerCase() === String(p.destinationName).toLowerCase());
+  if (!pref) return false;
+  const resolved = await tryResolveHotelName(pref.hotelName);
+  if (!resolved) return false;
+  h.hotelName = resolved.hotelName;
+  h._resolvedHotelId = resolved.resolvedHotelId;
+  return true;
+}
+
+async function tryResolvePoint(hint) {
+  if (!hint) return null;
+  const rows = await findPickup(hint);
+  return rows.length === 1 ? rows[0] : null;
+}
+
+async function tryResolveTransferParticular(hint) {
+  if (!hint) return null;
+  const rows = await findPickupOrParticular(hint);
+  return rows.length === 1 ? rows[0] : null;
+}
+
+async function tryResolveSightseeing(hint, weekday) {
+  if (!hint) return null;
+  const rows = await findSightseeing(hint, weekday);
+  return rows.length === 1 ? rows[0] : null;
+}
+
+// askItineraryChoice() also offers "self-booked", which reads oddly once real items already exist
+// on this draft - the manual flow never hits that case (it only ever calls askItineraryChoice()
+// before the first item), but the auto-queue below can resume this function after items already
+// exist, so it picks the more apt continuation phrasing itself.
+function itineraryContinuePrompt(draft) {
+  return draft.itineraryItems.length > 0 ? askAddMoreItinerary() : askItineraryChoice();
+}
+
+// The single entry/resume point for the auto-queue - called both when a travel-agent-sourced draft
+// first reaches the itinerary phase (from stepHotelChoice/stepHotelAddAnother/the hotel-cancel
+// branch) and again after each auto-started item finishes (from the transfer/sightseeing/
+// restaurant/leisure "item added" tails), until the queue is empty. Leisure entries need no
+// per-field questions at all, so a whole run of them is added silently in one pass; a transfer/
+// sightseeing entry pre-fills whatever resolves and then hands off to the ordinary
+// stepTransferCollect/stepSightseeingCollect dispatch (unmodified) for whatever's still missing.
+async function processAgentItineraryQueue(draft, prefix) {
+  draft.phase = 'itineraryChoice';
+  const queue = draft._agentItineraryQueue;
+  if (!queue || queue.length === 0) {
+    return { reply: `${prefix}${itineraryContinuePrompt(draft)}`, draft };
+  }
+
+  let leisureAdded = 0;
+  while (queue.length > 0 && queue[0].type === 'leisure') {
+    const line = queue.shift();
+    const dateStr = addDaysToDDMMYYYY(draft.fields.travelDate, Number(line.day) - 1);
+    if (!dateStr || validateItineraryItemDate(dateStr, draft)) continue; // out of the trip's own date range - skip rather than guess
+    draft.itineraryItems.push({
+      type: 'sightseeing', // same shape stepLeisureDayCollect itself pushes for a leisure day
+      id: '',
+      dayNumber: computeDayNumber(dateStr, draft.fields.travelDate),
+      date: dateStr,
+      time: '',
+      pickupPointId: '',
+      pickupPointName: '',
+      particularId: '',
+      transferName: '',
+      transferCode: '',
+      totalAdult: '0',
+      adultPrice: '0',
+      totalChild: '0',
+      childPrice: '0',
+      currency: draft.fields.currency || 'THB',
+      remarks: '',
+      selfBooked: true,
+      finalPrice: 0,
+      costPerAdult: 0,
+      costPerChild: 0,
+      costPerInfant: 0,
+      totalInfant: String(draft.fields.guestInfants || 0),
+      flightNo: null,
+    });
+    leisureAdded += 1;
+  }
+  const leisureNote = leisureAdded > 0 ? `Auto-added ${leisureAdded} leisure day(s) from the message. ` : '';
+
+  if (queue.length === 0) {
+    return { reply: `${prefix}${leisureNote}${itineraryContinuePrompt(draft)}`, draft };
+  }
+
+  const line = queue.shift();
+  const dateStr = addDaysToDDMMYYYY(draft.fields.travelDate, Number(line.day) - 1);
+  if (!dateStr || validateItineraryItemDate(dateStr, draft)) {
+    // Can't safely place this one (falls outside the trip's own travel/return range, or the day
+    // count didn't add up) - drop it rather than guess; it can still be added manually afterwards.
+    return processAgentItineraryQueue(draft, prefix + leisureNote);
+  }
+
+  if (line.type === 'transfer') {
+    if (!draft.vehicleOptions) draft.vehicleOptions = await listVehicles();
+    const t = { date: dateStr };
+    const matched = [];
+    const pickup = await tryResolvePoint(line.pickupHint);
+    if (pickup) { t.pickupPointName = pickup.Name; t._pickupPointNameRow = pickup; matched.push(`pickup: ${pickup.Name}`); }
+    const dropoff = await tryResolvePoint(line.dropoffHint);
+    if (dropoff) { t.dropOffPointName = dropoff.Name; t._dropOffPointNameRow = dropoff; matched.push(`drop-off: ${dropoff.Name}`); }
+    // Real transfer master records are named "<Pickup Point> to <Drop-off Point>" (verified live
+    // against the DB, e.g. "Phuket Airport to Phuket Hotel") - once both points are themselves
+    // resolved to real records, searching on their exact names together is far more reliable than
+    // the model's own free-text transferNameHint guess, which is only used as a fallback.
+    const particularQuery = pickup && dropoff ? `${pickup.Name} to ${dropoff.Name}` : line.transferNameHint || line.pickupHint;
+    const particular = await tryResolveTransferParticular(particularQuery);
+    if (particular) { t.transferName = particular.Name; t._transferNameRow = particular; matched.push(`transfer: ${particular.Name}`); }
+
+    draft.phase = 'transferCollect';
+    draft.currentItemDraft = t;
+    const next = TRANSFER_FIELD_ORDER.find((k) => t[k] === undefined || t[k] === null || t[k] === '');
+    const matchedNote = matched.length > 0 ? ` (auto-matched ${matched.join(', ')})` : '';
+    if (!next) {
+      draft.phase = 'transferOptionalCollect';
+      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer auto-matched${matchedNote}. Optional: time, number of vehicles, vehicle price, flight no, remarks. Reply with any of these, or "skip".`, draft };
+    }
+    draft.itemStep = next;
+    return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer from the message${matchedNote}. ${transferStepPrompt(next, draft)}`, draft };
+  }
+
+  if (line.type === 'sightseeing') {
+    const weekday = weekdayNameFor(dateStr);
+    const s = { date: dateStr };
+    const matched = [];
+    const particular = await tryResolveSightseeing(line.activityHint, weekday);
+    if (particular) { s.sightseeingName = particular.Name; s._sightseeingNameRow = particular; matched.push(particular.Name); }
+
+    draft.phase = 'sightseeingCollect';
+    draft.currentItemDraft = s;
+    const next = SIGHTSEEING_FIELD_ORDER.find((k) => s[k] === undefined || s[k] === null || s[k] === '');
+    const matchedNote = matched.length > 0 ? ` (auto-matched: ${matched.join(', ')})` : '';
+    if (!next) {
+      draft.phase = 'sightseeingOptionalCollect';
+      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — sightseeing auto-matched${matchedNote}. Optional: number of adults/children going, remarks. Reply with any, or "skip".`, draft };
+    }
+    draft.itemStep = next;
+    return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — sightseeing from the message${matchedNote}. ${sightseeingStepPrompt(next)}`, draft };
+  }
+
+  // Only transfer/sightseeing/leisure are ever queued (see the filter in stepAgentPaste) - nothing
+  // else should reach here, but fall through safely (continue the queue) rather than get stuck.
+  return processAgentItineraryQueue(draft, prefix + leisureNote);
 }
 
 async function stepBasic(draft, userMessage) {
@@ -575,13 +784,12 @@ async function stepHotelChoice(draft, userMessage) {
 
   if (selfBooked && !wantsAdd) {
     draft.hotelSelfBooked = true;
-    draft.phase = 'itineraryChoice';
-    return { reply: askItineraryChoice(), draft };
+    return processAgentItineraryQueue(draft, '');
   }
   if (wantsAdd || parseYesNo(userMessage) === true) {
     draft.hotelSelfBooked = false;
     draft.phase = 'hotelCollect';
-    return { reply: startHotelCollect(draft), draft };
+    return { reply: await startHotelCollect(draft), draft };
   }
   return { reply: 'Sorry, could you clarify — reply "self-booked" or "add hotel"?', draft };
 }
@@ -618,13 +826,20 @@ function hotelStepPrompt(stepKey, draft) {
 // has one destination there's nothing to choose, so "which destination is this hotel for?" is
 // skipped entirely and that destination is used directly - only trips with several destinations
 // still ask, via a single-select dropdown scoped to just this trip's own destinations.
-function startHotelCollect(draft) {
+async function startHotelCollect(draft) {
   draft.currentHotelDraft = {};
   const h = draft.currentHotelDraft;
   if (draft.resolvedDestinations.length === 1) {
     const dest = draft.resolvedDestinations[0];
     h.destinationName = dest.Name;
     h._destId = dest.Id;
+    // Travel-agent-sourced draft only (see applyAgentHotelPreference) - no-op for a manual one.
+    const usedPref = await applyAgentHotelPreference(draft, h);
+    if (usedPref) {
+      const next = HOTEL_FIELD_ORDER.find((k) => h[k] === undefined || h[k] === null || h[k] === '');
+      draft.hotelStep = next;
+      return `Using **${h.hotelName}** for ${h.destinationName} (from the message). ${hotelStepPrompt(next, draft)}`;
+    }
     draft.hotelStep = 'hotelName';
     return hotelStepPrompt('hotelName', draft);
   }
@@ -639,8 +854,7 @@ async function stepHotelCollect(draft, userMessage) {
   if (isCancelItemIntent(answer)) {
     draft.currentHotelDraft = null;
     if (draft.hotels.length > 0) {
-      draft.phase = 'itineraryChoice';
-      return { reply: `Okay, not adding this hotel. ${askItineraryChoice()}`, draft };
+      return processAgentItineraryQueue(draft, 'Okay, not adding this hotel. ');
     }
     draft.phase = 'hotelChoice';
     return { reply: `Okay, not adding this hotel. Is the hotel self-booked (guest arranging their own), or would you like to add hotel details? (reply "self-booked" or "add hotel")`, draft };
@@ -673,6 +887,11 @@ async function stepHotelCollect(draft, userMessage) {
         }
         h.destinationName = dest.Name;
         h._destId = dest.Id;
+        // Multi-destination trip - the single-destination case is handled in startHotelCollect;
+        // this covers the same "does the agent's message name a hotel for this destination"
+        // check once the destination question (only asked when there's more than one) is answered.
+        // No-op for a manual draft (see applyAgentHotelPreference).
+        await applyAgentHotelPreference(draft, h);
         break;
       }
       case 'hotelName': {
@@ -818,10 +1037,16 @@ async function stepHotelAddAnother(draft, userMessage) {
   const yn = parseYesNo(userMessage);
   if (yn === true) {
     draft.phase = 'hotelCollect';
-    return { reply: startHotelCollect(draft), draft };
+    return { reply: await startHotelCollect(draft), draft };
   }
-  draft.phase = 'itineraryChoice';
-  return { reply: askItineraryChoice(), draft };
+  // An unrecognized reply (typo, "yeah", etc.) previously fell through as a silent "no", skipping
+  // straight past adding the hotel the user actually meant to add with no way back except
+  // cancelling and redoing the whole booking - now it re-asks instead, matching every other
+  // yes/no gate in this file.
+  if (yn !== false) {
+    return { reply: `Sorry, I didn't catch that. Add another hotel? (yes/no)`, draft };
+  }
+  return processAgentItineraryQueue(draft, '');
 }
 
 // ---------- phase: itinerary (transfer + restaurant only, fully deterministic) ----------
@@ -838,7 +1063,7 @@ async function stepItineraryChoice(draft, userMessage) {
   // flagging self-booked while still sending real itinerary data - a real bug found via a live test).
   if (/self.?book/i.test(t)) {
     draft.itinerarySelfBooked = true;
-    if (draft.editMode) return finishItineraryEdit(draft);
+    if (draft.editMode) return askConfirmItineraryEdit(draft);
     draft.phase = 'priceCollect';
     return { reply: askAddMembers(), draft };
   }
@@ -870,7 +1095,7 @@ async function stepItineraryChoice(draft, userMessage) {
     return { reply: 'Which date is this a Leisure Day? (DD-MM-YYYY)', draft };
   }
   if (draft.itineraryItems.length > 0 && (parseYesNo(userMessage) === false || /done|no more/i.test(t))) {
-    if (draft.editMode) return finishItineraryEdit(draft);
+    if (draft.editMode) return askConfirmItineraryEdit(draft);
     draft.phase = 'priceCollect';
     return { reply: askAddMembers(), draft };
   }
@@ -919,10 +1144,36 @@ function startItineraryEditDraft(raw, code, guestName) {
   };
 }
 
-// Called once the user is done adding items (or picks self-booked). Merges the newly-collected
-// items into the EXISTING itinearyDetails by day, leaving every previously-saved day/item exactly
-// as GetBookingById returned it - the new items are the only thing built by this codebase, so
-// they're the only thing whose shape we need to trust.
+// Called once the user is done adding items (or picks self-booked) - asks for an explicit yes/no
+// before actually saving, matching every other real write in this file (stepConfirm for a new
+// booking, the convert/field-edit/status flows in chat.js). Previously this went STRAIGHT from
+// "self-booked"/"done" to submitBooking() with no confirmation at all - reproduced live: replying
+// "self-booked" to the very first itinerary-edit prompt saved to production immediately.
+function askConfirmItineraryEdit(draft) {
+  const { code, guestName } = draft.editContext;
+  const summary = draft.itinerarySelfBooked
+    ? 'marking the itinerary as self-booked (no items)'
+    : `adding ${draft.itineraryItems.length} new itinerary item(s)`;
+  draft.phase = 'confirmItineraryEdit';
+  return { reply: `Ready to save **${code}** (${guestName}) — ${summary}. This will update the live record and can't be undone from here. Proceed? (yes/no)`, draft };
+}
+
+async function stepConfirmItineraryEdit(draft, userMessage) {
+  const yn = parseYesNo(userMessage);
+  if (yn === false) {
+    return { reply: `Okay, cancelled — nothing was saved.`, draft: null };
+  }
+  if (yn !== true) {
+    return { reply: `Reply "yes" to save this itinerary update, or "no" to cancel.`, draft };
+  }
+  return finishItineraryEdit(draft);
+}
+
+// Called once the user has explicitly confirmed (see askConfirmItineraryEdit/
+// stepConfirmItineraryEdit above). Merges the newly-collected items into the EXISTING
+// itinearyDetails by day, leaving every previously-saved day/item exactly as GetBookingById
+// returned it - the new items are the only thing built by this codebase, so they're the only thing
+// whose shape we need to trust.
 async function finishItineraryEdit(draft) {
   const { raw, code, guestName } = draft.editContext;
   const merged = { ...(raw.itinearyDetails || {}) };
@@ -961,12 +1212,26 @@ async function finishItineraryEdit(draft) {
 // Handles one "ask for a name, resolve it via DB lookup, disambiguate if needed" field. Returns
 // { resolved: true } once item[fieldKey]/item[rowKey] are set (caller continues to the next
 // field), or { reply } if the caller should show that and wait for the next message instead.
-async function resolveSequentialLookup(item, fieldKey, rowKey, lookupFn, label, userAnswer) {
+// formatOption renders each candidate for both display AND matching - defaults to just the bare
+// Name, but several master tables (VehicalMaster in particular - see VEHICLE_FORMAT_OPTION below)
+// have several rows sharing the exact same Name (e.g. five separate "Bus" rows, one per seating
+// capacity). Listing bare names there produced a disambiguation list where every bullet read
+// identically ("Bus" x5) with no way for the user to tell them apart or to answer it - reproduced
+// live. A caller with that kind of data passes a formatOption that includes the distinguishing
+// detail (capacity, address, etc.) so each option is actually distinct on screen.
+async function resolveSequentialLookup(item, fieldKey, rowKey, lookupFn, label, userAnswer, formatOption = (o) => o.Name) {
   if (item._pendingField === fieldKey) {
-    const picked = item._pendingRows.find((o) => o.Name.toLowerCase() === userAnswer.toLowerCase());
+    const picked = item._pendingRows.find((o) => formatOption(o).toLowerCase() === userAnswer.toLowerCase());
     if (!picked) {
-      const opts = item._pendingRows.map((o) => `- ${o.Name}`).join('\n');
-      return { reply: `Please reply with the exact ${label} from the list:\n${opts}` };
+      // The reply didn't match any of the options just offered - rather than repeat that same
+      // list forever (reproduced live: replying "SUV" while a "Bus" x5 disambiguation was pending
+      // just re-showed the identical "Bus" list, with no way to escape it except cancelling the
+      // whole item), clear the pending state and treat this reply as a brand-new search instead.
+      // It still only ever resolves onto a real record (via the same lookupFn below), so this can't
+      // introduce a wrong/invented answer - it just stops a legitimate change of mind from getting stuck.
+      delete item._pendingField;
+      delete item._pendingRows;
+      return resolveSequentialLookup(item, fieldKey, rowKey, lookupFn, label, userAnswer, formatOption);
     }
     item[fieldKey] = picked.Name;
     item[rowKey] = picked;
@@ -982,12 +1247,18 @@ async function resolveSequentialLookup(item, fieldKey, rowKey, lookupFn, label, 
   if (rows.length > 1) {
     item._pendingField = fieldKey;
     item._pendingRows = rows;
-    const opts = rows.map((r) => `- ${r.Name}`).join('\n');
-    return { reply: `A few ${label} options match "${userAnswer}":\n${opts}\nWhich one did you mean?` };
+    const opts = rows.map((r) => `- ${formatOption(r)}`).join('\n');
+    return { reply: `A few ${label} options match "${userAnswer}":\n${opts}\nWhich one did you mean? Please reply with the exact option as shown above.` };
   }
   item[fieldKey] = rows[0].Name;
   item[rowKey] = rows[0];
   return { resolved: true };
+}
+
+// VehicalMaster rows are frequently duplicated by Name with only Capacity distinguishing them
+// (see the comment on resolveSequentialLookup above) - every vehicle-type lookup uses this.
+function formatVehicleOption(v) {
+  return v.Capacity != null ? `${v.Name} (${v.Capacity} seats)` : v.Name;
 }
 
 const TRANSFER_FIELD_ORDER = ['date', 'pickupPointName', 'dropOffPointName', 'transferName', 'vehicleTypeName'];
@@ -995,7 +1266,7 @@ const TRANSFER_LOOKUPS = {
   pickupPointName: [findPickup, 'pickup point'],
   dropOffPointName: [findPickup, 'drop-off point'],
   transferName: [findPickupOrParticular, 'transfer name'],
-  vehicleTypeName: [findVehicle, 'vehicle type'],
+  vehicleTypeName: [findVehicle, 'vehicle type', formatVehicleOption],
 };
 
 function transferStepPrompt(stepKey, draft) {
@@ -1022,13 +1293,16 @@ async function stepTransferCollect(draft, userMessage) {
 
   if (isCancelItemIntent(answer)) {
     draft.currentItemDraft = null;
+    if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+      return processAgentItineraryQueue(draft, 'Okay, not adding this transfer. ');
+    }
     draft.phase = 'itineraryChoice';
     return { reply: `Okay, not adding this transfer. ${askItineraryChoice()}`, draft };
   }
 
   if (t._pendingField) {
-    const [lookupFn, label] = TRANSFER_LOOKUPS[t._pendingField];
-    const res = await resolveSequentialLookup(t, t._pendingField, `_${t._pendingField}Row`, lookupFn, label, answer);
+    const [lookupFn, label, formatOption] = TRANSFER_LOOKUPS[t._pendingField];
+    const res = await resolveSequentialLookup(t, t._pendingField, `_${t._pendingField}Row`, lookupFn, label, answer, formatOption);
     if (!res.resolved) return { reply: res.reply, draft };
   } else {
     switch (draft.itemStep) {
@@ -1042,8 +1316,8 @@ async function stepTransferCollect(draft, userMessage) {
       case 'dropOffPointName':
       case 'transferName':
       case 'vehicleTypeName': {
-        const [lookupFn, label] = TRANSFER_LOOKUPS[draft.itemStep];
-        const res = await resolveSequentialLookup(t, draft.itemStep, `_${draft.itemStep}Row`, lookupFn, label, answer);
+        const [lookupFn, label, formatOption] = TRANSFER_LOOKUPS[draft.itemStep];
+        const res = await resolveSequentialLookup(t, draft.itemStep, `_${draft.itemStep}Row`, lookupFn, label, answer, formatOption);
         if (!res.resolved) return { reply: res.reply, draft };
         break;
       }
@@ -1135,8 +1409,12 @@ async function stepTransferOptionalCollect(draft, userMessage) {
   });
 
   draft.currentItemDraft = null;
+  const addedMsg = `Added the transfer (${pickup.Name} → ${dropoff.Name}). `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
   draft.phase = 'itineraryChoice';
-  return { reply: `Added the transfer (${pickup.Name} → ${dropoff.Name}). ${askAddMoreItinerary()}`, draft };
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
 }
 
 // ---------- itinerary item: sightseeing ----------
@@ -1167,6 +1445,9 @@ async function stepSightseeingCollect(draft, userMessage) {
 
   if (isCancelItemIntent(answer)) {
     draft.currentItemDraft = null;
+    if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+      return processAgentItineraryQueue(draft, 'Okay, not adding this sightseeing. ');
+    }
     draft.phase = 'itineraryChoice';
     return { reply: `Okay, not adding this sightseeing. ${askItineraryChoice()}`, draft };
   }
@@ -1272,8 +1553,12 @@ async function stepSightseeingOptionalCollect(draft, userMessage) {
   });
 
   draft.currentItemDraft = null;
+  const addedMsg = `Added the sightseeing (${particular.Name}). `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
   draft.phase = 'itineraryChoice';
-  return { reply: `Added the sightseeing (${particular.Name}). ${askAddMoreItinerary()}`, draft };
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
 }
 
 // ---------- itinerary item: leisure day ----------
@@ -1319,8 +1604,12 @@ async function stepLeisureDayCollect(draft, userMessage) {
   });
 
   draft.currentItemDraft = null;
+  const addedMsg = `Added a Leisure Day for ${answer}. `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
   draft.phase = 'itineraryChoice';
-  return { reply: `Added a Leisure Day for ${answer}. ${askAddMoreItinerary()}`, draft };
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
 }
 
 const RESTAURANT_FIELD_ORDER = ['date', 'restaurantName'];
@@ -1456,8 +1745,12 @@ async function stepRestaurantOptionalCollect(draft, userMessage) {
   });
 
   draft.currentItemDraft = null;
+  const addedMsg = `Added the restaurant (${restaurant.Name}). `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
   draft.phase = 'itineraryChoice';
-  return { reply: `Added the restaurant (${restaurant.Name}). ${askAddMoreItinerary()}`, draft };
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
 }
 
 function askAddMoreItinerary() {
@@ -1540,11 +1833,17 @@ async function stepPriceCollect(draft, userMessage) {
 }
 
 async function stepPriceCollectAnother(draft, userMessage) {
-  if (parseYesNo(userMessage) === true) {
+  const yn = parseYesNo(userMessage);
+  if (yn === true) {
     draft.phase = 'priceCollect';
     draft.currentItemDraft = {};
     draft.itemStep = 'type';
     return { reply: memberStepPrompt('type'), draft };
+  }
+  // See stepHotelAddAnother's comment above - an unrecognized reply must re-ask, not silently act
+  // as "no" and move on past a pricing line the user may still have wanted to add.
+  if (yn !== false) {
+    return { reply: `Sorry, I didn't catch that. Add another traveller-type pricing line? (yes/no)`, draft };
   }
   draft.phase = 'priceExtras';
   return { reply: askPriceExtras(), draft };
@@ -1789,14 +2088,30 @@ async function trySubmit(draft, allowSalesEntry) {
     return { reply: `I couldn't save this: ${err.message}. Nothing was created — you can try confirming again once that's fixed.`, draft };
   }
 
-  const created = await findBookingById(newId);
+  // submitBooking above has ALREADY succeeded - the record is live - so a failure in this lookup
+  // must never propagate uncaught. An uncaught throw here would leave draft.phase stuck at
+  // 'confirm' (session.draft is only ever updated by the CALLER once step() resolves), so a user
+  // who saw a generic error and didn't know the save had actually gone through could reply "yes"
+  // again and create a second, duplicate real booking via a second submitBooking() call with the
+  // identical payload. Treated the same as the existing "found no row" case below instead.
+  let created = null;
+  try {
+    created = await findBookingById(newId);
+  } catch {
+    created = null;
+  }
   const code = created ? (isBooking ? created.BookingId : created.QuotationId) : null;
 
   const successMsg = code
     ? `Done! I've created the ${draft.kind} for **${draft.fields.guestName}** — reference **${code}**. You can open it in the Booking panel for any further edits.`
     : `The ${draft.kind} was saved (id ${newId}), but I couldn't look up its reference code — please check the list for "${draft.fields.guestName}".`;
 
-  return { reply: successMsg, draft: null };
+  // Surfaced so chat.js can set session.lastBookingCode to the record just created - otherwise a
+  // same-session follow-up like "download this quotation" right after creation kept resolving
+  // against whichever OLDER code the user had last typed themselves (lastBookingCode is only ever
+  // updated from the user's own message - see chat.js), silently returning a completely different
+  // record's document instead of the one just created.
+  return { reply: successMsg, draft: null, createdCode: code || undefined };
 }
 
 async function stepConfirmNoSalesEntry(draft, userMessage) {
@@ -1848,6 +2163,8 @@ async function step(draft, userMessage) {
       return stepHotelAddAnother(draft, userMessage);
     case 'itineraryChoice':
       return stepItineraryChoice(draft, userMessage);
+    case 'confirmItineraryEdit':
+      return stepConfirmItineraryEdit(draft, userMessage);
     case 'transferCollect':
       return stepTransferCollect(draft, userMessage);
     case 'transferOptionalCollect':

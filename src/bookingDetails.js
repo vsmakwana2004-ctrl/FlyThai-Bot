@@ -28,11 +28,16 @@ function detectFullDetailIntent(text) {
 // Returns { status: 'not_found' } | { status: 'ambiguous', matches: [...] } | { status: 'ok', id, row }
 async function resolveBooking(pool, intent) {
   if (intent.exact) {
+    // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode for the
+    // confirmed live example of 3 rows sharing one code) - a bare TOP 1 here previously picked an
+    // arbitrary one of them silently, showing the wrong guest's details. Same ambiguity check the
+    // bare-digits branch below already does.
     const r = await pool.request().input('code', intent.code).query(`
-      SELECT TOP 1 Id, BookingId, QuotationId, GuestName FROM BookingMaster
+      SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
       WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
     `);
-    if (!r.recordset[0]) return { status: 'not_found' };
+    if (r.recordset.length === 0) return { status: 'not_found' };
+    if (r.recordset.length > 1) return { status: 'ambiguous', matches: r.recordset };
     return { status: 'ok', id: r.recordset[0].Id };
   }
 

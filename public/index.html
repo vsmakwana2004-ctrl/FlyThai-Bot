@@ -58,16 +58,6 @@
                above but driven by the current step instead of being fixed. -->
           <div class="suggestions" id="quickReplies" style="display:none"></div>
 
-          <div class="flow-bar" id="flowBar" style="display:none">
-            <span class="flow-bar-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="9" /><path d="M12 8v4M12 16h.01" />
-              </svg>
-            </span>
-            <span class="flow-bar-text">A guided step is in progress — answer the question above, or</span>
-            <button type="button" id="cancelFlowBtn" class="cancel-flow-btn">Cancel it</button>
-          </div>
-
           <div class="input-wrap">
             <div id="lookupDropdown" class="lookup-dropdown" style="display:none"></div>
             <div id="datePickerBox" class="date-picker-box" style="display:none">
@@ -81,6 +71,10 @@
                 <span>SU</span><span>MO</span><span>TU</span><span>WE</span><span>TH</span><span>FR</span><span>SA</span>
               </div>
               <div id="calGrid" class="cal-grid"></div>
+            </div>
+            <div id="timePickerBox" class="time-picker-box" style="display:none">
+              <div class="time-picker-title">Pick a time</div>
+              <div id="timeGrid" class="time-grid"></div>
             </div>
             <div id="paxPickerBox" class="pax-picker-box" style="display:none">
               <div class="pax-field">
@@ -156,6 +150,12 @@
             </div>
             <form id="chatForm" class="input-bar">
               <textarea id="chatInput" rows="1" autocomplete="off" maxlength="2000" placeholder="Ask anything about your bookings, quotations, hotels…"></textarea>
+              <button type="button" id="cancelFlowBtn" class="cancel-flow-btn" title="Cancel the guided step in progress" style="display:none">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+                <span>Cancel</span>
+              </button>
               <button type="submit" id="sendBtn" title="Send">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4 20-7Z" />

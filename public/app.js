@@ -12,6 +12,8 @@ const calPrev = document.getElementById('calPrev');
 const calNext = document.getElementById('calNext');
 const calTitle = document.getElementById('calTitle');
 const calGrid = document.getElementById('calGrid');
+const timePickerBox = document.getElementById('timePickerBox');
+const timeGrid = document.getElementById('timeGrid');
 const paxPickerBox = document.getElementById('paxPickerBox');
 const paxAdultsInput = document.getElementById('paxAdults');
 const paxChildrenInput = document.getElementById('paxChildren');
@@ -33,7 +35,6 @@ const edBookingBy = document.getElementById('edBookingBy');
 const edAllowVoucher = document.getElementById('edAllowVoucher');
 const edAllowInvoice = document.getElementById('edAllowInvoice');
 const edAllowItinerary = document.getElementById('edAllowItinerary');
-const flowBar = document.getElementById('flowBar');
 const cancelFlowBtn = document.getElementById('cancelFlowBtn');
 const charCount = document.getElementById('charCount');
 const layoutEl = document.getElementById('layout');
@@ -67,9 +68,11 @@ async function readJsonResponse(res) {
 }
 
 // Shows a visible way out of any guided step (booking creation, status change, PDF choice) — the
-// only previous escape was New Chat, which discarded the whole conversation.
+// only previous escape was New Chat, which discarded the whole conversation. Lives right next to
+// Send in the composer (not a separate banner above it) - a full-width banner used to get covered
+// by the lookup dropdown whenever one was open, and ate vertical space even when nothing overlapped it.
 function setFlowActive(active) {
-  flowBar.style.display = active ? 'flex' : 'none';
+  cancelFlowBtn.style.display = active ? 'inline-flex' : 'none';
 }
 
 // Live lookup dropdowns - shows real registered records above the input while the bot is asking
@@ -127,7 +130,7 @@ function syncDestinationInputValue() {
 // re-scrolling to the true bottom, keeps the latest message visible above the popover instead.
 const MESSAGES_BASE_PADDING_BOTTOM = 32; // must match .messages-inner's own CSS padding-bottom
 function reserveSpaceForVisiblePopover() {
-  const popovers = [lookupDropdown, datePickerBox, paxPickerBox, priceExtrasBox];
+  const popovers = [lookupDropdown, datePickerBox, timePickerBox, paxPickerBox, priceExtrasBox, extraDetailsBox];
   const visible = popovers.find((el) => el.style.display && el.style.display !== 'none');
   const extra = visible ? visible.offsetHeight + 12 : 0; // +12 matches the popover's own margin-bottom
   messagesInner.style.paddingBottom = extra ? `${MESSAGES_BASE_PADDING_BOTTOM + extra}px` : '';
@@ -315,6 +318,35 @@ calNext.addEventListener('click', () => {
   reserveSpaceForVisiblePopover();
 });
 
+// Common 30-min tour-start slots (05:00-23:30) - covers the vast majority of real answers to "what
+// time?" in one click, same interaction as a calendar day (click -> send immediately). Anything
+// off-grid (e.g. "09:15") is still just typed into the composer as before - this never replaces that.
+function renderTimeGrid() {
+  const slots = [];
+  for (let h = 5; h <= 23; h++) {
+    slots.push(`${pad2(h)}:00`, `${pad2(h)}:30`);
+  }
+  timeGrid.innerHTML = slots.map((t) => `<button type="button" class="time-slot" data-time="${t}">${t}</button>`).join('');
+}
+
+function showTimePicker() {
+  renderTimeGrid();
+  timePickerBox.style.display = 'block';
+  reserveSpaceForVisiblePopover();
+}
+
+function hideTimePicker() {
+  timePickerBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
+timeGrid.addEventListener('click', (e) => {
+  const btn = e.target.closest('.time-slot');
+  if (!btn) return;
+  hideTimePicker();
+  sendMessage(btn.dataset.time);
+});
+
 // Adults/children/infants step gets three number spinners instead of typing "4 adults, 1 child" -
 // digits only (native number input plus a keydown filter blocking e/+/-/.), adults floored at 1
 // since a booking needs at least one adult traveller. Every change re-syncs the chat input text so
@@ -497,6 +529,7 @@ function setExpecting(expecting) {
 
   if (expecting && expecting.field === 'date') {
     hideLookupDropdown();
+    hideTimePicker();
     hidePaxPicker();
     hidePriceExtrasPicker();
     hideExtraDetailsPicker();
@@ -506,6 +539,16 @@ function setExpecting(expecting) {
     return;
   }
   hideDatePicker();
+
+  if (expecting && expecting.field === 'time') {
+    hideLookupDropdown();
+    hidePaxPicker();
+    hidePriceExtrasPicker();
+    hideExtraDetailsPicker();
+    showTimePicker();
+    return;
+  }
+  hideTimePicker();
 
   if (expecting && expecting.field === 'pax') {
     hideLookupDropdown();

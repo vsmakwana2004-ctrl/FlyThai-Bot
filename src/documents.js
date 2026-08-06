@@ -93,17 +93,45 @@ function detectDocumentIntent(text, fallbackCode) {
   return { type: 'unknown', code };
 }
 
+// Returns EVERY row matching this code, not just one - BookingId is always assigned uniquely, but
+// QuotationId is NOT guaranteed unique in this database (confirmed live: three separate real rows -
+// two still-pending quotations for different guests, plus a third already converted to a booking -
+// all share the exact code "FTQ12260001"). A bare TOP 1 with no ORDER BY here previously picked an
+// arbitrary one of them silently - reproduced live: asking for that code's PDF returned a different
+// guest's already-converted booking instead of the actual pending quotation being asked about, with
+// nothing to suggest anything was wrong. Callers must now handle >1 result themselves (see
+// handleDocumentRequest's disambiguation prompt) rather than ever picking one on the caller's behalf.
 async function resolveBookingByCode(code) {
   const pool = await getPool();
   const result = await pool
     .request()
     .input('code', code)
     .query(`
-      SELECT TOP 1 Id, BookingId, QuotationId, GuestName, IsBooking
+      SELECT Id, BookingId, QuotationId, GuestName, IsBooking, CreatedOn
       FROM BookingMaster
       WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
+      ORDER BY CreatedOn DESC
     `);
+  return result.recordset;
+}
+
+// Re-fetches one specific row by its own internal Id - used once a code has already been resolved
+// to a single row (whether because it was unambiguous, or because the user just disambiguated one
+// of several matches), so nothing re-triggers the same code-based ambiguity a second time.
+async function resolveBookingById(internalId) {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('id', internalId)
+    .query(`SELECT Id, BookingId, QuotationId, GuestName, IsBooking, CreatedOn FROM BookingMaster WHERE IsDelete = 0 AND Id = @id`);
   return result.recordset[0] || null;
+}
+
+// One line per candidate in a "which one did you mean?" disambiguation list - distinguishes
+// same-code rows by guest name, current status, and creation date (the DB's own tie-breaker order).
+function describeMatch(m) {
+  const status = m.IsBooking && m.BookingId ? `now Booking **${m.BookingId}**${m.QuotationId ? ' (converted from this quotation)' : ''}` : 'still a Quotation';
+  return `**${m.GuestName}** — ${status}, created ${fmtDate(m.CreatedOn)}`;
 }
 
 // The hotel voucher PDF is keyed by BookingHotel.Id, not BookingMaster.Id (a booking can have
@@ -163,22 +191,51 @@ function reportLabel(isBooking) {
 }
 
 async function handleDocumentRequest(intent) {
-  const booking = await resolveBookingByCode(intent.code);
-  if (!booking) {
+  const matches = await resolveBookingByCode(intent.code);
+  if (matches.length === 0) {
     return { reply: `I couldn't find any booking or quotation with code **${intent.code}** in the database.` };
   }
+  if (matches.length > 1) {
+    // Never guess which same-code record was meant (see resolveBookingByCode) - same "ask, don't
+    // pick" standard the rest of this codebase already applies to ambiguous hotel/vehicle/
+    // destination matches.
+    const list = matches.map((m, i) => `${i + 1}. ${describeMatch(m)}`).join('\n');
+    return {
+      reply: `More than one record uses the code **${intent.code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`,
+      // .code alongside {intent, matches} so this fits the same {code: ...} shape every other
+      // pending-* state uses in chat.js (the cancel check and the "a different code interrupts a
+      // stale pending question" guard both key off pending.code).
+      pendingCodeChoice: { code: intent.code, intent, matches },
+    };
+  }
+  return buildDocumentReply(intent, matches[0]);
+}
+
+async function buildDocumentReply(intent, booking) {
   const code = booking.BookingId || booking.QuotationId;
+
+  // Converting a quotation to a booking (see convertBooking.js) keeps the OLD QuotationId on the
+  // same row alongside the newly-assigned BookingId, and flips IsBooking true - the real site's own
+  // convention, mirrored here (convertBooking.js's checkConversion already relies on the same fact
+  // for its own "already_booking" case). Asking for that old FTQ code (e.g. from a stale UI list
+  // that hasn't refreshed since it was converted) now silently resolves onto the BOOKING record
+  // instead - correct, but with no indication of why the returned code/PDF label differs from what
+  // was typed. Reproduced live: "download quotation for FTQ12260001" answered with the INVOICE for
+  // a completely different-looking code (FT12261788) and no explanation, reading as a wrong/
+  // hallucinated result even though it was actually the same record, just already converted.
+  const wasConverted = booking.IsBooking && booking.QuotationId && booking.BookingId && intent.code.toUpperCase() === booking.QuotationId.toUpperCase();
+  const conversionNote = wasConverted ? `_Note: **${booking.QuotationId}** has since been converted to booking **${booking.BookingId}** — showing that booking's document instead._\n\n` : '';
 
   if (intent.type === 'report') {
     const link = buildInvoiceLink(booking.Id, false);
     const label = reportLabel(booking.IsBooking);
-    return { reply: `Here's the ${label.toLowerCase()} for **${code}** (${booking.GuestName}):\n\n[Download ${label} PDF](${link})\n\nIt'll open using your existing FlyThai login session in a new tab.` };
+    return { reply: `${conversionNote}Here's the ${label.toLowerCase()} for **${code}** (${booking.GuestName}):\n\n[Download ${label} PDF](${link})\n\nIt'll open using your existing FlyThai login session in a new tab.` };
   }
 
   if (intent.type === 'unknown') {
     const label = reportLabel(booking.IsBooking);
     return {
-      reply: `For **${code}** (${booking.GuestName}), which PDF would you like?\n\n- ${label}\n- Itinerary\n- Hotel Voucher\n\n(Reply with one of these.)`,
+      reply: `${conversionNote}For **${code}** (${booking.GuestName}), which PDF would you like?\n\n- ${label}\n- Itinerary\n- Hotel Voucher\n\n(Reply with one of these.)`,
       pendingDocChoice: { code, internalId: booking.Id, guestName: booking.GuestName, isBooking: booking.IsBooking },
     };
   }
@@ -186,16 +243,17 @@ async function handleDocumentRequest(intent) {
   if (intent.type === 'hotelVoucher') {
     const hotels = await resolveBookingHotels(booking.Id);
     if (hotels.length === 0) {
-      return { reply: `**${code}** (${booking.GuestName}) doesn't have any hotel entries yet, so there's no voucher to generate.` };
+      return { reply: `${conversionNote}**${code}** (${booking.GuestName}) doesn't have any hotel entries yet, so there's no voucher to generate.` };
     }
     if (hotels.length === 1) {
-      return hotelVoucherLogoPrompt(code, booking.GuestName, hotels[0]);
+      const prompt = hotelVoucherLogoPrompt(code, booking.GuestName, hotels[0]);
+      return { ...prompt, reply: `${conversionNote}${prompt.reply}` };
     }
     // Same "which one?" pattern as bookingDetails.js's ambiguous-code case - never guess which
     // hotel stay was meant when a booking covers more than one.
     const list = hotels.map((h, i) => `${i + 1}. **${h.HotelName}** (${fmtDate(h.CheckInDate)} – ${fmtDate(h.CheckOutDate)}${h.ConfirmationId ? `, confirmation ${h.ConfirmationId}` : ''})`).join('\n');
     return {
-      reply: `**${code}** (${booking.GuestName}) has ${hotels.length} hotel stays — which one's voucher would you like?\n\n${list}\n\n(Reply with the number or the hotel name.)`,
+      reply: `${conversionNote}**${code}** (${booking.GuestName}) has ${hotels.length} hotel stays — which one's voucher would you like?\n\n${list}\n\n(Reply with the number or the hotel name.)`,
       pendingHotelChoice: { code, guestName: booking.GuestName, hotels },
     };
   }
@@ -203,7 +261,7 @@ async function handleDocumentRequest(intent) {
   // itinerary - the real site always pops up a 3-way logo choice first, so mirror that here
   // instead of silently picking a default. The chosen value is applied once the user replies.
   return {
-    reply: `Which version of the itinerary PDF for **${code}** (${booking.GuestName}) would you like?\n\n- With FlyThai Logo\n- With Agent Logo\n- No Logo\n\n(Reply with one of these, or just 1 / 2 / 3.)`,
+    reply: `${conversionNote}Which version of the itinerary PDF for **${code}** (${booking.GuestName}) would you like?\n\n- With FlyThai Logo\n- With Agent Logo\n- No Logo\n\n(Reply with one of these, or just 1 / 2 / 3.)`,
     pendingItinerary: { kind: 'itinerary', code, internalId: booking.Id, guestName: booking.GuestName },
   };
 }
@@ -226,8 +284,18 @@ function hotelVoucherLogoPrompt(code, guestName, hotel) {
 function stepHotelChoice(pending, userMessage) {
   const t = userMessage.trim().toLowerCase();
   const byNumber = /^\d+$/.test(t) ? pending.hotels[Number(t) - 1] : null;
-  const byName = pending.hotels.find((h) => h.HotelName.toLowerCase().includes(t) || t.includes(h.HotelName.toLowerCase()));
-  const chosen = byNumber || byName;
+  // Never guess when a partial name matches more than one hotel (e.g. two stays both containing
+  // "Ibis") - same "ask, don't pick" standard as resolveBookingByCode/stepCodeChoice in this file.
+  const nameMatches = byNumber ? [] : pending.hotels.filter((h) => h.HotelName.toLowerCase().includes(t) || t.includes(h.HotelName.toLowerCase()));
+  const chosen = byNumber || (nameMatches.length === 1 ? nameMatches[0] : null);
+
+  if (!chosen && nameMatches.length > 1) {
+    const list = pending.hotels.map((h, i) => `${i + 1}. **${h.HotelName}** (${fmtDate(h.CheckInDate)} – ${fmtDate(h.CheckOutDate)}${h.ConfirmationId ? `, confirmation ${h.ConfirmationId}` : ''})`).join('\n');
+    return {
+      reply: `That matches more than one hotel — which one did you mean?\n\n${list}\n\n(Reply with the number.)`,
+      pendingHotelChoice: pending,
+    };
+  }
 
   if (!chosen) {
     return {
@@ -245,7 +313,10 @@ function stepHotelChoice(pending, userMessage) {
 // first designed) - chat.js awaits this call.
 async function stepDocChoice(pending, userMessage) {
   if (HOTEL_VOUCHER_RE.test(userMessage) || /\bhotel\b/i.test(userMessage)) {
-    const booking = await resolveBookingByCode(pending.code);
+    // By internal Id (already resolved once, unambiguously, when this pendingDocChoice was first
+    // created), not resolveBookingByCode(pending.code) - re-resolving by code here previously
+    // re-triggered the exact same same-code ambiguity a second time (see resolveBookingByCode).
+    const booking = await resolveBookingById(pending.internalId);
     const hotels = await resolveBookingHotels(booking.Id);
     if (hotels.length === 0) {
       return { reply: `**${pending.code}** (${pending.guestName}) doesn't have any hotel entries yet, so there's no voucher to generate.`, pendingDocChoice: null };
@@ -282,6 +353,24 @@ async function stepDocChoice(pending, userMessage) {
   };
 }
 
+// Continues a pending "which record did you mean?" question (only asked when a code matches more
+// than one real row - see resolveBookingByCode) with the user's reply - by number only, since
+// nothing else about these candidates is guaranteed distinct enough to type unambiguously (guest
+// names can repeat too).
+async function stepCodeChoice(pending, userMessage) {
+  const t = userMessage.trim();
+  const chosen = /^\d+$/.test(t) ? pending.matches[Number(t) - 1] : null;
+  if (!chosen) {
+    const list = pending.matches.map((m, i) => `${i + 1}. ${describeMatch(m)}`).join('\n');
+    return {
+      reply: `Please reply with just the number of the record you meant:\n\n${list}`,
+      pendingCodeChoice: pending,
+    };
+  }
+  const result = await buildDocumentReply(pending.intent, chosen);
+  return { ...result, pendingCodeChoice: null };
+}
+
 // Continues a pending "which logo version?" question with the user's reply. Shared by the
 // itinerary flow and the hotel-voucher flow - both PDFs offer the same 3-way logo choice on the
 // real site, they just call a different endpoint (pending.kind picks which).
@@ -315,9 +404,12 @@ module.exports = {
   stepLogoChoice,
   stepDocChoice,
   stepHotelChoice,
+  stepCodeChoice,
   parseLogoChoice,
   resolveBookingByCode,
   buildInvoiceLink,
   buildItineraryLink,
   buildHotelVoucherLink,
+  describeMatch,
+  fmtDate,
 };

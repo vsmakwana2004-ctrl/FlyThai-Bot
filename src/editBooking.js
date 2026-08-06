@@ -24,7 +24,21 @@ function detectSimpleFieldEditIntent(text, lastBookingCode) {
   const value = toMatch[1].trim().replace(/^["']|["']$/g, '');
   if (!value) return null;
 
-  const field = FIELD_ALIASES.find((f) => f.pattern.test(text));
+  // Only search the part of the message BEFORE "to <value>" for the field name, and take the
+  // match closest to "to" (not the first one in FIELD_ALIASES's own order) - a message naming two
+  // field keywords ("update guest name to Alex, don't touch phone") previously could attribute the
+  // new value to whichever field happened to appear first in that fixed list, not the one the "to"
+  // clause was actually about.
+  const beforeTo = text.slice(0, toMatch.index);
+  let field = null;
+  let bestIndex = -1;
+  for (const f of FIELD_ALIASES) {
+    const m = beforeTo.match(f.pattern);
+    if (m && m.index > bestIndex) {
+      bestIndex = m.index;
+      field = f;
+    }
+  }
   if (!field) return null;
 
   const codeMatch = text.match(CODE_RE);
@@ -59,13 +73,23 @@ function detectItineraryEditIntent(text, lastBookingCode) {
   return { code };
 }
 
-// Shared first step for both edit paths: resolve the code to a real record and pull its current
-// live state (same GetBookingById-based read convertBooking.js's conversion check already uses).
-async function resolveForEdit(code) {
-  const booking = await resolveQuotation(code);
-  if (!booking) return { status: 'not_found', code };
+// Runs the actual "pull its current live state" step once a single, unambiguous row has already
+// been resolved - shared by resolveForEdit() below and by chat.js's post-disambiguation
+// continuation (once the user has picked which of several same-coded records they meant).
+async function resolveForEditBooking(booking) {
   const raw = await fetchRawRecord(booking.Id);
   return { status: 'ok', code: booking.BookingId || booking.QuotationId, guestName: booking.GuestName, raw };
+}
+
+// Shared first step for both edit paths: resolve the code to a real record and pull its current
+// live state (same GetBookingById-based read convertBooking.js's conversion check already uses).
+// resolveQuotation returns 'ambiguous' when the code matches more than one row (QuotationId isn't
+// guaranteed unique - see convertBooking.js/documents.js) - callers must handle that status rather
+// than ever guessing which record was meant.
+async function resolveForEdit(code) {
+  const resolved = await resolveQuotation(code);
+  if (resolved.status !== 'ok') return resolved;
+  return resolveForEditBooking(resolved.booking);
 }
 
 async function applySimpleFieldEdit(raw, fieldKey, value) {
@@ -79,4 +103,4 @@ async function applySimpleFieldEdit(raw, fieldKey, value) {
   }
 }
 
-module.exports = { detectSimpleFieldEditIntent, detectItineraryEditIntent, resolveForEdit, applySimpleFieldEdit };
+module.exports = { detectSimpleFieldEditIntent, detectItineraryEditIntent, resolveForEdit, resolveForEditBooking, applySimpleFieldEdit };

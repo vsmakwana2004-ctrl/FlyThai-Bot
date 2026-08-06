@@ -1,5 +1,5 @@
-const { getPool } = require('./db');
 const { submitBooking } = require('./bookingApi');
+const { resolveBookingByCode } = require('./documents');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 const CONVERT_RE = /\bconvert\b[\s\S]*\bbooking\b/i;
@@ -26,14 +26,17 @@ function buildHeaders() {
   return { base, headers: { accept: 'application/json', cookie, 'x-requested-with': 'XMLHttpRequest' } };
 }
 
+// Returns { status: 'not_found' } | { status: 'ambiguous', code, matches } | { status: 'ok', booking }.
+// QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode, which this reuses,
+// for the confirmed live example of 3 rows sharing one code) - a bare TOP 1 here previously picked
+// an arbitrary one of them silently, risking converting/editing a completely different guest's
+// record than the one asked about. Callers must handle 'ambiguous' themselves rather than ever
+// picking one on the caller's behalf.
 async function resolveQuotation(code) {
-  const pool = await getPool();
-  const result = await pool.request().input('code', code).query(`
-    SELECT TOP 1 Id, BookingId, QuotationId, GuestName, IsBooking
-    FROM BookingMaster
-    WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
-  `);
-  return result.recordset[0] || null;
+  const matches = await resolveBookingByCode(code);
+  if (matches.length === 0) return { status: 'not_found', code };
+  if (matches.length > 1) return { status: 'ambiguous', code, matches };
+  return { status: 'ok', booking: matches[0] };
 }
 
 // Pulls the record in the EXACT shape the real "Convert to Booking" button itself submits back -
@@ -107,9 +110,10 @@ function validateForConversion(raw) {
 // Checks whether a quotation is ready to convert, without writing anything - safe to call any
 // number of times. Returns the raw record too, so a caller that gets 'ok' doesn't need to
 // re-fetch it before actually converting.
-async function checkConversion(code) {
-  const booking = await resolveQuotation(code);
-  if (!booking) return { status: 'not_found', code };
+// Runs the actual "is this ready to convert?" checks once a single, unambiguous row has already
+// been resolved - shared by checkConversion() below and by chat.js's post-disambiguation
+// continuation (once the user has picked which of several same-coded records they meant).
+async function checkConversionForBooking(booking) {
   if (booking.IsBooking) return { status: 'already_booking', code: booking.BookingId, guestName: booking.GuestName };
 
   const raw = await fetchRawRecord(booking.Id);
@@ -118,6 +122,12 @@ async function checkConversion(code) {
     return { status: 'invalid', code: booking.QuotationId, guestName: booking.GuestName, errors };
   }
   return { status: 'ok', code: booking.QuotationId, guestName: booking.GuestName, internalId: booking.Id, raw };
+}
+
+async function checkConversion(code) {
+  const resolved = await resolveQuotation(code);
+  if (resolved.status !== 'ok') return resolved;
+  return checkConversionForBooking(resolved.booking);
 }
 
 // GetBookingById returns travelDate/returnDate as ISO ("2026-12-25"). Quotation-mode saves (the
@@ -141,4 +151,4 @@ async function performConversion(raw, { allowSalesEntry = true } = {}) {
   return submitBooking(patched, true, { allowSalesEntry });
 }
 
-module.exports = { detectConvertIntent, checkConversion, performConversion, validateForConversion, fetchRawRecord, resolveQuotation };
+module.exports = { detectConvertIntent, checkConversion, checkConversionForBooking, performConversion, validateForConversion, fetchRawRecord, resolveQuotation };
