@@ -1,8 +1,13 @@
 const { getPool } = require('./db');
 
 const FULL_CODE_RE = /\bFTQ?\d+\b/i;
+// "account history"/"account details" was missing - reproduced live: "show me the account history
+// of FT..." didn't match, so it fell through to the generic LLM SQL-planner instead of this
+// module's own verified pairVoucherLegs merge logic, producing raw unmerged Credit/Debit legs with
+// no FROM/OPP account pairing and no Total Sale/Purchase/Revenue or Credit/Debit/Balance summary -
+// silently wrong-shaped output compared to the real site's own Account screen for the same booking.
 const ACCOUNT_TXN_INTENT_RE =
-  /\b(account(?:ing)?\s+transactions?|ledger|transaction\s+(?:history|list|details?)|transactions?\s+(?:for|of)\b|sale\s*(?:vs\.?|\/|and)\s*purchase|receipt\s*(?:vs\.?|\/|and)\s*payment)\b/i;
+  /\b(account(?:ing)?\s+(?:transactions?|history|details?)|ledger|transaction\s+(?:history|list|details?)|transactions?\s+(?:for|of)\b|sale\s*(?:vs\.?|\/|and)\s*purchase|receipt\s*(?:vs\.?|\/|and)\s*payment)\b/i;
 
 // Detects "show account transactions for booking FT...", "ledger for FT...", "transaction history
 // of FT...", "sale vs purchase for FT..." etc. Falls back to the session's last-mentioned booking
@@ -81,13 +86,29 @@ function pairVoucherLegs(rows) {
       }
       if (matchIdx >= 0) usedInternal.add(matchIdx);
 
+      // Which leg is shown as FROM (and whose own Credit/Debit is displayed) depends on the
+      // transaction category - confirmed by querying the raw AccountTransaction/AccountMaster
+      // rows directly for a real booking (FT07261770) and comparing against the real site's own
+      // Account screen for that same booking: Sale Form/Purchase Form entries show the EXTERNAL
+      // (real-world counterparty - Agent/Hotel/Vendor) leg as FROM, with the INTERNAL (Fly Thai
+      // control account, e.g. "Fly Thai - Revenue"/"Fly Thai - Expense") leg's OWN Credit/Debit
+      // displayed. Bank Payment/Receipt entries show the OPPOSITE - the INTERNAL leg (Fly Thai's
+      // own bank account) as FROM, with the EXTERNAL leg's own Credit/Debit displayed. Previously
+      // this always used the external leg for both FROM and the displayed Credit/Debit, which
+      // matched Bank Payment/Receipt but was backwards for Sale/Purchase Form - reproduced live:
+      // FT07261770's Sale Form row showed Debit here vs Credit on the real site (and vice versa
+      // for its Purchase Form row), while its Bank Payment rows already matched.
+      const isSalePurchase = SALE_PURCHASE_FOR.has(ext.TransactionFor);
+      const fromLeg = isSalePurchase ? ext : match || ext;
+      const oppLeg = isSalePurchase ? match : ext;
+
       paired.push({
         VoucherNo: ext.VoucherNo,
         TransactionDate: ext.TransactionDate,
-        FromAccount: ext.AccountName,
-        OppAccount: match ? match.AccountName : '—',
+        FromAccount: fromLeg.AccountName,
+        OppAccount: oppLeg ? oppLeg.AccountName : '—',
         TransactionFor: ext.TransactionFor,
-        TransactionType: ext.TransactionType,
+        TransactionType: oppLeg ? oppLeg.TransactionType : ext.TransactionType,
         TransactionAmount: ext.TransactionAmount,
         Currency: ext.Currency,
         ROE: ext.ROE,
