@@ -148,6 +148,14 @@
                 </div>
               </div>
             </div>
+            <!-- Generic small form for a guided-flow item's OPTIONAL extra details (transfer/
+                 sightseeing/restaurant) - one shared box, fields injected by JS per item type
+                 (see renderItineraryOptionalForm in app.js) instead of a separate hardcoded box
+                 for each type, since they're all the same "labelled inputs -> composed sentence"
+                 shape as priceExtrasBox above. -->
+            <div id="itineraryOptionalBox" class="itinerary-optional-box" style="display:none">
+              <div id="itineraryOptionalFields" class="itinerary-optional-grid"></div>
+            </div>
             <form id="chatForm" class="input-bar">
               <textarea id="chatInput" rows="1" autocomplete="off" maxlength="2000" placeholder="Ask anything about your bookings, quotations, hotels…"></textarea>
               <button type="button" id="cancelFlowBtn" class="cancel-flow-btn" title="Cancel the guided step in progress" style="display:none">

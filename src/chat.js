@@ -421,6 +421,56 @@ function expectingField(draft) {
   // instead of a single free-text message the user has to phrase from memory - it still lands on
   // the same LLM-parsed stepPriceExtras() as before, just pre-composed for them.
   if (draft && draft.phase === 'priceExtras') return { field: 'priceExtras' };
+  // Optional per-item details (transfer/sightseeing/restaurant) - only reached once the user has
+  // said yes to the gate question (see quickRepliesFor's *OptionalGate chips), same "gate before
+  // form" pattern as extraGate/extraCollect below. One generic form, fields swapped per item type -
+  // same LLM-parsed step*OptionalCollect() as before, just pre-composed instead of typed from memory.
+  if (draft && draft.phase === 'transferOptionalCollect') {
+    return {
+      field: 'itineraryOptionalForm',
+      params: {
+        fields: [
+          { key: 'time', label: 'Time', type: 'text', placeholder: 'e.g. 14:30' },
+          { key: 'numberOfVehicles', label: 'Number of vehicles', type: 'number' },
+          { key: 'vehiclePrice', label: 'Vehicle price', type: 'number' },
+          { key: 'flightNo', label: 'Flight no', type: 'text' },
+          { key: 'remarks', label: 'Remarks', type: 'text' },
+        ],
+      },
+    };
+  }
+  if (draft && draft.phase === 'sightseeingOptionalCollect') {
+    return {
+      field: 'itineraryOptionalForm',
+      params: {
+        fields: [
+          { key: 'totalAdult', label: 'Adults', type: 'number' },
+          { key: 'adultPrice', label: 'Adult price', type: 'number' },
+          { key: 'totalChild', label: 'Children', type: 'number' },
+          { key: 'childPrice', label: 'Child price', type: 'number' },
+          { key: 'remarks', label: 'Remarks', type: 'text' },
+        ],
+      },
+    };
+  }
+  if (draft && draft.phase === 'restaurantOptionalCollect') {
+    return {
+      field: 'itineraryOptionalForm',
+      params: {
+        fields: [
+          { key: 'lunchAdultCount', label: 'Lunch adults', type: 'number' },
+          { key: 'lunchAdultPrice', label: 'Lunch adult price', type: 'number' },
+          { key: 'lunchChildCount', label: 'Lunch children', type: 'number' },
+          { key: 'lunchChildPrice', label: 'Lunch child price', type: 'number' },
+          { key: 'dinnerAdultCount', label: 'Dinner adults', type: 'number' },
+          { key: 'dinnerAdultPrice', label: 'Dinner adult price', type: 'number' },
+          { key: 'dinnerChildCount', label: 'Dinner children', type: 'number' },
+          { key: 'dinnerChildPrice', label: 'Dinner child price', type: 'number' },
+          { key: 'remarks', label: 'Remarks', type: 'text' },
+        ],
+      },
+    };
+  }
   // Final optional details (note/emergency contact/booked by/PDF permissions) - same idea, only
   // shown once the user has actually said they want to add any (see the extraGate quick replies).
   if (draft && draft.phase === 'extraCollect') return { field: 'extraDetails' };
@@ -461,6 +511,15 @@ function quickRepliesFor(draft) {
   // need none of it, so "Skip" goes straight to confirm without ever opening the form.
   if (draft && draft.phase === 'extraGate') return ['Skip', 'Yes, add details'];
   if (draft && draft.phase === 'extraCollect') return ['Skip'];
+  // Same gate-then-form pattern for each itinerary item's own optional details (time/vehicles/
+  // price for a transfer, adults/children for sightseeing, lunch/dinner counts for a restaurant) -
+  // most items need none of it, so "Skip" on the gate skips straight to "item added".
+  if (draft && (draft.phase === 'transferOptionalGate' || draft.phase === 'sightseeingOptionalGate' || draft.phase === 'restaurantOptionalGate')) {
+    return ['Skip', 'Yes, add details'];
+  }
+  if (draft && (draft.phase === 'transferOptionalCollect' || draft.phase === 'sightseeingOptionalCollect' || draft.phase === 'restaurantOptionalCollect')) {
+    return ['Skip'];
+  }
   return null;
 }
 

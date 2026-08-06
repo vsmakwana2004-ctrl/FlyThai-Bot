@@ -1,4 +1,4 @@
-const { submitBooking } = require('./bookingApi');
+const { submitBooking, safeFetch } = require('./bookingApi');
 const { resolveBookingByCode } = require('./documents');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
@@ -49,7 +49,7 @@ async function resolveQuotation(code) {
 // columns documented in schema.js, so guessing it independently was not safe enough to trust.
 async function fetchRawRecord(internalId) {
   const { base, headers } = buildHeaders();
-  const res = await fetch(`${base}/Booking/GetBookingById?id=${internalId}`, { headers });
+  const res = await safeFetch(`${base}/Booking/GetBookingById?id=${internalId}`, { headers });
   const text = await res.text();
   if (!res.ok) {
     const err = new Error(`GetBookingById returned ${res.status}: ${text.slice(0, 300)}`);

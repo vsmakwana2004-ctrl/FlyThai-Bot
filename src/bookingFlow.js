@@ -1198,12 +1198,16 @@ async function finishItineraryEdit(draft) {
     await trySave(true);
   } catch (err) {
     if (err.code !== 'AGENT_ACCOUNT_NOT_FOUND') {
-      return { reply: `Sorry, saving the itinerary failed: ${err.message}`, draft: null };
+      // draft.phase is still 'confirmItineraryEdit' here (unchanged) - kept, not cleared, so a
+      // transient failure (e.g. a network hiccup reaching the FlyThai site - see bookingApi.js's
+      // safeFetch) doesn't force the user to re-answer every itinerary question from scratch.
+      // Matches trySubmit's own error handling for a brand-new booking/quotation.
+      return { reply: `Sorry, saving the itinerary failed: ${err.message}. Nothing was saved — reply "yes" to try again once that's fixed, or "no" to cancel.`, draft };
     }
     try {
       await trySave(false);
     } catch (err2) {
-      return { reply: `Sorry, saving the itinerary failed: ${err2.message}`, draft: null };
+      return { reply: `Sorry, saving the itinerary failed: ${err2.message}. Nothing was saved — reply "yes" to try again once that's fixed, or "no" to cancel.`, draft };
     }
   }
   return { reply: `Done — itinerary updated for **${code}** (${guestName}).`, draft: null };
@@ -1332,8 +1336,8 @@ async function stepTransferCollect(draft, userMessage) {
     return { reply: transferStepPrompt(next, draft), draft };
   }
 
-  draft.phase = 'transferOptionalCollect';
-  return { reply: 'Optional: time, number of vehicles, vehicle price, flight no, remarks — e.g. "14:30, 2 vehicles" or "flight AI131". Reply with any of these, or "skip".', draft };
+  draft.phase = 'transferOptionalGate';
+  return { reply: askTransferOptionalGate(), draft };
 }
 
 function transferOptionalSystemPrompt(fields) {
@@ -1342,6 +1346,19 @@ Possible fields: time, numberOfVehicles (number), vehiclePrice (number), flightN
 Fields already known (JSON): ${JSON.stringify(fields)}
 Merge only what the user's message actually mentions - this is a single-turn step, don't ask follow-up questions.
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
+}
+
+// One-tap gate before the actual optional-details form - most transfers need none of this, so
+// staff with nothing to add skip straight to "item added" instead of being shown a form to skip.
+// Same pattern as askExtraGate()/stepExtraGate() below for the final booking-level extras.
+function askTransferOptionalGate() {
+  return `Want to add optional details for this transfer — time, number of vehicles, vehicle price, flight no, remarks?`;
+}
+
+async function stepTransferOptionalGate(draft, userMessage) {
+  if (parseYesNo(userMessage) === false) return finishTransferItem(draft);
+  draft.phase = 'transferOptionalCollect';
+  return { reply: 'Fill in what you\'d like below, or reply "skip".', draft };
 }
 
 async function stepTransferOptionalCollect(draft, userMessage) {
@@ -1368,7 +1385,14 @@ async function stepTransferOptionalCollect(draft, userMessage) {
     if (hasFields) Object.assign(t, cleanFields);
   }
   delete draft._transferOptionalRetried;
+  return finishTransferItem(draft);
+}
 
+// Builds and pushes the finished transfer item - shared by the "skip" path (gate says no, nothing
+// to merge) and the "add details" path (stepTransferOptionalCollect, after merging whatever fields
+// the form/free-text supplied).
+function finishTransferItem(draft) {
+  const t = draft.currentItemDraft;
   const pickup = t._pickupPointNameRow;
   const dropoff = t._dropOffPointNameRow;
   const particular = t._transferNameRow;
@@ -1494,8 +1518,8 @@ async function stepSightseeingCollect(draft, userMessage) {
     return { reply: sightseeingStepPrompt(next), draft };
   }
 
-  draft.phase = 'sightseeingOptionalCollect';
-  return { reply: 'Optional: number of adults/children going (adult/child price default from the master rate but can be overridden), remarks. Reply with any, or "skip".', draft };
+  draft.phase = 'sightseeingOptionalGate';
+  return { reply: askSightseeingOptionalGate(), draft };
 }
 
 function sightseeingOptionalSystemPrompt(fields) {
@@ -1504,6 +1528,17 @@ Possible fields: totalAdult (number), adultPrice (number, overrides the master r
 Fields already known (JSON): ${JSON.stringify(fields)}
 Merge only what the user's message actually mentions - this is a single-turn step, don't ask follow-up questions.
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
+}
+
+// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors.
+function askSightseeingOptionalGate() {
+  return `Want to add optional details for this sightseeing — number of adults/children going, remarks?`;
+}
+
+async function stepSightseeingOptionalGate(draft, userMessage) {
+  if (parseYesNo(userMessage) === false) return finishSightseeingItem(draft);
+  draft.phase = 'sightseeingOptionalCollect';
+  return { reply: 'Fill in what you\'d like below, or reply "skip".', draft };
 }
 
 async function stepSightseeingOptionalCollect(draft, userMessage) {
@@ -1517,7 +1552,13 @@ async function stepSightseeingOptionalCollect(draft, userMessage) {
       // optional - ignore parse failures
     }
   }
+  return finishSightseeingItem(draft);
+}
 
+// Builds and pushes the finished sightseeing item - shared by the "skip" path (gate says no,
+// nothing to merge) and the "add details" path (after merging whatever the form/free-text gave).
+function finishSightseeingItem(draft) {
+  const s = draft.currentItemDraft;
   const particular = s._sightseeingNameRow;
   const pickup = s._pickupPointNameRow;
   const totalAdult = Number(s.totalAdult) || 0;
@@ -1662,8 +1703,8 @@ async function stepRestaurantCollect(draft, userMessage) {
     return { reply: restaurantStepPrompt(next), draft };
   }
 
-  draft.phase = 'restaurantOptionalCollect';
-  return { reply: 'Optional: adults/children for lunch and/or dinner (with prices), remarks. Reply with any, or "skip".', draft };
+  draft.phase = 'restaurantOptionalGate';
+  return { reply: askRestaurantOptionalGate(), draft };
 }
 
 function restaurantOptionalSystemPrompt(fields) {
@@ -1672,6 +1713,17 @@ Possible fields: lunchAdultCount, lunchAdultPrice, lunchChildCount, lunchChildPr
 Fields already known (JSON): ${JSON.stringify(fields)}
 Merge only what the user's message actually mentions - this is a single-turn step, don't ask follow-up questions.
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
+}
+
+// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors.
+function askRestaurantOptionalGate() {
+  return `Want to add optional details for this restaurant — adults/children for lunch and/or dinner (with prices), remarks?`;
+}
+
+async function stepRestaurantOptionalGate(draft, userMessage) {
+  if (parseYesNo(userMessage) === false) return finishRestaurantItem(draft);
+  draft.phase = 'restaurantOptionalCollect';
+  return { reply: 'Fill in what you\'d like below, or reply "skip".', draft };
 }
 
 async function stepRestaurantOptionalCollect(draft, userMessage) {
@@ -1685,7 +1737,13 @@ async function stepRestaurantOptionalCollect(draft, userMessage) {
       // optional - ignore parse failures
     }
   }
+  return finishRestaurantItem(draft);
+}
 
+// Builds and pushes the finished restaurant item - shared by the "skip" path (gate says no,
+// nothing to merge) and the "add details" path (after merging whatever the form/free-text gave).
+function finishRestaurantItem(draft) {
+  const r = draft.currentItemDraft;
   const restaurant = r._restaurantNameRow;
   const lunchAdultCount = Number(r.lunchAdultCount) || 0;
   const lunchAdultPrice = r.lunchAdultPrice != null ? Number(r.lunchAdultPrice) : Number(restaurant.LunchPriceForAdults) || 0;
@@ -2167,16 +2225,22 @@ async function step(draft, userMessage) {
       return stepConfirmItineraryEdit(draft, userMessage);
     case 'transferCollect':
       return stepTransferCollect(draft, userMessage);
+    case 'transferOptionalGate':
+      return stepTransferOptionalGate(draft, userMessage);
     case 'transferOptionalCollect':
       return stepTransferOptionalCollect(draft, userMessage);
     case 'sightseeingCollect':
       return stepSightseeingCollect(draft, userMessage);
+    case 'sightseeingOptionalGate':
+      return stepSightseeingOptionalGate(draft, userMessage);
     case 'sightseeingOptionalCollect':
       return stepSightseeingOptionalCollect(draft, userMessage);
     case 'leisureDayCollect':
       return stepLeisureDayCollect(draft, userMessage);
     case 'restaurantCollect':
       return stepRestaurantCollect(draft, userMessage);
+    case 'restaurantOptionalGate':
+      return stepRestaurantOptionalGate(draft, userMessage);
     case 'restaurantOptionalCollect':
       return stepRestaurantOptionalCollect(draft, userMessage);
     case 'priceCollect':

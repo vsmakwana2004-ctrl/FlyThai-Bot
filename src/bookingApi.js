@@ -1,5 +1,24 @@
 const { getPool } = require('./db');
 
+// Node's built-in fetch (undici) throws a bare "fetch failed" TypeError for ANY network-level
+// failure before a response arrives (DNS lookup, connection refused/reset, TLS handshake, timeout)
+// - the actual reason lives in err.cause, which every caller here was silently losing, so a real
+// network hiccup surfaced to staff as an unhelpful "fetch failed" with nothing to act on and
+// nothing in the server logs to diagnose from. Wraps the error with the cause's own code/message
+// (e.g. "ECONNRESET", "ETIMEDOUT") and always logs server-side so a repeat failure is diagnosable.
+async function safeFetch(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    console.error('FlyThai API request failed:', url, err.cause || err);
+    const cause = err.cause;
+    const detail = cause && (cause.code || cause.message) ? ` (${cause.code || cause.message})` : '';
+    const wrapped = new Error(`Could not reach the FlyThai booking site${detail}. Please check the connection and try again.`);
+    wrapped.cause = err;
+    throw wrapped;
+  }
+}
+
 function buildHeaders() {
   const cookie = process.env.FLYTHAI_SESSION_COOKIE;
   if (!cookie) {
@@ -35,7 +54,7 @@ async function submitBooking(model, isBooking, { allowSalesEntry = true } = {}) 
     allowSalesEntry,
   };
 
-  const res = await fetch(`${base}/booking/AddBooking`, {
+  const res = await safeFetch(`${base}/booking/AddBooking`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -87,7 +106,7 @@ async function updateBookingStatus(internalId, statusType, value) {
   const { base, headers } = buildHeaders();
   const body = new URLSearchParams({ value, id: String(internalId), status: statusType }).toString();
 
-  const res = await fetch(`${base}/booking/updateStatus`, {
+  const res = await safeFetch(`${base}/booking/updateStatus`, {
     method: 'POST',
     headers: { ...headers, 'content-type': 'application/x-www-form-urlencoded' },
     body,
@@ -108,4 +127,4 @@ async function updateBookingStatus(internalId, statusType, value) {
   return text.trim() === '1';
 }
 
-module.exports = { submitBooking, findBookingById, updateBookingStatus };
+module.exports = { submitBooking, findBookingById, updateBookingStatus, safeFetch };

@@ -29,6 +29,8 @@ const peFinalRate = document.getElementById('peFinalRate');
 const peDueDateBtn = document.getElementById('peDueDateBtn');
 const peDueDateLabel = document.getElementById('peDueDateLabel');
 const extraDetailsBox = document.getElementById('extraDetailsBox');
+const itineraryOptionalBox = document.getElementById('itineraryOptionalBox');
+const itineraryOptionalFields = document.getElementById('itineraryOptionalFields');
 const edNote = document.getElementById('edNote');
 const edContactChips = document.getElementById('edContactChips');
 const edBookingBy = document.getElementById('edBookingBy');
@@ -130,7 +132,7 @@ function syncDestinationInputValue() {
 // re-scrolling to the true bottom, keeps the latest message visible above the popover instead.
 const MESSAGES_BASE_PADDING_BOTTOM = 32; // must match .messages-inner's own CSS padding-bottom
 function reserveSpaceForVisiblePopover() {
-  const popovers = [lookupDropdown, datePickerBox, timePickerBox, paxPickerBox, priceExtrasBox, extraDetailsBox];
+  const popovers = [lookupDropdown, datePickerBox, timePickerBox, paxPickerBox, priceExtrasBox, extraDetailsBox, itineraryOptionalBox];
   const visible = popovers.find((el) => el.style.display && el.style.display !== 'none');
   const extra = visible ? visible.offsetHeight + 12 : 0; // +12 matches the popover's own margin-bottom
   messagesInner.style.paddingBottom = extra ? `${MESSAGES_BASE_PADDING_BOTTOM + extra}px` : '';
@@ -519,6 +521,60 @@ edContactChips.addEventListener('click', (e) => {
   syncExtraDetailsInputValue();
 });
 
+// Generic small form for an itinerary item's OPTIONAL extra details (transfer/sightseeing/
+// restaurant) - only ever shown after that item's own *OptionalGate question's "Yes, add details"
+// reply (see quickRepliesFor's *OptionalGate chips server-side), same gate-then-form pattern as
+// extraGate/extraDetailsBox above. One shared box; fields are injected fresh each time from
+// expecting.params.fields (server decides which fields this item type has) instead of a separate
+// hardcoded box per item type, since every field here is the same "label + input -> composed
+// sentence" shape - same free-text-composing convention as priceExtrasBox/extraDetailsBox, landing
+// on the same LLM-parsed step*OptionalCollect() as typing would have.
+let itineraryOptionalInputs = []; // [[inputEl, label], ...] for the fields currently rendered
+
+function syncItineraryOptionalInputValue() {
+  const parts = itineraryOptionalInputs.filter(([el]) => el.value.trim()).map(([el, label]) => `${label} ${el.value.trim()}`);
+  input.value = parts.join(', ');
+  updateCharCount();
+}
+
+function renderItineraryOptionalForm(fields) {
+  itineraryOptionalFields.innerHTML = '';
+  itineraryOptionalInputs = fields.map((f) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'pe-field';
+    const label = document.createElement('label');
+    label.setAttribute('for', `io-${f.key}`);
+    label.textContent = f.label;
+    const el = document.createElement('input');
+    el.type = f.type === 'number' ? 'number' : 'text';
+    el.id = `io-${f.key}`;
+    if (f.type === 'number') {
+      el.inputMode = 'decimal';
+      el.step = 'any';
+      el.placeholder = '0';
+    } else if (f.placeholder) {
+      el.placeholder = f.placeholder;
+    }
+    el.addEventListener('input', syncItineraryOptionalInputValue);
+    wrap.appendChild(label);
+    wrap.appendChild(el);
+    itineraryOptionalFields.appendChild(wrap);
+    return [el, f.label.toLowerCase()];
+  });
+}
+
+function showItineraryOptionalPicker(fields) {
+  renderItineraryOptionalForm(fields);
+  syncItineraryOptionalInputValue();
+  itineraryOptionalBox.style.display = 'block';
+  reserveSpaceForVisiblePopover();
+}
+
+function hideItineraryOptionalPicker() {
+  itineraryOptionalBox.style.display = 'none';
+  reserveSpaceForVisiblePopover();
+}
+
 function setExpecting(expecting) {
   // Leaving the destination checklist (answer submitted, or a different field is now being asked)
   // clears the ticks so a later booking's checklist doesn't start pre-checked from a previous one.
@@ -533,6 +589,7 @@ function setExpecting(expecting) {
     hidePaxPicker();
     hidePriceExtrasPicker();
     hideExtraDetailsPicker();
+    hideItineraryOptionalPicker();
     priceExtrasDatePickMode = false;
     calBackToForm.style.display = 'none';
     showDatePicker(expecting.params);
@@ -545,6 +602,7 @@ function setExpecting(expecting) {
     hidePaxPicker();
     hidePriceExtrasPicker();
     hideExtraDetailsPicker();
+    hideItineraryOptionalPicker();
     showTimePicker();
     return;
   }
@@ -554,6 +612,7 @@ function setExpecting(expecting) {
     hideLookupDropdown();
     hidePriceExtrasPicker();
     hideExtraDetailsPicker();
+    hideItineraryOptionalPicker();
     showPaxPicker();
     return;
   }
@@ -562,6 +621,7 @@ function setExpecting(expecting) {
   if (expecting && expecting.field === 'priceExtras') {
     hideLookupDropdown();
     hideExtraDetailsPicker();
+    hideItineraryOptionalPicker();
     showPriceExtrasPicker();
     return;
   }
@@ -569,10 +629,18 @@ function setExpecting(expecting) {
 
   if (expecting && expecting.field === 'extraDetails') {
     hideLookupDropdown();
+    hideItineraryOptionalPicker();
     showExtraDetailsPicker();
     return;
   }
   hideExtraDetailsPicker();
+
+  if (expecting && expecting.field === 'itineraryOptionalForm') {
+    hideLookupDropdown();
+    showItineraryOptionalPicker(expecting.params.fields);
+    return;
+  }
+  hideItineraryOptionalPicker();
 
   if (!expecting) {
     hideLookupDropdown();
