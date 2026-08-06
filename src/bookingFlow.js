@@ -236,13 +236,32 @@ function nextBasicStep(draft) {
 
 // ---------- phase: source (manual vs travel-agent-provided) ----------
 // The very first question of any new booking/quotation: was this typed in from scratch, or is it
-// based on a message a travel agent already sent with (partial) trip details? Picking "travel
-// agent" routes through stepAgentPaste below to pre-fill whatever it can from that message, then
-// drops into the exact same phase: 'basic' flow the manual path uses - stepBasic itself, and
-// everything after it (hotel/itinerary/pricing), is completely untouched by this addition.
+// based on a message a travel agent already sent with (partial) trip details? Previously asked as
+// its own separate "manual booking / travel agent booking" choice before anything else - merged
+// into the guest-name question instead (one fewer click for the common case): a short, single-line
+// reply is taken as the guest's name and the manual flow continues from the NEXT field; a reply
+// that looks like a pasted agent message (multi-line, or clearly bundles several trip details) is
+// routed straight into the exact same extraction stepAgentPaste already does, without a second
+// "please paste it" round-trip since this message already IS the paste. Everything downstream
+// (stepAgentPaste, stepBasic, and everything after it) is completely untouched by this change.
 
 function sourceChoicePrompt(draft) {
-  return `Let's create a new ${draft.kind}. First — is this a **manual booking**, or based on details a **travel agent** already sent you?\n\n_(You can say **cancel** at any point to stop.)_`;
+  return `Let's create a new ${draft.kind}. What is the guest's name?\n\n_(Or paste a travel agent's message with the trip details, and I'll pull out whatever I can from it. You can say **cancel** at any point to stop.)_`;
+}
+
+// Heuristic only, not a guarantee - a name that happens to be unusually long/detailed could still
+// be misclassified as a paste (or vice versa), but a plain guest name never looks like this: it's
+// one short line, no dates, no trip-shaped keywords, no several-details-bundled-with-commas shape.
+// Worst case of a wrong guess is a wrong-looking Guest Name in the eventual confirmation summary,
+// which is still checked by a human before anything saves - never a silently wrong save.
+function looksLikeAgentPaste(text) {
+  const t = text.trim();
+  if (/\n/.test(t)) return true; // a real paste is almost always multi-line
+  if (t.length > 60) return true; // no real guest name is ever this long
+  if (/\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?/.test(t)) return true; // a date
+  if (/\b(nights?|pax|adults?|hotel|itinerary|check.?in|check.?out)\b/i.test(t)) return true; // trip-shaped words
+  if ((t.match(/,/g) || []).length >= 2) return true; // several details bundled onto one line
+  return false;
 }
 
 async function stepSource(draft, userMessage) {
@@ -251,17 +270,17 @@ async function stepSource(draft, userMessage) {
     return { reply: sourceChoicePrompt(draft), draft };
   }
 
-  const t = userMessage.trim().toLowerCase();
-  if (/travel\s*agent|agent\s*booking/.test(t)) {
+  const answer = userMessage.trim();
+  if (looksLikeAgentPaste(answer)) {
     draft.phase = 'agentPaste';
     if (!draft.destinationOptions) draft.destinationOptions = await listDestinations();
-    return { reply: "Please paste the travel agent's message with the trip details, and I'll pull out whatever I can from it — then I'll ask for anything that's still missing.", draft };
+    return stepAgentPaste(draft, userMessage);
   }
-  if (/manual/.test(t)) {
-    draft.phase = 'basic';
-    return stepBasic(draft, userMessage);
-  }
-  return { reply: 'Please reply "manual booking" or "travel agent booking".', draft };
+
+  draft.fields.guestName = answer;
+  draft.basicStarted = true;
+  draft.phase = 'basic';
+  return { reply: basicNextPrompt(draft), draft };
 }
 
 // ---------- phase: agentPaste (pre-fill basic fields from a pasted travel-agent message) ----------

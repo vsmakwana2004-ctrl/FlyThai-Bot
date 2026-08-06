@@ -483,11 +483,10 @@ function expectingField(draft) {
 // above the input, same idea as the lookup dropdowns above but for LLM-extracted free-text steps
 // rather than a DB-backed field. Clicking one sends its exact text, same as typing it.
 function quickRepliesFor(draft) {
-  // First question of any new booking/quotation - manual entry vs pre-filling from a pasted
-  // travel-agent message (see bookingFlow.js stepSource/stepAgentPaste).
-  if (draft && draft.phase === 'source') {
-    return ['Manual Booking', 'Travel Agent Booking'];
-  }
+  // The first question of a new booking/quotation (draft.phase === 'source') now asks directly for
+  // the guest's name (or accepts a pasted travel-agent message) - see bookingFlow.js
+  // stepSource/looksLikeAgentPaste - so there's no longer a separate manual-vs-agent choice to
+  // render chips for here.
   if (draft && draft.phase === 'agentPasteConfirm') {
     return ['Yes, use these', 'No, enter manually'];
   }
