@@ -929,14 +929,18 @@ async function handleChatInner(sessionId, userMessage) {
   const acctTxnIntent = accountTransactions.detectAccountTransactionsIntent(userMessage, session.lastBookingCode);
   if (acctTxnIntent) {
     const result = await accountTransactions.fetchAccountTransactions(acctTxnIntent);
+    // acctTxnIntent may have been resolved by an explicit FT/FTQ code OR by a bare guest name
+    // (e.g. "account detail of guest karan") - .code is only set in the former case.
+    const label = acctTxnIntent.code || acctTxnIntent.guestName;
     if (result.status === 'not_found') {
-      const reply = `I couldn't find any booking or quotation matching **${acctTxnIntent.code}** in the database.`;
+      const reply = `I couldn't find any booking or quotation matching **${label}** in the database.`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
     }
     if (result.status === 'ambiguous') {
       const list = result.matches.map((m) => `- **${m.BookingId || m.QuotationId}** (${m.GuestName})`).join('\n');
-      const reply = `More than one record uses the code **${acctTxnIntent.code}** — which one did you mean?\n\n${list}\n\nPlease ask again including the guest's name too.`;
+      const hint = acctTxnIntent.code ? 'Please ask again including the guest\'s name too.' : 'Please ask again using the specific FT/FTQ code.';
+      const reply = `More than one record matches **${label}** — which one did you mean?\n\n${list}\n\n${hint}`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: result.matches.length };
     }

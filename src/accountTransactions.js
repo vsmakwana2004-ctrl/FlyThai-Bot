@@ -9,27 +9,49 @@ const FULL_CODE_RE = /\bFTQ?\d+\b/i;
 const ACCOUNT_TXN_INTENT_RE =
   /\b(account(?:ing)?\s+(?:transactions?|history|details?)|ledger|transaction\s+(?:history|list|details?)|transactions?\s+(?:for|of)\b|sale\s*(?:vs\.?|\/|and)\s*purchase|receipt\s*(?:vs\.?|\/|and)\s*payment)\b/i;
 
+// "guest <name>" phrasing - e.g. "account detail of our guest karan" - has no FT/FTQ code at all
+// (by design; the user is naming the person, not the record), so falls through this far without a
+// code to resolve. Captures the word(s) right after "guest" and trims off trailing filler
+// ("ka"/"ki"/"ke", "account", "details", "'s", ...) that a natural sentence tacks on afterward.
+const GUEST_NAME_RE = /\bguest\s+([a-zA-Z][a-zA-Z\s'.-]{1,40})/i;
+function extractGuestName(text) {
+  const m = text.match(GUEST_NAME_RE);
+  if (!m) return null;
+  let name = m[1].replace(/\b(ka|ki|ke|account|accounts|detail|details|history|ledger|transaction|transactions|of|for)\b.*$/i, '').trim();
+  name = name.replace(/'s$/i, '').trim();
+  return name || null;
+}
+
 // Detects "show account transactions for booking FT...", "ledger for FT...", "transaction history
-// of FT...", "sale vs purchase for FT..." etc. Falls back to the session's last-mentioned booking
-// code (same convention as statusUpdate.js) so a follow-up like "and its transactions?" resolves
-// without repeating the code.
+// of FT...", "sale vs purchase for FT...", "account detail of guest <name>" etc. Falls back to the
+// session's last-mentioned booking code (same convention as statusUpdate.js) so a follow-up like
+// "and its transactions?" resolves without repeating the code.
 function detectAccountTransactionsIntent(text, lastBookingCode) {
   if (!ACCOUNT_TXN_INTENT_RE.test(text)) return null;
-  const match = text.match(FULL_CODE_RE);
-  const code = match ? match[0].toUpperCase() : lastBookingCode;
-  if (!code) return null;
-  return { code };
+  const codeMatch = text.match(FULL_CODE_RE);
+  if (codeMatch) return { code: codeMatch[0].toUpperCase() };
+  const guestName = extractGuestName(text);
+  if (guestName) return { guestName };
+  if (lastBookingCode) return { code: lastBookingCode };
+  return null;
 }
 
 // Returns { status: 'not_found' } | { status: 'ambiguous', matches } | { status: 'ok', booking }.
-async function resolveBooking(pool, code) {
+async function resolveBooking(pool, intent) {
   // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode for the
   // confirmed live example of 3 rows sharing one code) - a bare TOP 1 here previously picked an
-  // arbitrary one of them silently, showing the wrong guest's ledger.
-  const r = await pool.request().input('code', code).query(`
-    SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
-    WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
-  `);
+  // arbitrary one of them silently, showing the wrong guest's ledger. Same "ask, don't guess"
+  // standard applies to a guest-name lookup - two different guests can share a first name.
+  const r = intent.code
+    ? await pool.request().input('code', intent.code).query(`
+        SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
+        WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
+      `)
+    : await pool.request().input('name', `%${intent.guestName}%`).query(`
+        SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
+        WHERE IsDelete = 0 AND GuestName LIKE @name
+        ORDER BY CreatedOn DESC
+      `);
   if (r.recordset.length === 0) return { status: 'not_found' };
   if (r.recordset.length > 1) return { status: 'ambiguous', matches: r.recordset };
   return { status: 'ok', booking: r.recordset[0] };
@@ -120,7 +142,7 @@ function pairVoucherLegs(rows) {
 
 async function fetchAccountTransactions(intent) {
   const pool = await getPool();
-  const resolved = await resolveBooking(pool, intent.code);
+  const resolved = await resolveBooking(pool, intent);
   if (resolved.status !== 'ok') return resolved;
   const booking = resolved.booking;
 
