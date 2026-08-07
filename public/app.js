@@ -37,9 +37,11 @@ const edBookingBy = document.getElementById('edBookingBy');
 const edAllowVoucher = document.getElementById('edAllowVoucher');
 const edAllowInvoice = document.getElementById('edAllowInvoice');
 const edAllowItinerary = document.getElementById('edAllowItinerary');
-const cancelFlowBtn = document.getElementById('cancelFlowBtn');
 const charCount = document.getElementById('charCount');
 const layoutEl = document.getElementById('layout');
+const historySidebar = document.getElementById('historySidebar');
+const historyList = document.getElementById('historyList');
+const sidebarToggleBtn = document.getElementById('sidebarToggleBtn');
 const dataDrawer = document.getElementById('dataDrawer');
 const dataDrawerTitle = document.getElementById('dataDrawerTitle');
 const dataDrawerBody = document.getElementById('dataDrawerBody');
@@ -67,14 +69,6 @@ async function readJsonResponse(res) {
   } catch (err) {
     return { error: friendlyHttpError(res.status) };
   }
-}
-
-// Shows a visible way out of any guided step (booking creation, status change, PDF choice) — the
-// only previous escape was New Chat, which discarded the whole conversation. Lives right next to
-// Send in the composer (not a separate banner above it) - a full-width banner used to get covered
-// by the lookup dropdown whenever one was open, and ate vertical space even when nothing overlapped it.
-function setFlowActive(active) {
-  cancelFlowBtn.style.display = active ? 'inline-flex' : 'none';
 }
 
 // Live lookup dropdowns - shows real registered records above the input while the bot is asking
@@ -879,6 +873,14 @@ function openDataDrawer(rows, rowCount, rowsTruncated) {
     dataDrawerBody.appendChild(note);
   }
 
+  // A 50/50 split with the history sidebar also open leaves three panels fighting for space and
+  // the chat column too narrow to read. Collapse the sidebar for the duration without touching
+  // the user's own remembered preference (setSidebarCollapsed's persist:false), and bring it back
+  // when the drawer closes - see sidebarAutoCollapsedForDrawer below.
+  if (!layoutEl.classList.contains('sidebar-collapsed')) {
+    sidebarAutoCollapsedForDrawer = true;
+    setSidebarCollapsed(true, false);
+  }
   layoutEl.classList.add('split');
   dataDrawer.setAttribute('aria-hidden', 'false');
 }
@@ -887,6 +889,10 @@ function openDataDrawer(rows, rowCount, rowsTruncated) {
 function closeDataDrawer() {
   layoutEl.classList.remove('split');
   dataDrawer.setAttribute('aria-hidden', 'true');
+  if (sidebarAutoCollapsedForDrawer) {
+    sidebarAutoCollapsedForDrawer = false;
+    setSidebarCollapsed(false, false);
+  }
 }
 
 dataDrawerClose.addEventListener('click', closeDataDrawer);
@@ -985,7 +991,12 @@ async function sendMessage(text) {
     return;
   }
   busy = true;
+  // Captured once so a slow request still saves to the chat it was actually asked from, even
+  // though sidebar switching is blocked while busy (see historyList's click handler) and can't
+  // actually change sessionId out from under this call - kept explicit rather than relying on that.
+  const chatId = sessionId;
   addMessage('user', escapeHtml(text).replace(/\n/g, '<br/>'));
+  appendMessageToChat(chatId, 'user', text);
   input.value = '';
   updateCharCount();
   sendBtn.disabled = true;
@@ -998,23 +1009,28 @@ async function sendMessage(text) {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, sessionId }),
+      body: JSON.stringify({ message: text, sessionId: chatId }),
     });
     const data = await readJsonResponse(res);
     loadingEl.remove();
     if (!res.ok) {
-      addMessage('bot', `<span class="error-note">${escapeHtml(data.error || friendlyHttpError(res.status))}</span>`);
+      const errText = data.error || friendlyHttpError(res.status);
+      addMessage('bot', `<span class="error-note">${escapeHtml(errText)}</span>`);
+      appendMessageToChat(chatId, 'bot', errText, { kind: 'error' });
       return;
     }
     const { wrap } = addMessage('bot', renderMarkdown(data.answer || ''));
     addDataToggle(wrap, data.rows, data.rowCount, data.rowsTruncated);
+    appendMessageToChat(chatId, 'bot', data.answer || '');
+    updateChatFlowState(chatId, data.expecting || null, data.quickReplies || null);
     setExpecting(data.expecting || null);
     renderQuickReplies(data.quickReplies || null);
-    setFlowActive(!!data.flowActive);
     if (data.expecting) input.focus();
   } catch (err) {
     loadingEl.remove();
-    addMessage('bot', `<span class="error-note">Could not reach the server. Please check that it is running and try again.</span>`);
+    const errText = 'Could not reach the server. Please check that it is running and try again.';
+    addMessage('bot', `<span class="error-note">${errText}</span>`);
+    appendMessageToChat(chatId, 'bot', errText, { kind: 'error' });
   } finally {
     busy = false;
     sendBtn.disabled = false;
@@ -1044,26 +1060,6 @@ function autoResizeInput() {
 }
 
 input.addEventListener('input', updateCharCount);
-
-cancelFlowBtn.addEventListener('click', async () => {
-  try {
-    const res = await fetch('/api/cancel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId }),
-    });
-    const data = await readJsonResponse(res);
-    addMessage('bot', renderMarkdown(data.answer || 'Cancelled.'));
-  } catch (err) {
-    addMessage('bot', `<span class="error-note">Could not reach the server to cancel. Please try again.</span>`);
-  } finally {
-    setFlowActive(false);
-    setExpecting(null);
-    renderQuickReplies(null);
-    suggestions.style.display = 'flex';
-    input.focus();
-  }
-});
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -1104,15 +1100,314 @@ quickReplies.addEventListener(
   { passive: false }
 );
 
-clearBtn.addEventListener('click', () => {
+clearBtn.addEventListener('click', startNewChat);
+
+// ==========================================================================
+// Chat history sidebar
+//
+// Conversations aren't stored anywhere server-side beyond the in-memory flow
+// state keyed by sessionId (see src/chat.js), so the transcript itself lives
+// in localStorage, one record per chat, keyed by that same sessionId. This
+// also means it's per-browser, not per-account - fine for a single-staff-
+// member tool with no login, and it avoids adding a table to the real
+// production database just to hold UI chat logs.
+// ==========================================================================
+
+const CHATS_KEY = 'flythai_chats';
+const SIDEBAR_COLLAPSED_KEY = 'flythai_sidebar_collapsed';
+const MAX_MESSAGES_PER_CHAT = 300; // soft cap so a long-lived chat can't grow localStorage without bound
+
+const PENCIL_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+const TRASH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+
+function loadChats() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CHATS_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function saveChats() {
+  try {
+    localStorage.setItem(CHATS_KEY, JSON.stringify(chats));
+  } catch (err) {
+    // Most likely a quota error from very long-running chats - not worth surfacing to the user,
+    // the in-memory list (and this browser tab) still works fine either way.
+    console.warn('Could not save chat history:', err);
+  }
+}
+
+let chats = loadChats();
+let renamingChatId = null; // chat currently showing a rename <input> in the sidebar, or null
+
+function findChat(id) {
+  return chats.find((c) => c.id === id) || null;
+}
+
+function makeChatTitle(text) {
+  const t = text.trim().replace(/\s+/g, ' ');
+  if (!t) return 'New chat';
+  return t.length > 42 ? `${t.slice(0, 42)}…` : t;
+}
+
+function createChatRecord(id) {
+  return {
+    id,
+    title: 'New chat',
+    titleManual: false, // becomes true once the user renames it, so a later first message can't overwrite that choice
+    updatedAt: Date.now(),
+    messages: [], // [{ role: 'user'|'bot', text, kind: 'normal'|'error' }]
+    lastExpecting: null,
+    lastQuickReplies: null,
+  };
+}
+
+// Called once at startup - wraps whatever sessionId was already in localStorage (possibly from
+// before this feature existed) in a proper chat record instead of losing it.
+function ensureCurrentChat() {
+  let chat = findChat(sessionId);
+  if (!chat) {
+    chat = createChatRecord(sessionId);
+    chats.unshift(chat);
+    saveChats();
+  }
+  return chat;
+}
+
+function appendMessageToChat(chatId, role, text, extra = {}) {
+  const chat = findChat(chatId);
+  if (!chat) return;
+  chat.messages.push({ role, text, kind: extra.kind || 'normal' });
+  if (chat.messages.length > MAX_MESSAGES_PER_CHAT) {
+    chat.messages.splice(0, chat.messages.length - MAX_MESSAGES_PER_CHAT);
+  }
+  chat.updatedAt = Date.now();
+  if (role === 'user' && !chat.titleManual && chat.messages.filter((m) => m.role === 'user').length === 1) {
+    chat.title = makeChatTitle(text);
+  }
+  saveChats();
+  renderHistorySidebar();
+}
+
+function updateChatFlowState(chatId, expecting, quickReplies) {
+  const chat = findChat(chatId);
+  if (!chat) return;
+  chat.lastExpecting = expecting || null;
+  chat.lastQuickReplies = quickReplies || null;
+  saveChats();
+}
+
+// Rebuilds the whole message pane from a chat record - used both at startup (for a returning
+// chat with history) and whenever the user switches to a different chat in the sidebar.
+function renderChatIntoDOM(chat) {
+  messagesInner.innerHTML = '';
+  if (!chat.messages.length) {
+    addMessage('bot', 'Started a new chat. What would you like to know?');
+  } else {
+    chat.messages.forEach((m) => {
+      if (m.role === 'user') {
+        addMessage('user', escapeHtml(m.text).replace(/\n/g, '<br/>'));
+      } else if (m.kind === 'error') {
+        addMessage('bot', `<span class="error-note">${escapeHtml(m.text)}</span>`);
+      } else {
+        addMessage('bot', renderMarkdown(m.text || ''));
+        // Note: the "view N records from the database" toggle isn't restored on reload - the
+        // underlying row data isn't persisted (it can be large; the DB is the source of truth
+        // and can always be re-queried), only the rendered answer text is.
+      }
+    });
+  }
+  suggestions.style.display = chat.messages.length ? 'none' : 'flex';
+  renderQuickReplies(chat.lastQuickReplies || null);
+  setExpecting(chat.lastExpecting || null);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function formatRelativeTime(ts) {
+  const diff = Date.now() - ts;
+  const minute = 60000;
+  const hour = 3600000;
+  const day = 86400000;
+  if (diff < minute) return 'Just now';
+  if (diff < hour) return `${Math.floor(diff / minute)}m ago`;
+  if (diff < day) return `${Math.floor(diff / hour)}h ago`;
+  if (diff < 2 * day) return 'Yesterday';
+  if (diff < 7 * day) return `${Math.floor(diff / day)}d ago`;
+  const d = new Date(ts);
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0, 3)}`;
+}
+
+function renderHistorySidebar() {
+  const sorted = [...chats].sort((a, b) => b.updatedAt - a.updatedAt);
+  if (!sorted.length) {
+    historyList.innerHTML = '<div class="history-empty">No chats yet</div>';
+    return;
+  }
+  historyList.innerHTML = sorted
+    .map((chat) => {
+      const active = chat.id === sessionId ? ' active' : '';
+      if (chat.id === renamingChatId) {
+        return `<div class="history-item${active}" data-id="${escapeHtml(chat.id)}">
+          <div class="history-item-main">
+            <input type="text" class="history-rename-input" value="${escapeHtml(chat.title)}" maxlength="60" />
+          </div>
+        </div>`;
+      }
+      return `<div class="history-item${active}" data-id="${escapeHtml(chat.id)}">
+        <div class="history-item-main" data-action="switch">
+          <div class="history-item-title">${escapeHtml(chat.title || 'New chat')}</div>
+          <div class="history-item-time">${escapeHtml(formatRelativeTime(chat.updatedAt))}</div>
+        </div>
+        <div class="history-item-actions">
+          <button type="button" class="history-item-btn history-rename-btn" data-action="rename" title="Rename">${PENCIL_ICON}</button>
+          <button type="button" class="history-item-btn history-delete-btn" data-action="delete" title="Delete">${TRASH_ICON}</button>
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  if (renamingChatId) {
+    const renameInput = historyList.querySelector('.history-rename-input');
+    if (renameInput) {
+      renameInput.focus();
+      renameInput.select();
+    }
+  }
+}
+
+function closeSidebarOnMobile() {
+  if (window.innerWidth <= 640) setSidebarCollapsed(true);
+}
+
+function switchToChat(id) {
+  if (busy || id === sessionId) return;
+  const chat = findChat(id);
+  if (!chat) return;
+  sessionId = id;
+  localStorage.setItem('flythai_session_id', id);
+  renderChatIntoDOM(chat);
+  renderHistorySidebar();
+  closeSidebarOnMobile();
+}
+
+function startNewChat() {
+  if (busy) return;
   sessionId = 'sess-' + Math.random().toString(36).slice(2) + Date.now();
   localStorage.setItem('flythai_session_id', sessionId);
-  messagesInner.innerHTML = '';
-  addMessage('bot', 'Started a new chat. What would you like to know?');
-  suggestions.style.display = 'flex';
-  renderQuickReplies(null);
-  setExpecting(null);
-  setFlowActive(false);
+  const chat = createChatRecord(sessionId);
+  chats.unshift(chat);
+  saveChats();
+  renderChatIntoDOM(chat);
+  renderHistorySidebar();
   input.value = '';
   updateCharCount();
+  input.focus();
+  closeSidebarOnMobile();
+}
+
+function deleteChat(id) {
+  if (busy) return;
+  const chat = findChat(id);
+  if (!chat) return;
+  if (!confirm(`Delete "${chat.title || 'this chat'}"? This cannot be undone.`)) return;
+  chats = chats.filter((c) => c.id !== id);
+  saveChats();
+  if (id === sessionId) {
+    if (chats.length) {
+      const next = [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+      sessionId = next.id;
+      localStorage.setItem('flythai_session_id', sessionId);
+      renderChatIntoDOM(next);
+    } else {
+      startNewChat();
+      return; // startNewChat already re-renders the sidebar
+    }
+  }
+  renderHistorySidebar();
+}
+
+function finishRenameChat(id, rawValue) {
+  const chat = findChat(id);
+  if (chat) {
+    const value = rawValue.trim();
+    if (value) {
+      chat.title = value.slice(0, 60);
+      chat.titleManual = true;
+      saveChats();
+    }
+  }
+  renamingChatId = null;
+  renderHistorySidebar();
+}
+
+historyList.addEventListener('click', (e) => {
+  const actionEl = e.target.closest('[data-action]');
+  const itemEl = e.target.closest('.history-item');
+  if (!actionEl || !itemEl) return;
+  const id = itemEl.dataset.id;
+  if (actionEl.dataset.action === 'switch') switchToChat(id);
+  else if (actionEl.dataset.action === 'rename') {
+    renamingChatId = id;
+    renderHistorySidebar();
+  } else if (actionEl.dataset.action === 'delete') deleteChat(id);
 });
+
+historyList.addEventListener('keydown', (e) => {
+  if (!e.target.classList.contains('history-rename-input')) return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    e.target.blur(); // triggers the focusout handler below, which saves it
+  } else if (e.key === 'Escape') {
+    renamingChatId = null;
+    renderHistorySidebar();
+  }
+});
+
+// focusout (not blur, which doesn't bubble) so a single listener on the list covers whichever
+// item is currently mid-rename, without rebinding it every time renderHistorySidebar() runs.
+historyList.addEventListener('focusout', (e) => {
+  if (!e.target.classList.contains('history-rename-input') || !renamingChatId) return;
+  finishRenameChat(renamingChatId, e.target.value);
+});
+
+// True only while the sidebar was auto-collapsed by openDataDrawer() (see above) rather than by
+// the user's own click - closeDataDrawer() checks this to know whether to bring it back.
+let sidebarAutoCollapsedForDrawer = false;
+
+function setSidebarCollapsed(collapsed, persist = true) {
+  layoutEl.classList.toggle('sidebar-collapsed', collapsed);
+  if (!persist) return;
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+  } catch (err) {
+    // ignore - collapsed state just won't persist across reloads
+  }
+}
+
+sidebarToggleBtn.addEventListener('click', () => {
+  sidebarAutoCollapsedForDrawer = false; // an explicit click overrides any pending auto-restore
+  setSidebarCollapsed(!layoutEl.classList.contains('sidebar-collapsed'));
+});
+
+// Defaults to collapsed on a phone-width screen (no room to spare) and expanded everywhere else,
+// unless the user already made an explicit choice that's remembered in localStorage.
+(function initSidebarCollapsed() {
+  let stored = null;
+  try {
+    stored = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+  } catch (err) {
+    // ignore
+  }
+  setSidebarCollapsed(stored !== null ? stored === '1' : window.innerWidth <= 640);
+})();
+
+(function initHistory() {
+  const chat = ensureCurrentChat();
+  // A brand-new chat with zero messages already has its richer welcome bubble hardcoded in
+  // index.html - re-rendering it here would just replace that with the plainer "Started a new
+  // chat" text for no reason. Only rebuild from scratch when there's actual history to restore.
+  if (chat.messages.length) renderChatIntoDOM(chat);
+  renderHistorySidebar();
+})();

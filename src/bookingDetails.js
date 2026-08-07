@@ -10,17 +10,41 @@ const BARE_NUMBER_RE = /\b\d{4,}\b/;
 // unrelated sections into a focused answer.
 const DETAIL_INTENT_RE = /\b(detail|details|full info|complete info|everything about)\b/i;
 
-// Detects requests like "What is the booking detail of FT08261781?" or "What is the booking
-// detail of 8261781?" (bare digits, no FT/FTQ prefix). Deterministic (regex + fixed SQL), not
-// LLM-authored, so hotel/itinerary/cost data is ALWAYS fetched together - the SQL-planner LLM was
-// found to sometimes only query BookingMaster and skip the joins schema.js asks for, silently
-// producing an incomplete answer.
+// "details of guest <name>" or just "details of <name>" (no FT/FTQ code and no digits at all) has
+// no code to resolve, and previously fell through this whole module entirely into the generic LLM
+// SQL-planner - reproduced live twice: once for "guest karan" (silently skipped the hotel/
+// itinerary/cost joins this deterministic path exists to guarantee), and again for "booking detail
+// of Devansh" (no "guest" keyword at all - the planner's own generated SQL then failed outright
+// with "Multiple statements are not allowed"). Captures whatever follows "of"/"for" (an optional
+// "guest"/"our guest" prefix is skipped), then trims trailing filler ("ka"/"ki"/"ke", "detail",
+// "'s", ...) a natural sentence tacks on afterward - same pattern as accountTransactions.js's own
+// guest-name lookup. NON_NAME_WORDS_RE guards against "details of the hotel bookings"-style phrasing
+// (no guest name at all) being misread as one - those fall through to the SQL-planner as before,
+// rather than confidently searching for a guest literally named "the hotel bookings".
+const GUEST_NAME_RE = /\b(?:of|for)\s+(?:our\s+)?(?:guest\s+)?([a-zA-Z][a-zA-Z\s'.-]{1,40})/i;
+const NON_NAME_WORDS_RE = /\b(booking|bookings|quotation|quotations|hotel|hotels|payment|payments|record|records|invoice|invoices|transaction|transactions|voucher|vouchers|itinerary|status|agent|agents|company|companies)\b/i;
+function extractGuestName(text) {
+  const m = text.match(GUEST_NAME_RE);
+  if (!m) return null;
+  let name = m[1].replace(/\b(ka|ki|ke|booking|account|accounts|detail|details|history|ledger|of|for)\b.*$/i, '').trim();
+  name = name.replace(/'s$/i, '').trim();
+  if (!name || NON_NAME_WORDS_RE.test(name)) return null;
+  return name;
+}
+
+// Detects requests like "What is the booking detail of FT08261781?", "What is the booking detail
+// of 8261781?" (bare digits, no FT/FTQ prefix), or "give me the booking details of guest karan"
+// (name, no code at all). Deterministic (regex + fixed SQL), not LLM-authored, so hotel/itinerary/
+// cost data is ALWAYS fetched together - the SQL-planner LLM was found to sometimes only query
+// BookingMaster and skip the joins schema.js asks for, silently producing an incomplete answer.
 function detectFullDetailIntent(text) {
   if (!DETAIL_INTENT_RE.test(text)) return null;
   const fullMatch = text.match(FULL_CODE_RE);
   if (fullMatch) return { code: fullMatch[0].toUpperCase(), exact: true };
   const bareMatch = text.match(BARE_NUMBER_RE);
   if (bareMatch) return { code: bareMatch[0], exact: false };
+  const guestName = extractGuestName(text);
+  if (guestName) return { guestName };
   return null;
 }
 
@@ -35,6 +59,17 @@ async function resolveBooking(pool, intent) {
     const r = await pool.request().input('code', intent.code).query(`
       SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
       WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
+    `);
+    if (r.recordset.length === 0) return { status: 'not_found' };
+    if (r.recordset.length > 1) return { status: 'ambiguous', matches: r.recordset };
+    return { status: 'ok', id: r.recordset[0].Id };
+  }
+
+  if (intent.guestName) {
+    const r = await pool.request().input('name', `%${intent.guestName}%`).query(`
+      SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster
+      WHERE IsDelete = 0 AND GuestName LIKE @name
+      ORDER BY CreatedOn DESC
     `);
     if (r.recordset.length === 0) return { status: 'not_found' };
     if (r.recordset.length > 1) return { status: 'ambiguous', matches: r.recordset };

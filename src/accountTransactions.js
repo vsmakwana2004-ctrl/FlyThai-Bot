@@ -9,17 +9,22 @@ const FULL_CODE_RE = /\bFTQ?\d+\b/i;
 const ACCOUNT_TXN_INTENT_RE =
   /\b(account(?:ing)?\s+(?:transactions?|history|details?)|ledger|transaction\s+(?:history|list|details?)|transactions?\s+(?:for|of)\b|sale\s*(?:vs\.?|\/|and)\s*purchase|receipt\s*(?:vs\.?|\/|and)\s*payment)\b/i;
 
-// "guest <name>" phrasing - e.g. "account detail of our guest karan" - has no FT/FTQ code at all
-// (by design; the user is naming the person, not the record), so falls through this far without a
-// code to resolve. Captures the word(s) right after "guest" and trims off trailing filler
-// ("ka"/"ki"/"ke", "account", "details", "'s", ...) that a natural sentence tacks on afterward.
-const GUEST_NAME_RE = /\bguest\s+([a-zA-Z][a-zA-Z\s'.-]{1,40})/i;
+// "guest <name>" phrasing - e.g. "account detail of our guest karan" - or just a bare name after
+// "of"/"for" ("account transactions of Devansh", no "guest" keyword at all) has no FT/FTQ code at
+// all (by design; the user is naming the person, not the record), so falls through this far without
+// a code to resolve. Captures whatever follows "of"/"for" (an optional "guest"/"our guest" prefix
+// is skipped) and trims off trailing filler ("ka"/"ki"/"ke", "account", "details", "'s", ...) that a
+// natural sentence tacks on afterward. NON_NAME_WORDS_RE guards against a phrase with no real guest
+// name at all ("transactions of the whole account") being misread as one.
+const GUEST_NAME_RE = /\b(?:of|for)\s+(?:our\s+)?(?:guest\s+)?([a-zA-Z][a-zA-Z\s'.-]{1,40})/i;
+const NON_NAME_WORDS_RE = /\b(booking|bookings|quotation|quotations|hotel|hotels|payment|payments|record|records|invoice|invoices|transaction|transactions|voucher|vouchers|itinerary|status|agent|agents|company|companies|account|accounts)\b/i;
 function extractGuestName(text) {
   const m = text.match(GUEST_NAME_RE);
   if (!m) return null;
   let name = m[1].replace(/\b(ka|ki|ke|account|accounts|detail|details|history|ledger|transaction|transactions|of|for)\b.*$/i, '').trim();
   name = name.replace(/'s$/i, '').trim();
-  return name || null;
+  if (!name || NON_NAME_WORDS_RE.test(name)) return null;
+  return name;
 }
 
 // Detects "show account transactions for booking FT...", "ledger for FT...", "transaction history

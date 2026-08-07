@@ -290,6 +290,37 @@ Rules: exactly one statement, must start with SELECT or WITH, never INSERT/UPDAT
 CRITICAL: you have NO ability to write/update/change anything in the database or anywhere else from this point in the code. If a message reaches you asking to change/update/set/mark/create something and it wasn't intercepted before this prompt, that means it could NOT be handled automatically (e.g. the booking code was unclear). NEVER reply claiming you made a change, updated a status, or saved anything — that would be false. Instead reply honestly that you can't perform updates from here, and ask for the exact booking code so it can be handled correctly (e.g. "change payment status of FT07261782 to done").`;
 }
 
+// Always builds the "Cost Breakdown" section of a full-detail answer deterministically - the
+// answerer LLM was found to sometimes drop the whole section, and sometimes keep it but compute a
+// row wrong (reproduced live for booking FT08261794/Devansh: it showed each row's raw per-person
+// Price instead of Price x PAX). Same "don't trust an LLM with financial output" risk documented in
+// accountTransactions.js. Mirrors the exact table shape the prompt itself asks for (Traveller | Pax
+// | Amount, one row per costBreakdown entry, then costSummary's own already-computed totals
+// appended as further rows), so it reads identically to what a correct model answer would look like
+// - the caller always uses this in place of whatever the model produced for this section, never
+// only as a gap-filler.
+function buildCostBreakdownSection(data) {
+  const costBreakdown = data.costBreakdown || [];
+  const costSummary = data.costSummary;
+  if (costBreakdown.length === 0 && !costSummary) return '';
+  const currency = (costSummary && costSummary.currency) || (data.booking && data.booking.Currency) || '';
+  const fmt = (n, curr) => `${Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${curr ? ` ${curr}` : ''}`;
+
+  let out = '### Cost Breakdown\n\n| Traveller | Pax | Amount |\n|---|---|---|\n';
+  for (const row of costBreakdown) {
+    const amount = (Number(row.Price) || 0) * (Number(row.PAX) || 0);
+    out += `| ${row.Type} | ${row.PAX} | ${fmt(amount, currency)} |\n`;
+  }
+  if (costSummary) {
+    out += `| Total Cost | — | ${fmt(costSummary.totalCost, currency)} |\n`;
+    out += `| ROE | — | ${costSummary.roe} |\n`;
+    if (costSummary.totalAfterROE != null) out += `| Total After ROE | — | ${fmt(costSummary.totalAfterROE, 'INR')} |\n`;
+    out += `| Discount | — | ${fmt(costSummary.discountINR, 'INR')} |\n`;
+    if (costSummary.finalAmountINR != null) out += `| Final Amount | — | ${fmt(costSummary.finalAmountINR, 'INR')} |\n`;
+  }
+  return out;
+}
+
 function answererSystemPrompt() {
   return `You are FlyThai's internal database assistant. You previously ran a SQL query against the live database to answer the staff member's question. Using ONLY the JSON data provided (never invent anything beyond it), write a clear, helpful answer.
 - Always reply in English, regardless of what language the question was asked in.
@@ -1014,9 +1045,12 @@ async function handleChatInner(sessionId, userMessage) {
   const fullDetailIntent = bookingDetails.detectFullDetailIntent(userMessage);
   if (fullDetailIntent) {
     const resolved = await bookingDetails.fetchFullBookingDetails(fullDetailIntent);
+    // fullDetailIntent may have been resolved by an explicit FT/FTQ code, bare digits, OR a bare
+    // guest name (e.g. "booking details of guest karan") - .code is only set in the first two cases.
+    const label = fullDetailIntent.code || fullDetailIntent.guestName;
 
     if (resolved.status === 'not_found') {
-      const reply = `I couldn't find any booking or quotation matching **${fullDetailIntent.code}** in the database.`;
+      const reply = `I couldn't find any booking or quotation matching **${label}** in the database.`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
     }
@@ -1025,7 +1059,8 @@ async function handleChatInner(sessionId, userMessage) {
       const list = resolved.matches
         .map((m) => `- **${m.BookingId || m.QuotationId}** (${m.GuestName})`)
         .join('\n');
-      const reply = `That number matches more than one record — did you mean one of these?\n\n${list}\n\nPlease ask again with the full code.`;
+      const hint = fullDetailIntent.guestName ? 'Please ask again using the specific FT/FTQ code.' : 'Please ask again with the full code.';
+      const reply = `**${label}** matches more than one record — did you mean one of these?\n\n${list}\n\n${hint}`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: resolved.matches.length };
     }
@@ -1037,7 +1072,25 @@ async function handleChatInner(sessionId, userMessage) {
         content: `User's question: ${userMessage}\n\nFull booking data, as JSON (booking = main record, hotels = hotel stays, hotelExtras = extra charges per hotel keyed by BookingHotelId, itinerary = day-by-day activities, costBreakdown = traveller-type pricing rows, costSummary = precomputed Total Cost/ROE/Total After ROE/Discount/Final Amount - already calculated correctly, just format it, do not recompute):\n${JSON.stringify(resolved.data)}`,
       },
     ];
-    const answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
+    let answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
+    // See buildCostBreakdownSection's own comment - the model asked for this section sometimes
+    // drops it entirely, and sometimes keeps the section but gets a row wrong (reproduced live for
+    // FT08261794/Devansh: it showed each row's raw per-person Price instead of Price x PAX - e.g.
+    // "THB 10,000" for a 3-pax row that should read 30,000 - a real financial figure staff could
+    // act on, even though the Total Cost line taken straight from costSummary was correct). Always
+    // REPLACE whatever the model produced for this section (or insert one if it produced none) with
+    // a deterministically-built one, rather than only filling a gap - money math here is never
+    // trusted to the model, matching the same standard accountTransactions.js already applies.
+    const hasCostData = (resolved.data.costBreakdown && resolved.data.costBreakdown.length > 0) || resolved.data.costSummary;
+    if (hasCostData) {
+      const withoutLLMSection = answer.replace(/###\s*cost breakdown[\s\S]*?(?=\n###\s|$)/i, '').trim();
+      const section = buildCostBreakdownSection(resolved.data);
+      // Keeps the fixed section order the prompt itself specifies (Cost Breakdown before Payments/
+      // Job Sheet/Other) when that section is present; otherwise just appends at the end.
+      answer = /###\s*payments/i.test(withoutLLMSection)
+        ? withoutLLMSection.replace(/(?=###\s*payments)/i, `${section}\n\n`)
+        : `${withoutLLMSection}\n\n${section}`;
+    }
     pushTurn(sessionId, userMessage, answer);
     return { answer, sql: null, rowCount: 1 };
   }
