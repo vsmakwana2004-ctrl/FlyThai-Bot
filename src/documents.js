@@ -1,6 +1,20 @@
 const { getPool } = require('./db');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
+// Same guest-name extraction convention as bookingDetails.js/accountTransactions.js - "of"/"for"
+// followed by a name, with an optional "guest" prefix, trimmed of trailing filler words. Lets a
+// PDF request like "give me invoice of zia" resolve by name instead of demanding a code the user
+// may not have handy.
+const GUEST_NAME_RE = /\b(?:of|for)\s+(?:our\s+)?(?:guest\s+)?([a-zA-Z][a-zA-Z\s'.-]{1,40})/i;
+const NON_NAME_WORDS_RE = /\b(booking|bookings|quotation|quotations|hotel|hotels|payment|payments|record|records|invoice|invoices|transaction|transactions|voucher|vouchers|itinerary|status|agent|agents|company|companies)\b/i;
+function extractGuestName(text) {
+  const m = text.match(GUEST_NAME_RE);
+  if (!m) return null;
+  let name = m[1].replace(/\b(ka|ki|ke|booking|account|accounts|detail|details|history|ledger|of|for)\b.*$/i, '').trim();
+  name = name.replace(/'s$/i, '').trim();
+  if (!name || NON_NAME_WORDS_RE.test(name)) return null;
+  return name;
+}
 
 // Plain Levenshtein edit distance, used below so a typo'd trigger word ("downlode", "qutaion")
 // still matches instead of silently falling through to a completely different (wrong) response
@@ -47,9 +61,14 @@ const HOTEL_VOUCHER_RE = /\bhotel\s*voucher\b/i;
 // "share"/"send"/"get" are too ambiguous - "share the invoice details" means give the information
 // as text, NOT hand over a raw PDF link. Only explicit file language should trigger the PDF path.
 const DOWNLOAD_VERB_WORDS = ['download', 'pdf', 'generate'];
+// "give me quotation details for X"/"give me the itinerary info" are plain text lookups, not file
+// requests, even though they pair "give" with a report word - the word "details"/"info" is what
+// actually disambiguates them from "give me the quotation" (a real, if weakly-worded, PDF ask).
+const DETAIL_WORDS = ['detail', 'details', 'info', 'information'];
 const REPORT_RE = { test: (text) => fuzzyWordMatch(text, REPORT_WORDS) };
 const ITINERARY_RE = { test: (text) => fuzzyWordMatch(text, ITINERARY_WORDS) };
 const DOWNLOAD_VERB_RE = { test: (text) => fuzzyWordMatch(text, DOWNLOAD_VERB_WORDS) };
+const DETAIL_RE = { test: (text) => fuzzyWordMatch(text, DETAIL_WORDS) };
 
 // Verified against the real site's "Download PDF" popup (options query param on GetItineraryPdf):
 // 1 = With FlyThai Logo (also the old default before this 3-way choice existed), 2 = With Agent
@@ -74,7 +93,7 @@ function detectDocumentIntent(text, fallbackCode) {
   // details" is a normal text lookup, not a file request - so those only count when paired with a
   // specific document word (invoice/itinerary/hotel voucher) that removes the ambiguity.
   const hasStrongVerb = DOWNLOAD_VERB_RE.test(text);
-  const hasWeakVerb = (isHotelVoucher || isItinerary || isReport) && fuzzyWordMatch(text, ['give', 'send']);
+  const hasWeakVerb = (isHotelVoucher || isItinerary || isReport) && fuzzyWordMatch(text, ['give', 'send']) && !DETAIL_RE.test(text);
   if (!hasStrongVerb && !hasWeakVerb) return null;
 
   // A real file request was made (strong or weak verb matched above) but there's no code to work
@@ -82,15 +101,24 @@ function detectDocumentIntent(text, fallbackCode) {
   // fall through to the LLM planner (which has no booking to build a query around and was seen
   // failing with a confusing raw DB error - "Multiple statements are not allowed" - instead of a
   // clear ask), hand back a distinct signal so chat.js can ask for the code directly.
-  const code = codeMatch ? codeMatch[0].toUpperCase() : fallbackCode;
-  if (!code) return { type: 'needsCode' };
+  // Priority: an explicit code in THIS message, then an explicit guest name in THIS message, then
+  // the last code mentioned earlier in the session (a follow-up like "give me invoice of this") -
+  // only asking outright once none of those resolve to anything.
+  let code = codeMatch ? codeMatch[0].toUpperCase() : null;
+  let guestName = null;
+  if (!code) {
+    guestName = extractGuestName(text);
+    if (!guestName) code = fallbackCode || null;
+  }
+  if (!code && !guestName) return { type: 'needsCode' };
+  const target = code ? { code } : { guestName };
 
-  if (isHotelVoucher) return { type: 'hotelVoucher', code };
-  if (isItinerary) return { type: 'itinerary', code };
-  if (isReport) return { type: 'report', code };
+  if (isHotelVoucher) return { type: 'hotelVoucher', ...target };
+  if (isItinerary) return { type: 'itinerary', ...target };
+  if (isReport) return { type: 'report', ...target };
   // An explicit file request ("... in pdf") was made but it's unclear which document is meant -
   // ask instead of silently falling back to a plain-text answer.
-  return { type: 'unknown', code };
+  return { type: 'unknown', ...target };
 }
 
 // Returns EVERY row matching this code, not just one - BookingId is always assigned uniquely, but
@@ -110,6 +138,23 @@ async function resolveBookingByCode(code) {
       SELECT Id, BookingId, QuotationId, GuestName, IsBooking, CreatedOn
       FROM BookingMaster
       WHERE IsDelete = 0 AND (BookingId = @code OR QuotationId = @code)
+      ORDER BY CreatedOn DESC
+    `);
+  return result.recordset;
+}
+
+// Same idea as resolveBookingByCode, but for a guest-name-only request - matches are expected here
+// (unlike the same-code case above, which is about one specific record splitting across rows),
+// since more than one guest can share a name; handleDocumentRequest asks which one the same way.
+async function resolveBookingByGuestName(name) {
+  const pool = await getPool();
+  const result = await pool
+    .request()
+    .input('name', `%${name}%`)
+    .query(`
+      SELECT Id, BookingId, QuotationId, GuestName, IsBooking, CreatedOn
+      FROM BookingMaster
+      WHERE IsDelete = 0 AND GuestName LIKE @name
       ORDER BY CreatedOn DESC
     `);
   return result.recordset;
@@ -191,20 +236,22 @@ function reportLabel(isBooking) {
 }
 
 async function handleDocumentRequest(intent) {
-  const matches = await resolveBookingByCode(intent.code);
+  const matches = intent.guestName ? await resolveBookingByGuestName(intent.guestName) : await resolveBookingByCode(intent.code);
+  const label = intent.guestName ? `guest **${intent.guestName}**` : `code **${intent.code}**`;
   if (matches.length === 0) {
-    return { reply: `I couldn't find any booking or quotation with code **${intent.code}** in the database.` };
+    return { reply: `I couldn't find any booking or quotation matching ${label} in the database.` };
   }
   if (matches.length > 1) {
-    // Never guess which same-code record was meant (see resolveBookingByCode) - same "ask, don't
-    // pick" standard the rest of this codebase already applies to ambiguous hotel/vehicle/
-    // destination matches.
+    // Never guess which record was meant (same code splitting across rows, or several guests
+    // sharing a name) - same "ask, don't pick" standard the rest of this codebase already applies
+    // to ambiguous hotel/vehicle/destination matches.
     const list = matches.map((m, i) => `${i + 1}. ${describeMatch(m)}`).join('\n');
     return {
-      reply: `More than one record uses the code **${intent.code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`,
+      reply: `More than one record matches ${label} — which one did you mean?\n\n${list}\n\n(Reply with the number.)`,
       // .code alongside {intent, matches} so this fits the same {code: ...} shape every other
       // pending-* state uses in chat.js (the cancel check and the "a different code interrupts a
-      // stale pending question" guard both key off pending.code).
+      // stale pending question" guard both key off pending.code) - left undefined for a
+      // guest-name match, since by definition those candidates don't share one single code.
       pendingCodeChoice: { code: intent.code, intent, matches },
     };
   }
@@ -223,7 +270,7 @@ async function buildDocumentReply(intent, booking) {
   // was typed. Reproduced live: "download quotation for FTQ12260001" answered with the INVOICE for
   // a completely different-looking code (FT12261788) and no explanation, reading as a wrong/
   // hallucinated result even though it was actually the same record, just already converted.
-  const wasConverted = booking.IsBooking && booking.QuotationId && booking.BookingId && intent.code.toUpperCase() === booking.QuotationId.toUpperCase();
+  const wasConverted = !!intent.code && booking.IsBooking && booking.QuotationId && booking.BookingId && intent.code.toUpperCase() === booking.QuotationId.toUpperCase();
   const conversionNote = wasConverted ? `_Note: **${booking.QuotationId}** has since been converted to booking **${booking.BookingId}** — showing that booking's document instead._\n\n` : '';
 
   if (intent.type === 'report') {
@@ -407,6 +454,7 @@ module.exports = {
   stepCodeChoice,
   parseLogoChoice,
   resolveBookingByCode,
+  resolveBookingByGuestName,
   buildInvoiceLink,
   buildItineraryLink,
   buildHotelVoucherLink,

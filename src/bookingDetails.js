@@ -94,7 +94,7 @@ async function fetchFullBookingDetails(intent) {
   const bookingResult = await pool.request().input('id', resolved.id).query(`
     SELECT TOP 1 bm.Id, bm.BookingId, bm.QuotationId, bm.IsBooking, bm.GuestName, bm.GuestPhoneNumber,
            bm.GuestEmail, bm.GuestCompany, bm.GuestAdults, bm.GuestChildrens, bm.GuestInfants,
-           bm.TravelDate, bm.ReturnDate, bm.Currency, bm.ROERate, bm.TaxAmount, bm.TaxPercentage,
+           bm.TravelDate, bm.ReturnDate, bm.Currency, bm.ROERate, bm.ROECharge, bm.TaxAmount, bm.TaxPercentage,
            bm.LandSelling, bm.InvoiceDiscount, bm.TravelStatus, bm.InvoiceStatus, bm.VoucherStatus,
            bm.ItineraryStatus, bm.PaymentStatus, bm.BookingBy, bm.CreatedOn, bm.UpdatedOn,
            a.Name AS AgentName, a.Phone AS AgentPhone,
@@ -136,18 +136,26 @@ async function fetchFullBookingDetails(intent) {
 
   const costRows = membersResult.recordset;
   // Precomputed here (not left for the LLM to calculate) so the ROE conversion always matches the
-  // real invoice math exactly: Total Cost -> x ROE -> Total After ROE -> minus Discount -> Final Amount.
+  // real invoice math exactly: Total Cost -> x ROE -> Total After ROE -> minus Discount -> Final
+  // Amount. Formula verified against a real invoice PDF and matches financeReports.js's own
+  // documented one: (TotalCost + Tax) x (ROERate + ROECharge) - a booking can have its rate set in
+  // either field (ROERate is often left at 0 with the real rate entered as ROECharge instead), so
+  // using ROERate alone (the previous bug here) silently dropped these rows for those bookings.
   let costSummary = null;
   if (costRows.length) {
     const round2 = (n) => Math.round(n * 100) / 100;
     const totalCost = costRows.reduce((sum, r) => sum + (Number(r.Price) || 0) * (Number(r.PAX) || 0), 0);
-    const roe = Number(booking.ROERate) || 0;
-    const totalAfterROE = roe ? totalCost * roe : null;
+    const roeRate = Number(booking.ROERate) || 0;
+    const roeCharge = Number(booking.ROECharge) || 0;
+    const taxAmount = Number(booking.TaxAmount) || 0;
+    const combinedRoe = roeRate + roeCharge;
+    const totalAfterROE = combinedRoe ? (totalCost + taxAmount) * combinedRoe : null;
     const discount = Number(booking.InvoiceDiscount) || 0;
     costSummary = {
       currency: booking.Currency,
       totalCost: round2(totalCost),
-      roe: booking.ROERate,
+      roeRate: booking.ROERate,
+      roeCharge: booking.ROECharge,
       totalAfterROE: totalAfterROE !== null ? round2(totalAfterROE) : null,
       discountINR: discount,
       finalAmountINR: totalAfterROE !== null ? round2(totalAfterROE - discount) : null,

@@ -313,7 +313,8 @@ function buildCostBreakdownSection(data) {
   }
   if (costSummary) {
     out += `| Total Cost | — | ${fmt(costSummary.totalCost, currency)} |\n`;
-    out += `| ROE | — | ${costSummary.roe} |\n`;
+    out += `| ROE | — | ${costSummary.roeRate} |\n`;
+    out += `| ROE Charges | — | ${costSummary.roeCharge} |\n`;
     if (costSummary.totalAfterROE != null) out += `| Total After ROE | — | ${fmt(costSummary.totalAfterROE, 'INR')} |\n`;
     out += `| Discount | — | ${fmt(costSummary.discountINR, 'INR')} |\n`;
     if (costSummary.finalAmountINR != null) out += `| Final Amount | — | ${fmt(costSummary.finalAmountINR, 'INR')} |\n`;
