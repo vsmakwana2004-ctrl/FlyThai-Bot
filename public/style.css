@@ -390,6 +390,7 @@ body {
 
 .msg {
   display: flex;
+  flex-wrap: nowrap;
   align-items: flex-start;
   gap: 14px;
   animation: msgIn 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
@@ -414,6 +415,7 @@ body {
 }
 
 .msg-content {
+  flex: 1 1 auto;
   max-width: 100%;
   display: flex;
   flex-direction: column;
