@@ -14,6 +14,7 @@ const bookingEditForms = require('./bookingEditForms');
 const { findBookingById } = require('./bookingApi');
 const { isAnyCancel } = require('./cancel');
 const { findDestinations, listDestinations } = require('./lookups');
+const jobSheetCopy = require('./jobSheetCopy');
 
 // Simple in-memory per-session state (server restarts clear it — fine for an internal tool).
 const sessions = new Map();
@@ -1108,6 +1109,31 @@ function finishDuplicateResolve(sessionId, session, userMessage, resolved, fallb
   return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
 }
 
+// Turns a jobSheetCopy.js result into the chat reply - each copy is its own fenced code block so
+// it pastes cleanly (no markdown reformatting the blank lines the real template relies on) and the
+// agent can grab just the one they need straight off the message.
+function finishJobSheetCopyResult(sessionId, session, userMessage, intent, result) {
+  const copyLabel = intent.copyType === 'booking' ? 'Booking' : 'Customer';
+  if (result.status === 'not_found') {
+    let reply;
+    if (result.reason === 'date') reply = `No job sheets found for that day.`;
+    else if (result.reason === 'no_job_sheets') reply = `**${result.code}** has no job sheets yet.`;
+    else reply = `I couldn't find any booking or quotation matching **${intent.scope.code}** in the database.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (result.copies.length === 0) {
+    const reply = `Found matching job sheet(s), but couldn't fetch their details from the site just now - please try again.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  const blocks = result.copies.map((c) => `**${c.label}**\n\`\`\`\n${c.text}\n\`\`\``).join('\n\n');
+  const truncatedNote = result.truncated ? `\n\n(More may exist beyond the first ${result.copies.length} shown.)` : '';
+  const reply = `Found ${result.copies.length} ${copyLabel} Copy ${result.copies.length === 1 ? 'text' : 'texts'}:\n\n${blocks}${truncatedNote}`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
+}
+
 // Resumes whichever flow asked "which one did you mean?" (session.pendingRecordChoice) once the
 // user has picked a specific row - dispatches by .kind to the same "finish" helper the fresh-intent
 // path itself uses, so the two paths can never drift apart.
@@ -1135,6 +1161,10 @@ async function resumeRecordChoice(sessionId, session, pending, chosen, userMessa
       return { answer: reply, sql: null, rowCount: 0 };
     }
     return openEditSection(sessionId, session, userMessage, resolved.code, resolved.guestName, pending.extra.sectionText, false);
+  }
+  if (pending.kind === 'jobSheetCopy') {
+    const result = await jobSheetCopy.resolveJobSheetCopiesForBooking(chosen, pending.extra.copyType);
+    return finishJobSheetCopyResult(sessionId, session, userMessage, { copyType: pending.extra.copyType, scope: { code: pending.code } }, result);
   }
   // 'statusUpdate'
   const result = await statusUpdate.startWithBooking(chosen, pending.extra.userMessage);
@@ -1887,6 +1917,23 @@ async function handleChatInner(sessionId, userMessage) {
     session.pendingStatusChange = result.pending;
     pushTurn(sessionId, userMessage, result.reply);
     return { answer: result.reply, sql: null, rowCount: 0 };
+  }
+
+  // A request for the real Job Sheet page's own "Copy For Customer"/"Copy Booking" text (see
+  // jobSheetCopy.js) - by a specific FT/FTQ code, or by today/tomorrow/yesterday/a literal date.
+  // Handled deterministically against the real /Jobsheet/GetBookingById endpoint, never guessed.
+  const jobSheetCopyIntent = jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST());
+  if (jobSheetCopyIntent) {
+    if (!jobSheetCopyIntent.scope) {
+      const reply = `Copy for which job sheet(s)? Give me an FT/FTQ code, or a day (today/tomorrow/yesterday/a date).`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const result = await jobSheetCopy.resolveJobSheetCopies(jobSheetCopyIntent);
+    if (result.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, jobSheetCopyIntent.scope.code, result.matches, 'jobSheetCopy', { copyType: jobSheetCopyIntent.copyType });
+    }
+    return finishJobSheetCopyResult(sessionId, session, userMessage, jobSheetCopyIntent, result);
   }
 
   // Or a request for an invoice/itinerary/hotel voucher PDF - handled deterministically (no
