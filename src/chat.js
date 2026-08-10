@@ -1131,7 +1131,11 @@ function finishJobSheetCopyResult(sessionId, session, userMessage, intent, resul
   const truncatedNote = result.truncated ? `\n\n(More may exist beyond the first ${result.copies.length} shown.)` : '';
   const reply = `Found ${result.copies.length} ${copyLabel} Copy ${result.copies.length === 1 ? 'text' : 'texts'}:\n\n${blocks}${truncatedNote}`;
   pushTurn(sessionId, userMessage, reply);
-  return { answer: reply, sql: null, rowCount: 0 };
+  // copyBlocks lets the frontend render a one-tap "Copy" chip per job sheet (see app.js's
+  // addCopyButtons) instead of making the agent select-and-Ctrl+C out of the fenced code block
+  // above by hand - the real Job Sheet page's own two modals both have exactly this kind of single
+  // "Copy" button already, this just reproduces that same one-tap convenience here.
+  return { answer: reply, sql: null, rowCount: 0, copyBlocks: result.copies };
 }
 
 // Resumes whichever flow asked "which one did you mean?" (session.pendingRecordChoice) once the

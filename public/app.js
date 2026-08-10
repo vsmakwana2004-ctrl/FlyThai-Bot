@@ -942,6 +942,76 @@ function addDataToggle(wrap, rows, rowCount, rowsTruncated) {
   wrap.appendChild(btn);
 }
 
+// One "Copy" chip per job sheet's ready-to-send text (see src/jobSheetCopy.js's copyBlocks) - the
+// real Job Sheet page's own two modals ("Copy Booking"/"Copy For Customer") each have exactly one
+// "Copy" button that does this same one-tap clipboard copy; this reproduces that directly in the
+// chat instead of making the agent select-and-Ctrl+C out of the fenced code block by hand. Not
+// persisted across a reload (same convention as addDataToggle's row data above) - the full text is
+// still right there in the message itself either way.
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // Fallback for a context without the async Clipboard API (e.g. non-HTTPS).
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}
+
+// Shared by every chip addCopyButtons creates (the per-block ones and "Copy All") - copies `text`,
+// flips the button to a brief "Copied!"/"Copy failed" state, then restores its original label.
+function makeCopyButton(label, text, extraClass) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = extraClass ? `copy-block-btn ${extraClass}` : 'copy-block-btn';
+  btn.textContent = label;
+  btn.addEventListener('click', async () => {
+    try {
+      await copyTextToClipboard(text);
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+    } catch (err) {
+      btn.textContent = 'Copy failed';
+    } finally {
+      setTimeout(() => {
+        btn.textContent = label;
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  });
+  return btn;
+}
+
+function addCopyButtons(wrap, copyBlocks) {
+  if (!copyBlocks || copyBlocks.length === 0) return;
+
+  const row = document.createElement('div');
+  row.className = 'copy-blocks-row';
+
+  // Only worth offering once there's more than one block to combine - joined with a blank line
+  // between each (mirroring the blank line each individual template already ends on), so pasted
+  // as one message it still reads as clearly separate entries, not run together.
+  if (copyBlocks.length > 1) {
+    const allText = copyBlocks.map((b) => b.text).join('\n\n');
+    const allBtn = makeCopyButton(`Copy All (${copyBlocks.length})`, allText, 'copy-all');
+    row.appendChild(allBtn);
+  }
+
+  copyBlocks.forEach((block, i) => {
+    const label = copyBlocks.length > 1 ? `Copy #${i + 1}` : 'Copy';
+    const btn = makeCopyButton(label, block.text);
+    btn.title = block.label;
+    row.appendChild(btn);
+  });
+  wrap.appendChild(row);
+}
+
 // Tap-to-answer shortcuts for a guided-flow step (see quickRepliesFor() in src/chat.js) - same
 // chip look as the fixed suggestions row, but populated per-response from data.quickReplies.
 const QUICK_REPLY_ICONS = {
@@ -1074,6 +1144,7 @@ async function sendMessage(text) {
     }
     const { wrap } = addMessage('bot', renderMarkdown(data.answer || ''));
     addDataToggle(wrap, data.rows, data.rowCount, data.rowsTruncated);
+    addCopyButtons(wrap, data.copyBlocks);
     appendMessageToChat(chatId, 'bot', data.answer || '');
     updateChatFlowState(chatId, data.expecting || null, data.quickReplies || null);
     setExpecting(data.expecting || null);
