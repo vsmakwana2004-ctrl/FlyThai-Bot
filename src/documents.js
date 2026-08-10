@@ -35,6 +35,18 @@ function levenshtein(a, b) {
   return dp[m][n];
 }
 
+// Known false-positive collisions: a common, unrelated English word that happens to fall within
+// the Levenshtein tolerance below for one of the fuzzy targets, so a blanket tolerance can't
+// exclude it without also losing genuine typo tolerance for that target - reproduced live:
+// "general" (as in "general remarks noted") is edit-distance 2 from "generate", the exact same
+// distance a real typo like "generat"/"genrate" needs to still match, so "general" was silently
+// treated as a typo'd "generate PDF" request and asked "which booking is that for?" on an
+// unrelated job-sheet question. Checked as an exact-word denylist per target instead of loosening
+// the tolerance globally.
+const FUZZY_EXCLUDE = {
+  generate: ['general', 'generally', 'generic', 'generous'],
+};
+
 // True if any word in `text` is an exact or near-exact (typo-tolerant) match for one of `targets`.
 // Tolerance scales with word length so short words ("pdf") still require an exact/near-exact hit
 // rather than matching almost anything.
@@ -43,6 +55,7 @@ function fuzzyWordMatch(text, targets) {
   for (const w of words) {
     for (const target of targets) {
       if (w === target) return true;
+      if ((FUZZY_EXCLUDE[target] || []).includes(w)) continue;
       const maxDist = target.length <= 4 ? 1 : 2;
       if (Math.abs(w.length - target.length) <= maxDist && levenshtein(w, target) <= maxDist) return true;
     }

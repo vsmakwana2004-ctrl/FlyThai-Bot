@@ -32,6 +32,7 @@ This returns exactly one row per booking no matter how many hotels or itinerary 
 === BookingHotel === (hotels booked for a trip/itinerary)
 Columns: Id, BookingId(int FK -> BookingMaster.Id), DestinationId(FK->Destination.Id), HotelId(FK->Hotel.Id), Name(hotel name text), RoomCategory, TotalRooms, TotalNights, CheckInDate, CheckOutDate, Rate, ConfirmationId, HotelRatePerNight, HotelRatePerNightCurrency, TotalAmount, IsDelete(bit).
 IMPORTANT: TotalAmount already includes any extra charges below - it is the final correct total. But if the user asks for "hotel details" or a cost breakdown, you MUST also check BookingHotelAttributeMapping (join on BookingHotelId = BookingHotel.Id) for extra add-on charges included in that total - e.g. extra bed, extra breakfast, extra lunch/dinner - and list them, otherwise the answer looks incomplete compared to the real booking (this has been missed before - always check this table when showing hotel cost breakdowns).
+"Total hotel cost" for a BOOKING, or for an AGENT/COMPANY across their bookings (e.g. "total hotel cost for Ajay Modi Travels this month") means SUM(BookingHotel.TotalAmount) — join BookingHotel to BookingMaster (and BookingMaster.AgentId to Agents for the company filter). Do NOT compute this from AccountTransaction/AccountMaster (see the warning in that section below) - reproduced live: filtering AccountMaster by both the agent's own Name AND AccountType='Hotel' matches nothing, since an agent's account row and a hotel vendor's account row are different rows entirely, so that query silently returns zero every time.
 
 === BookingHotelAttributeMapping === (extra/optional charges added to a hotel booking - e.g. extra bed, extra breakfast, extra meals)
 Columns: Id, AttributeTypeId(FK->AttributeType.Id), BookingHotelId(FK->BookingHotel.Id), Adults(int, how many people this charge is for), Children, Infants, Price(decimal, per-person/per-night rate), FinalPrice(decimal, the actual total charged for this line item), Currency, IsDeleted(bit), IsActive(bit).
@@ -56,6 +57,7 @@ Columns: Id, BookingId(int FK->BookingMaster.Id), ItineraryId(FK->BookingItinear
 
 === AccountMaster === (chart of accounts / ledger accounts — e.g. hotels, vendors, agents as accounts)
 Columns: Id(PK), AccountGroupId(FK->AccountGroup.Id), AccountType(values seen: 'Hotel', 'Agent', 'Vender', 'OfficeExpense', 'Salary', or NULL), Name, AccountNo, Mobile, Email, Address, City, State, Country, OpeningBalance, Currency, IsActive(bit).
+An AGENT and a HOTEL are always two SEPARATE rows here (one AccountType='Agent', the others AccountType='Hotel') - never filter a single AccountMaster row by both an agent's Name AND AccountType='Hotel' (or vice versa), that matches nothing. For "how much has agent X been charged for hotels" style questions, don't use AccountMaster/AccountTransaction at all - see BookingHotel.TotalAmount above, which is the correct, simpler source for hotel cost.
 === AccountGroup === Id(PK), Name, GroupType, IsActive.
 
 === AccountTransaction === (ledger transactions / payments — the core accounting table)

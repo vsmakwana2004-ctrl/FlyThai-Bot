@@ -2281,4 +2281,4 @@ async function step(draft, userMessage) {
   }
 }
 
-module.exports = { step, startDraft, detectCreateIntent, parseYesNo, startItineraryEditDraft, askItineraryChoice };
+module.exports = { step, startDraft, detectCreateIntent, parseYesNo, startItineraryEditDraft, askItineraryChoice, nextBasicStep };

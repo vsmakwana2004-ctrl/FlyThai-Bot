@@ -45,12 +45,17 @@ function buildHeaders() {
 // Returns the new record's internal Id on success. The real site's own JS treats the response
 // body as a raw integer: >0 is the new id, -1 means "agent account not found" (the real UI asks
 // to confirm saving anyway without a sales entry), anything else is a rejected/failed save.
-async function submitBooking(model, isBooking, { allowSalesEntry = true } = {}) {
+// isDuplicateCheck: true is how the real "Duplicate Booking" action (managebookings.js) tells this
+// same endpoint to insert a brand-new row instead of updating the one model.id points at - confirmed
+// live from the real site's own JS, which resubmits the original record's own id unchanged either
+// way, so this flag (not a zeroed id) is what the server keys off. Defaults to false so every
+// existing caller (new-booking create, quotation convert, field/itinerary edit) is unaffected.
+async function submitBooking(model, isBooking, { allowSalesEntry = true, isDuplicateCheck = false } = {}) {
   const { base, headers } = buildHeaders();
   const body = {
     model,
     type: isBooking,
-    isDuplicateCheck: false,
+    isDuplicateCheck,
     allowSalesEntry,
   };
 

@@ -1043,20 +1043,41 @@ body {
 }
 .pe-field input[type='number']:focus,
 .pe-field input[type='text']:focus { outline: none; border-color: var(--green-600); }
-.pe-due-date-btn {
-  width: 100%;
+.pe-actions {
+  display: flex;
+  gap: 8px;
   margin-top: 12px;
-  border: 1.5px dashed var(--border);
+}
+.pe-action-btn {
   border-radius: 10px;
   padding: 9px 12px;
-  background: var(--mint-50);
-  color: var(--ink);
   font-size: 13px;
   cursor: pointer;
   text-align: left;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
+.pe-due-date-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1.5px dashed var(--border);
+  background: var(--mint-50);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .pe-due-date-btn:hover { background: var(--mint-100); border-color: var(--green-600); }
+/* Narrower than the due-date button (its own label never wraps) - sits second so the more
+   commonly-needed pricing fields stay visually primary and this reads as the escape hatch. */
+.pe-skip-btn {
+  flex: 0 0 auto;
+  border: 1.5px solid var(--border);
+  background: #fff;
+  color: var(--green-700);
+  font-weight: 600;
+  text-align: center;
+}
+.pe-skip-btn:hover { background: var(--mint-100); border-color: var(--green-500); }
 
 /* --- itinerary-item optional-details picker (transfer/sightseeing/restaurant) -----------------
    Same visual shape as .price-extras-box above (this is the same "labelled inputs above the

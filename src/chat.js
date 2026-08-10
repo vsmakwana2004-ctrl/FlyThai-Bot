@@ -9,8 +9,11 @@ const accountTransactions = require('./accountTransactions');
 const financeReports = require('./financeReports');
 const convertBooking = require('./convertBooking');
 const editBooking = require('./editBooking');
+const duplicateBooking = require('./duplicateBooking');
+const bookingEditForms = require('./bookingEditForms');
 const { findBookingById } = require('./bookingApi');
 const { isAnyCancel } = require('./cancel');
+const { findDestinations, listDestinations } = require('./lookups');
 
 // Simple in-memory per-session state (server restarts clear it — fine for an internal tool).
 const sessions = new Map();
@@ -24,7 +27,31 @@ function getSession(sessionId) {
 // True while the session is inside a guided multi-message flow, so the UI can offer a visible
 // "Cancel" button instead of relying on the user knowing the right word to type.
 function isFlowActive(session) {
-  return !!(session.draft || session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingCodeChoice || session.pendingRecordChoice || session.pendingCreateConfirm || session.pendingConvertConfirm || session.pendingFieldEditConfirm);
+  return !!(
+    session.draft ||
+    session.pendingStatusChange ||
+    session.pendingItinerary ||
+    session.pendingDocChoice ||
+    session.pendingHotelChoice ||
+    session.pendingCodeChoice ||
+    session.pendingRecordChoice ||
+    session.pendingCreateConfirm ||
+    session.pendingConvertConfirm ||
+    session.pendingFieldEditConfirm ||
+    session.pendingDuplicateConfirm ||
+    session.pendingPostDuplicateEdit ||
+    session.pendingEditSectionChoice ||
+    session.pendingBasicFieldChoice ||
+    session.pendingHotelRowChoice ||
+    session.pendingFieldValueEntry ||
+    session.pendingDestinationsEntry ||
+    session.pendingHotelFieldChoice ||
+    session.pendingHotelFieldValue ||
+    session.pendingHotelFieldConfirm ||
+    session.pendingFieldSectionChoice ||
+    session.pendingFieldSectionValue ||
+    session.pendingFieldSectionConfirm
+  );
 }
 
 // Hard reset of every guided flow - what the UI's Cancel button calls. Deliberately unconditional
@@ -42,6 +69,19 @@ function cancelFlows(sessionId) {
   session.pendingCreateConfirm = null;
   session.pendingConvertConfirm = null;
   session.pendingFieldEditConfirm = null;
+  session.pendingDuplicateConfirm = null;
+  session.pendingPostDuplicateEdit = null;
+  session.pendingEditSectionChoice = null;
+  session.pendingBasicFieldChoice = null;
+  session.pendingHotelRowChoice = null;
+  session.pendingFieldValueEntry = null;
+  session.pendingDestinationsEntry = null;
+  session.pendingHotelFieldChoice = null;
+  session.pendingHotelFieldValue = null;
+  session.pendingHotelFieldConfirm = null;
+  session.pendingFieldSectionChoice = null;
+  session.pendingFieldSectionValue = null;
+  session.pendingFieldSectionConfirm = null;
   return wasActive;
 }
 
@@ -162,7 +202,27 @@ function distinctRecordCount(rows) {
       codes.add(code.toUpperCase());
     }
   }
-  return sawCodeColumn ? codes.size : null;
+  if (!sawCodeColumn) return null;
+
+  // Not every repeat of a Booking/Quotation ID is a join fan-out of the SAME record - a query about
+  // a child table with many rows per booking (JobSheetMaster: one row per itinerary item, each with
+  // its own lunch/dinner status; PaymentMaster/AccountTransaction: one row per transaction) legitimately
+  // returns several real, distinct records that just happen to share a booking code. Collapsing those
+  // down to "1 per booking" (as below) previously turned "1632 job sheets pending" into a wrong "46
+  // bookings," contradicting the raw row count shown in the side drawer. A genuine surrogate primary
+  // key column (JobSheetId, TransactionId, PaymentId, ...) is 100% unique across the whole result set
+  // by definition - unlike a joined dimension's foreign key (DestinationId, HotelId), which repeats
+  // whenever two different bookings share the same destination/hotel. If one is present, each row is
+  // already its own distinct record - don't merge by booking code.
+  const sample = rows[0] || {};
+  for (const key of Object.keys(sample)) {
+    if (key === 'BookingId' || key === 'QuotationId' || !/Id$/.test(key)) continue;
+    const values = rows.map((r) => r && r[key]).filter((v) => v !== null && v !== undefined);
+    if (values.length !== rows.length) continue;
+    if (new Set(values.map(String)).size === rows.length) return null;
+  }
+
+  return codes.size;
 }
 
 // A join can repeat one booking across many rows, so a naive "first 20 rows" slice can end up
@@ -330,8 +390,8 @@ function answererSystemPrompt() {
 
 MULTI-RECORD LIST ANSWERS — read this before writing any table with more than one data row:
 - The JSON you are given is the complete, already-deduplicated result. Write EXACTLY ONE table row per record in it. If the JSON holds 3 records, the table has exactly 3 data rows — no more, ever.
-- NEVER repeat a record. Two rows with the same Booking/Quotation ID is always a mistake, even if the records look similar. Each ID appears at most once in the whole table.
-- If several JSON rows share the same Booking/Quotation ID, they are ONE booking that a join has split across rows (e.g. one row per destination or per hotel). Merge them into a single table row — combining the differing values into one cell where useful (e.g. "Bangkok, Pattaya") — never list that booking twice.
+- NEVER repeat a record. Two rows with the same Booking/Quotation ID is USUALLY a mistake — UNLESS the COUNTS note appended after the JSON explicitly says the total is a count of distinct records rather than distinct bookings (this happens for child-level data like job sheets, transactions, or payments, where a booking can genuinely have several of its own). In that case each row is its own real record and must get its own table row — do not merge them.
+- Otherwise (no such COUNTS override), if several JSON rows share the same Booking/Quotation ID, they are ONE booking that a join has split across rows (e.g. one row per destination or per hotel). Merge them into a single table row — combining the differing values into one cell where useful (e.g. "Bangkok, Pattaya") — never list that booking twice.
 - Open with the count, e.g. "Found 3 bookings travelling on 02-Aug-2026:", then the table.
 - Once every record has been written, STOP. Do not continue the row pattern, do not pad the table, do not re-list records you have already written.
 - If the data array is empty, clearly say no matching record was found in the database.
@@ -350,10 +410,165 @@ A bullet list of itinerary/inclusion items if present.
 ALWAYS a SINGLE markdown table if costBreakdown rows or costSummary is present — even if there is only ONE traveller-type row, still use a table, NEVER separate "Label: Value" lines for this section. Table columns: Traveller | Pax | Amount. First one row per costBreakdown entry (Type | PAX | Price, computed as Price x PAX shown with the currency), then when costSummary is present append these as further rows in that SAME table (Traveller column blank/"—" for these): Total Cost, ROE, Total After ROE, Discount (INR), Final Amount (INR) — using the exact numbers given in costSummary, never recalculate them yourself.
 ### Payments / Job Sheet / Other
 Any remaining requested data (payment status, job sheet status, transactions, etc.) as short "Label: Value" lines or a small table.
-Use this same structure consistently whether the user asks for "full details," just "status," or a narrower slice (e.g. "hotel details only") — just include only the relevant section(s) in that case, with the same header/table style, not a different format.`;
+Use this same structure consistently whether the user asks for "full details," just "status," or a narrower slice (e.g. "hotel details only") — just include only the relevant section(s) in that case, with the same header/table style, not a different format.
+
+JOB SHEET / VENDOR CONFIRMATION LIST ANSWERS — always use this fixed layout for any question about job sheets, vendor confirmation status, or customer update status (e.g. "today's pending vendor confirmation," "all bookings with vendor confirmation pending," "job sheets with lunch status pending"):
+- One markdown table row per job sheet (JobSheetMaster row) — per the MULTI-RECORD LIST rule above, several job sheets sharing one Booking ID are separate real records here and each gets its own row, never merged.
+- Table columns, in this order, including only the columns the JSON actually has data for: Booking ID | Guest Name | Vendor Name | Travel Date | Vendor Confirmation | Customer Update | Lunch Status | Dinner Status. (BookingSentStatus is "Vendor Confirmation", CustomerSentStatus is "Customer Update".)
+- Open with the count exactly as the COUNTS note instructs (e.g. "Found 46 job sheets with vendor confirmation pending:").`;
 }
 
 const ANY_CODE_RE = /\bFTQ?\d+\b/i;
+
+// Shared one-tap Yes/No confirmation chips - autoSend since each is a complete answer on its own,
+// same convention quickRepliesFor's own yes/no gates (hotelAddAnother, the draft confirm phases)
+// already use, just reused here for the record-level (duplicate/field-edit) confirmations that live
+// outside a booking draft.
+const YES_NO_CHIPS = [
+  { label: 'Yes', value: 'yes', autoSend: true },
+  { label: 'No', value: 'no', autoSend: true },
+];
+
+// "What would you like to update?" top-level menu shown after a duplicate (or any time editing a
+// record is offered as a menu rather than typed from memory) - mirrors the real Edit Booking page's
+// own section layout (Basic Details / Hotel Details / Itinerary Details / General Remarks / Price
+// Details / Extra Note and Emergency Contact) so staff pick a section the same way they would on the
+// real site, then a second chip step narrows to the specific field/form within it.
+const EDIT_SECTION_CHIPS = [
+  { label: 'Basic Details', value: 'basic details', autoSend: true },
+  { label: 'Hotel Details', value: 'hotel details', autoSend: true },
+  { label: 'Itinerary Details', value: 'itinerary details', autoSend: true },
+  { label: 'General Remarks', value: 'general remarks', autoSend: true },
+  { label: 'Price Details', value: 'price details', autoSend: true },
+  { label: 'Extra Note & Emergency Contact', value: 'extra note', autoSend: true },
+  { label: 'Nothing else', value: 'done', autoSend: true },
+];
+
+// Basic Details' own field picker - travel/return date are deliberately still excluded: changing
+// them here wouldn't cascade to the hotel/itinerary rows already dated against the OLD dates (those
+// live in separate tables this patch never touches), which could silently leave a booking with a
+// hotel check-in outside its own travel window. Destinations carries a smaller version of that same
+// risk (a hotel could reference a destination no longer on the list) but is common enough to edit
+// (adding/dropping a stop) that it's included - handled specially below (pendingDestinationsEntry),
+// not through the generic pendingFieldValueEntry text-value path, since it needs the same
+// multi-select checklist + real-record resolution the new-booking creation flow uses.
+const BASIC_FIELD_CHOICE_CHIPS = [
+  { label: 'Guest Name', value: 'guest name', autoSend: true },
+  { label: 'Phone Number', value: 'phone number', autoSend: true },
+  { label: 'Email', value: 'email', autoSend: true },
+  { label: 'Company Name', value: 'company name', autoSend: true },
+  { label: 'Address', value: 'address', autoSend: true },
+  { label: 'Destinations', value: 'destinations', autoSend: true },
+  { label: 'Adults', value: 'adults', autoSend: true },
+  { label: 'Children', value: 'children', autoSend: true },
+  { label: 'Infants', value: 'infants', autoSend: true },
+  { label: 'Back', value: 'back', autoSend: true },
+];
+
+// Matches a BASIC_FIELD_CHOICE_CHIPS pick (or free-typed equivalent) back to the exact field
+// key/label editBooking.js's applySimpleFieldEdit expects - same small explicit list as
+// editBooking.js's own FIELD_ALIASES, kept separate rather than imported so this file's chip
+// wording can stay independent of that file's "update X to Y" sentence-parsing patterns. Does NOT
+// include 'destinations' - that's matched and handled separately (its own resolution step), before
+// this list is even consulted.
+const EDIT_FIELD_KEY_BY_CHOICE = [
+  { pattern: /\bcompany\b/i, key: 'guestCompany', label: 'Company name' },
+  { pattern: /\bphone\b/i, key: 'guestPhoneNumber', label: 'Phone number' },
+  { pattern: /\bemail\b/i, key: 'guestEmail', label: 'Email' },
+  { pattern: /\bguest\s*name\b/i, key: 'guestName', label: 'Guest name' },
+  { pattern: /\baddress\b/i, key: 'guestAddress', label: 'Address' },
+  { pattern: /\badults\b/i, key: 'guestAdults', label: 'Adults' },
+  { pattern: /\bchildren\b/i, key: 'guestChildrens', label: 'Children' },
+  { pattern: /\binfants\b/i, key: 'guestInfants', label: 'Infants' },
+];
+
+// Detects a direct "edit the basic details of FT...", "edit hotel details of FT...", "update
+// booking FT..." style command that should open the SAME section-menu system the post-duplicate
+// offer opens, for an EXISTING record - not just reachable right after duplicating one. Checked
+// after (and so loses to) the more specific detectSimpleFieldEditIntent ("...to <value>") and
+// detectItineraryEditIntent ("add/edit itinerary...") intents further down, which already cover
+// their own narrower phrasing with a direct save, not a menu.
+const EDIT_MENU_VERB_RE = /\b(edit|update|modify|change)\b/i;
+// Read-style questions ("what changed on FT...", "did anything update on FT...") legitimately
+// contain these verbs without being an edit request - bail out on a leading question/lookup word,
+// same guard bookingFlow.js's detectCreateIntent uses for its own read/write ambiguity.
+const EDIT_MENU_READ_LEAD_RE = /^\s*(show|list|display|find|search|fetch|what|which|who|when|where|how\s+many|how\s+much|tell|is|are|do|does|did|has|have)\b/i;
+function detectEditMenuIntent(text, lastBookingCode) {
+  if (EDIT_MENU_READ_LEAD_RE.test(text)) return null;
+  if (!EDIT_MENU_VERB_RE.test(text)) return null;
+  const codeMatch = text.match(ANY_CODE_RE);
+  const code = codeMatch ? codeMatch[0].toUpperCase() : lastBookingCode;
+  if (!code) return null;
+  return { code, sectionText: text };
+}
+
+// Hotel Details' own field picker - single-field-at-a-time like Basic Details, rather than one
+// combined generic form, SPECIFICALLY so Room Category and the two dates get the same real
+// dropdown/calendar UI bookingFlow.js's own hotelCollect step already gives them when adding a NEW
+// hotel (roomType lookup scoped to this exact hotel, date picker bounded to the trip's travel
+// window) - a plain text box for these was a visible step down from how every other lookup-backed
+// field in the app already works.
+const HOTEL_FIELD_CHOICE_CHIPS = [
+  { label: 'Room Category', value: 'room category', autoSend: true },
+  { label: 'Total Rooms', value: 'total rooms', autoSend: true },
+  { label: 'Total Nights', value: 'total nights', autoSend: true },
+  { label: 'Rate Per Night', value: 'rate per night', autoSend: true },
+  { label: 'Check-in Date', value: 'check-in date', autoSend: true },
+  { label: 'Check-out Date', value: 'check-out date', autoSend: true },
+  { label: 'Breakfast', value: 'breakfast', autoSend: true },
+  { label: 'Done', value: 'done', autoSend: true },
+];
+
+const HOTEL_FIELD_KEY_BY_CHOICE = [
+  { pattern: /\broom\s*category\b/i, key: 'roomCategory', label: 'Room Category' },
+  { pattern: /\btotal\s*rooms\b/i, key: 'totalRooms', label: 'Total Rooms' },
+  { pattern: /\btotal\s*nights\b/i, key: 'totalNights', label: 'Total Nights' },
+  { pattern: /\brate\b/i, key: 'ratePerNight', label: 'Rate Per Night' },
+  { pattern: /\bcheck.?in\b/i, key: 'checkInDate', label: 'Check-in Date' },
+  { pattern: /\bcheck.?out\b/i, key: 'checkOutDate', label: 'Check-out Date' },
+  { pattern: /\bbreakfast\b/i, key: 'breakfast', label: 'Breakfast' },
+];
+
+// Price Details / General Remarks / Extra Note & Emergency Contact - like Hotel Details, edited one
+// field at a time (openFieldSection/pendingFieldSectionChoice below) rather than one combined
+// generic form, so a date field gets the real calendar and a yes/no field gets real Yes/No chips
+// instead of typed text - same "look like the real booking flow, not a generic form" standard
+// Hotel/Basic Details already follow. type drives both the `expecting`/quickReplies shown when
+// asking for the value AND how the typed/picked answer is parsed (see pendingFieldSectionValue).
+const FIELD_SECTIONS = {
+  price: {
+    title: 'Price Details',
+    fields: [
+      { key: 'roerate', label: 'ROE Rate', type: 'number' },
+      { key: 'roecharge', label: 'ROE Charge', type: 'number' },
+      { key: 'taxAmount', label: 'Tax Amount', type: 'number' },
+      { key: 'taxPercentage', label: 'Tax %', type: 'number' },
+      { key: 'landSelling', label: 'Land Selling', type: 'number' },
+      { key: 'invoiceDiscount', label: 'Invoice Discount', type: 'number' },
+      { key: 'invoiceDueDate', label: 'Invoice Due Date', type: 'date' },
+    ],
+  },
+  remarks: {
+    title: 'General Remarks',
+    fields: [
+      { key: 'lunchDetails', label: 'Lunch Details', type: 'text' },
+      { key: 'lunchRemarks', label: 'Lunch Remarks', type: 'text' },
+      { key: 'dinnerDetails', label: 'Dinner Details', type: 'text' },
+      { key: 'dinnerRemarks', label: 'Dinner Remarks', type: 'text' },
+    ],
+  },
+  extra: {
+    title: 'Extra Note & Emergency Contact',
+    fields: [
+      { key: 'extraNote', label: 'Extra Note', type: 'text' },
+      { key: 'emergencyContact', label: 'Emergency Contact', type: 'text' },
+      { key: 'bookingBy', label: 'Booked By', type: 'text' },
+      { key: 'isAllowForVoucher', label: 'Allow Voucher PDF', type: 'boolean' },
+      { key: 'isAllowForInvoice', label: 'Allow Invoice PDF', type: 'boolean' },
+      { key: 'isAllowForItinerary', label: 'Allow Itinerary PDF', type: 'boolean' },
+    ],
+  },
+};
 
 // The itinerary/hotel-voucher "which logo version?" question - same fixed 3-way choice every
 // time. Shown as chips (quickReplies) rather than the lookup dropdown, but unlike every other
@@ -522,11 +737,80 @@ function quickRepliesFor(draft) {
   if (draft && draft.phase === 'agentPasteConfirm') {
     return ['Yes, use these', 'No, enter manually'];
   }
-  if (draft && draft.phase === 'hotelOptionalCollect') {
-    return ['Skip', 'Breakfast included', 'No breakfast', 'Single sharing', 'Double sharing', 'Triple sharing'];
+  // The guest's phone/email steps offer a "reply same to use the agent's own number/email"
+  // shortcut (see bookingFlow.js's basicStepPrompt) - a one-tap chip beats typing "same" from
+  // memory, and showing the actual number/email in the chip label means the value isn't hidden
+  // behind the word "same". {label, value} lets the chip show the descriptive label while still
+  // sending exactly "same" - the one word bookingFlow.js's stepBasic actually checks for.
+  // autoSend: true because this is a single complete answer (not one of several fields to combine
+  // in one message, the way the hotelOptionalCollect chips below are) - clicking it should submit
+  // immediately, not just fill the box and wait for Send.
+  if (draft && draft.phase === 'basic') {
+    const next = bookingFlow.nextBasicStep(draft);
+    if (next === 'guestPhoneNumber' && draft.resolvedAgent && draft.resolvedAgent.Phone) {
+      return [{ label: `Same as agent (${draft.resolvedAgent.Phone})`, value: 'same', autoSend: true }];
+    }
+    if (next === 'guestEmail' && draft.resolvedAgent && draft.resolvedAgent.Email) {
+      return [{ label: `Same as agent (${draft.resolvedAgent.Email})`, value: 'same', autoSend: true }];
+    }
   }
+  // Same "reply same" shortcut for a hotel row's rate-per-night, when the selected room type has
+  // its own known rate (see hotelStepPrompt's 'ratePerNight' case).
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'ratePerNight' && draft.currentHotelDraft && draft.currentHotelDraft._roomTypeRate != null) {
+    const h = draft.currentHotelDraft;
+    const currency = h._roomTypeCurrency || draft.fields.currency || 'THB';
+    return [{ label: `Same as room type (${h._roomTypeRate} ${currency})`, value: 'same', autoSend: true }];
+  }
+  if (draft && draft.phase === 'hotelOptionalCollect') {
+    // Skip is its own complete answer (there's nothing left to combine it with) so it submits
+    // immediately - the other chips here stay fill-the-box, since picking one shouldn't cut off
+    // the chance to also add another (e.g. "Breakfast included" + "Double sharing" together).
+    return [
+      { label: 'Skip', value: 'skip', autoSend: true },
+      'Breakfast included',
+      'No breakfast',
+      'Single sharing',
+      'Double sharing',
+      'Triple sharing',
+    ];
+  }
+  // "Add another hotel?" is a plain yes/no gate - single-tap, auto-send.
+  if (draft && draft.phase === 'hotelAddAnother') {
+    return [
+      { label: 'Yes', value: 'yes', autoSend: true },
+      { label: 'No', value: 'no', autoSend: true },
+    ];
+  }
+  // The FIRST itinerary question (askItineraryChoice) offers 5 forks, each a complete answer -
+  // auto-send like the other forks above.
+  if (draft && draft.phase === 'itineraryChoice' && draft.itineraryItems && draft.itineraryItems.length === 0) {
+    return [
+      { label: 'Transfer', value: 'transfer', autoSend: true },
+      { label: 'Sightseeing', value: 'sightseeing', autoSend: true },
+      { label: 'Restaurant', value: 'restaurant', autoSend: true },
+      { label: 'Leisure Day', value: 'leisure day', autoSend: true },
+      { label: 'Self-booked', value: 'self-booked', autoSend: true },
+    ];
+  }
+  // Once at least one item exists, this same phase re-asks via askAddMoreItinerary instead
+  // (different wording, "done" instead of self-booked) - Done leads since staff wrap up an
+  // itinerary far more often than they add a 3rd/4th item at this point.
+  if (draft && draft.phase === 'itineraryChoice' && draft.itineraryItems && draft.itineraryItems.length > 0) {
+    return [
+      { label: 'Done', value: 'done', autoSend: true },
+      { label: 'Transfer', value: 'transfer', autoSend: true },
+      { label: 'Sightseeing', value: 'sightseeing', autoSend: true },
+      { label: 'Restaurant', value: 'restaurant', autoSend: true },
+      { label: 'Leisure Day', value: 'leisure day', autoSend: true },
+    ];
+  }
+  // Self-booked vs add-details is a fork, not a field to combine with anything else - auto-send
+  // like the phone/email "Same as..." chips above.
   if (draft && draft.phase === 'hotelChoice') {
-    return ['Self-booked', 'Add hotel details'];
+    return [
+      { label: 'Self-booked', value: 'self-booked', autoSend: true },
+      { label: 'Add hotel details', value: 'add hotel details', autoSend: true },
+    ];
   }
   // Traveller-type field: the real site's own #member-type autocomplete only ever offers these six
   // values (managebookings.js bindMemberType()) - chips beat typing one out from memory.
@@ -536,20 +820,45 @@ function quickRepliesFor(draft) {
   // First entry into pricing collection - "Skip" is a one-tap way out for staff with nothing to
   // add (the form below has no submit button of its own for an all-blank answer); "Add pricing
   // line" mirrors what typing anything other than a "no" here already does in stepPriceCollect.
-  if (draft && draft.phase === 'priceCollect' && !draft.currentItemDraft) return ['Skip', 'Add pricing line'];
+  // Both are complete forks on their own - auto-send.
+  if (draft && draft.phase === 'priceCollect' && !draft.currentItemDraft) {
+    return [
+      { label: 'Skip', value: 'skip', autoSend: true },
+      { label: 'Add pricing line', value: 'add pricing line', autoSend: true },
+    ];
+  }
   if (draft && draft.phase === 'priceExtras') return ['Skip'];
   // Gate before the final note/emergency-contact/booked-by/PDF-permission form - most bookings
   // need none of it, so "Skip" goes straight to confirm without ever opening the form.
-  if (draft && draft.phase === 'extraGate') return ['Skip', 'Yes, add details'];
+  if (draft && draft.phase === 'extraGate') {
+    return [
+      { label: 'Skip', value: 'skip', autoSend: true },
+      { label: 'Yes, add details', value: 'yes, add details', autoSend: true },
+    ];
+  }
   if (draft && draft.phase === 'extraCollect') return ['Skip'];
   // Same gate-then-form pattern for each itinerary item's own optional details (time/vehicles/
   // price for a transfer, adults/children for sightseeing, lunch/dinner counts for a restaurant) -
-  // most items need none of it, so "Skip" on the gate skips straight to "item added".
+  // most items need none of it, so "Skip" on the gate skips straight to "item added". Both replies
+  // are complete answers on their own (yes opens the form below, no reason to hold off sending) -
+  // auto-send, same as extraGate above.
   if (draft && (draft.phase === 'transferOptionalGate' || draft.phase === 'sightseeingOptionalGate' || draft.phase === 'restaurantOptionalGate')) {
-    return ['Skip', 'Yes, add details'];
+    return [
+      { label: 'Skip', value: 'skip', autoSend: true },
+      { label: 'Yes, add details', value: 'yes, add details', autoSend: true },
+    ];
   }
   if (draft && (draft.phase === 'transferOptionalCollect' || draft.phase === 'sightseeingOptionalCollect' || draft.phase === 'restaurantOptionalCollect')) {
     return ['Skip'];
+  }
+  // Final "Reply yes to save this, or no to cancel" confirmation (buildConfirmationSummary/
+  // stepConfirm in bookingFlow.js) - a plain yes/no gate like hotelAddAnother above, so it gets
+  // the same one-tap auto-send chips instead of making staff type "yes"/"no" by hand.
+  if (draft && (draft.phase === 'confirm' || draft.phase === 'confirmNoSalesEntry' || draft.phase === 'confirmItineraryEdit')) {
+    return [
+      { label: 'Yes', value: 'yes', autoSend: true },
+      { label: 'No', value: 'no', autoSend: true },
+    ];
   }
   return null;
 }
@@ -575,7 +884,7 @@ async function handleChat(sessionId, userMessage) {
 // session.pendingRecordChoice so the next message can resume the right flow via resumeRecordChoice.
 function askWhichRecord(sessionId, session, userMessage, code, matches, kind, extra) {
   const list = matches.map((m, i) => `${i + 1}. ${documents.describeMatch(m)}`).join('\n');
-  const reply = `More than one record uses the code **${code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`;
+  const reply = `More than one record matches **${code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`;
   session.pendingRecordChoice = { code, matches, kind, extra };
   pushTurn(sessionId, userMessage, reply);
   return { answer: reply, sql: null, rowCount: 0 };
@@ -608,14 +917,27 @@ function finishConvertResult(sessionId, session, userMessage, result) {
 
 // Finishes a simple field-edit resolve (not_found/ok) - shared by the fresh fieldEditIntent path
 // and the post-disambiguation continuation in resumeRecordChoice. `intentLike` just needs
-// .code/.field/.label/.value.
+// .code/.field/.label/.value, plus optionally .displayValue (shown in messages instead of .value,
+// for a field like destinations where the saved value - a comma Id list - isn't what a human should
+// read back).
+// Resolves a raw booking's comma-Id "destinations" string (e.g. "9,1") into real {Id, Name,
+// ShortCode} rows, for pre-checking the destination checklist with the booking's CURRENT selection
+// rather than starting it blank the way new-booking creation's own destinationNames step does.
+async function resolveDestinationIdsToNames(destinationsCsv) {
+  const ids = new Set((destinationsCsv || '').split(',').map((s) => s.trim()).filter(Boolean));
+  if (ids.size === 0) return [];
+  const all = await listDestinations('');
+  return all.filter((d) => ids.has(String(d.Id)));
+}
+
 function finishFieldEditResolve(sessionId, session, userMessage, resolved, intentLike) {
   if (resolved.status === 'not_found') {
     const reply = `I couldn't find any booking or quotation matching **${intentLike.code}** in the database.`;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0 };
   }
-  const reply = `Set **${intentLike.label}** for **${resolved.code}** (${resolved.guestName}) to "${intentLike.value}"? (yes/no)`;
+  const shown = intentLike.displayValue != null ? intentLike.displayValue : intentLike.value;
+  const reply = `Set **${intentLike.label}** for **${resolved.code}** (${resolved.guestName}) to "${shown}"? (yes/no)`;
   session.pendingFieldEditConfirm = {
     code: resolved.code,
     guestName: resolved.guestName,
@@ -623,9 +945,136 @@ function finishFieldEditResolve(sessionId, session, userMessage, resolved, inten
     fieldKey: intentLike.field,
     label: intentLike.label,
     value: intentLike.value,
+    displayValue: intentLike.displayValue,
+    // Only set when this edit was reached via BASIC_FIELD_CHOICE_CHIPS (pendingFieldValueEntry
+    // below) - true for that path, absent for the plain typed-from-scratch "update X to Y" path
+    // further down, so only the menu-driven edit loops back to "anything else?" on success; a
+    // one-off typed edit keeps its existing one-and-done behavior.
+    viaMenu: !!intentLike.viaMenu,
   };
   pushTurn(sessionId, userMessage, reply);
-  return { answer: reply, sql: null, rowCount: 0 };
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+}
+
+// After any menu-driven edit saves successfully, loop back to the top-level section menu instead
+// of ending the chain - lets staff make several changes to the same record in one go.
+function editSectionMenuAgain(sessionId, session, userMessage, doneMessage, code, guestName) {
+  session.pendingEditSectionChoice = { code, guestName };
+  const reply = `${doneMessage} Anything else you'd like to update on **${code}**?`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+}
+
+// Opens whichever section `sectionText` names (basic/hotel/itinerary/price/remarks/extra), or the
+// top-level EDIT_SECTION_CHIPS menu if none is named - the single place both entry points into this
+// whole edit-menu system route through: the post-duplicate offer (pendingPostDuplicateEdit),
+// EDIT_SECTION_CHIPS replies (pendingEditSectionChoice), AND a direct "edit the basic details of
+// FT..." command typed from scratch (detectEditMenuIntent below), so a section named up front jumps
+// straight to it instead of always showing the menu first. isReask=true only changes the "didn't
+// understand" wording (pendingEditSectionChoice re-asking after an unclear reply reads oddly as a
+// fresh "what would you like to update" greeting).
+async function openEditSection(sessionId, session, userMessage, code, guestName, sectionText, isReask) {
+  const t = sectionText.trim().toLowerCase();
+  if (/\bdone\b|\bnothing\b|\bno(ne|thing)?\b/.test(t)) {
+    const reply = `Okay, no changes made to **${code}**.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (/\bbasic\b/.test(t)) {
+    session.pendingBasicFieldChoice = { code, guestName };
+    const reply = `Which basic detail would you like to update on **${code}**?`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: BASIC_FIELD_CHOICE_CHIPS };
+  }
+  if (/\bitinerary\b/.test(t)) {
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, code, resolved.matches, 'itineraryEdit', {});
+    }
+    return finishItineraryEditResolve(sessionId, session, userMessage, resolved, code);
+  }
+  if (/\bhotel\b/.test(t)) {
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const hotels = resolved.raw.hotelDetails || [];
+    if (hotels.length === 0) {
+      const reply = `**${code}** is self-booked for hotel — there's no hotel entry to edit.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    if (hotels.length === 1) {
+      return openHotelFieldChoice(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw, 0);
+    }
+    session.pendingHotelRowChoice = { code: resolved.code, guestName: resolved.guestName, raw: resolved.raw };
+    const reply = `**${resolved.code}** has more than one hotel — which one would you like to update?`;
+    pushTurn(sessionId, userMessage, reply);
+    return {
+      answer: reply,
+      sql: null,
+      rowCount: 0,
+      quickReplies: hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+    };
+  }
+  if (/\bprice\b/.test(t)) {
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return openFieldSection(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw, 'price');
+  }
+  if (/\bremarks\b/.test(t)) {
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return openFieldSection(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw, 'remarks');
+  }
+  if (/\bextra\b|\bemergency\b/.test(t)) {
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return openFieldSection(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw, 'extra');
+  }
+  session.pendingEditSectionChoice = { code, guestName };
+  const reply = isReask
+    ? `Sorry, I didn't catch that — please pick one of the options below for **${code}**.`
+    : `What would you like to update on **${code}** (${guestName})?`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+}
+
+// Opens the Hotel Details field picker for one specific hotel row (already resolved - either the
+// booking's only hotel, or the one just chosen from pendingHotelRowChoice).
+function openHotelFieldChoice(sessionId, session, userMessage, code, guestName, raw, hotelIndex) {
+  session.pendingHotelFieldChoice = { code, guestName, raw, hotelIndex };
+  const hotel = raw.hotelDetails[hotelIndex];
+  const reply = `Which detail of **${hotel.name}** would you like to update on **${code}**?`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: HOTEL_FIELD_CHOICE_CHIPS };
+}
+
+// Opens a FIELD_SECTIONS field picker (price/remarks/extra) - the flat-field counterpart to
+// openHotelFieldChoice above (these patch a top-level raw key directly, not a nested hotelDetails
+// row, so they share one generic implementation instead of three near-identical copies).
+function openFieldSection(sessionId, session, userMessage, code, guestName, raw, sectionKey) {
+  const section = FIELD_SECTIONS[sectionKey];
+  session.pendingFieldSectionChoice = { code, guestName, raw, sectionKey };
+  const reply = `Which **${section.title}** field would you like to update on **${code}**?`;
+  pushTurn(sessionId, userMessage, reply);
+  const chips = section.fields.map((f) => ({ label: f.label, value: f.label.toLowerCase(), autoSend: true }));
+  chips.push({ label: 'Done', value: 'done', autoSend: true });
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: chips };
 }
 
 // Finishes an itinerary-edit resolve (not_found/ok) - shared by the fresh itineraryEditIntent path
@@ -641,6 +1090,22 @@ function finishItineraryEditResolve(sessionId, session, userMessage, resolved, f
   const reply = `Let's add itinerary details to **${resolved.code}** (${resolved.guestName}).\n\n${bookingFlow.askItineraryChoice()}`;
   pushTurn(sessionId, userMessage, reply);
   return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Finishes a duplicate-booking resolve (not_found/ok) - shared by the fresh duplicateIntent path
+// and the post-disambiguation continuation in resumeRecordChoice.
+function finishDuplicateResolve(sessionId, session, userMessage, resolved, fallbackCode) {
+  if (resolved.status === 'not_found') {
+    const reply = `I couldn't find any booking or quotation matching **${fallbackCode}** in the database.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  const booking = resolved.booking;
+  const code = booking.BookingId || booking.QuotationId;
+  const reply = `Duplicate **${code}** (${booking.GuestName})? This creates a brand-new ${booking.IsBooking ? 'booking' : 'quotation'} with the exact same details, which you can then edit.`;
+  session.pendingDuplicateConfirm = { code, guestName: booking.GuestName, internalId: booking.Id };
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
 }
 
 // Resumes whichever flow asked "which one did you mean?" (session.pendingRecordChoice) once the
@@ -659,6 +1124,18 @@ async function resumeRecordChoice(sessionId, session, pending, chosen, userMessa
     const resolved = await editBooking.resolveForEditBooking(chosen);
     return finishItineraryEditResolve(sessionId, session, userMessage, resolved, pending.code);
   }
+  if (pending.kind === 'duplicate') {
+    return finishDuplicateResolve(sessionId, session, userMessage, { status: 'ok', booking: chosen }, pending.code);
+  }
+  if (pending.kind === 'editMenu') {
+    const resolved = await editBooking.resolveForEditBooking(chosen);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${pending.code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return openEditSection(sessionId, session, userMessage, resolved.code, resolved.guestName, pending.extra.sectionText, false);
+  }
   // 'statusUpdate'
   const result = await statusUpdate.startWithBooking(chosen, pending.extra.userMessage);
   session.pendingStatusChange = result.pending;
@@ -672,7 +1149,30 @@ async function handleChatInner(sessionId, userMessage) {
   // Any pending question ("which logo?", "which status?") is a dead end if the user changes their
   // mind — each of those handlers just re-asks forever on an unrecognised reply. One shared check
   // in front of all of them means "cancel" always works, whatever we happen to be waiting on.
-  if ((session.pendingStatusChange || session.pendingItinerary || session.pendingDocChoice || session.pendingHotelChoice || session.pendingCodeChoice || session.pendingRecordChoice || session.pendingConvertConfirm || session.pendingFieldEditConfirm) && isAnyCancel(userMessage)) {
+  if (
+    (session.pendingStatusChange ||
+      session.pendingItinerary ||
+      session.pendingDocChoice ||
+      session.pendingHotelChoice ||
+      session.pendingCodeChoice ||
+      session.pendingRecordChoice ||
+      session.pendingConvertConfirm ||
+      session.pendingFieldEditConfirm ||
+      session.pendingDuplicateConfirm ||
+      session.pendingPostDuplicateEdit ||
+      session.pendingEditSectionChoice ||
+      session.pendingBasicFieldChoice ||
+      session.pendingHotelRowChoice ||
+      session.pendingFieldValueEntry ||
+      session.pendingDestinationsEntry ||
+      session.pendingHotelFieldChoice ||
+      session.pendingHotelFieldValue ||
+      session.pendingHotelFieldConfirm ||
+      session.pendingFieldSectionChoice ||
+      session.pendingFieldSectionValue ||
+      session.pendingFieldSectionConfirm) &&
+    isAnyCancel(userMessage)
+  ) {
     cancelFlows(sessionId);
     const reply = 'Okay, cancelled — nothing was changed. What would you like to know?';
     pushTurn(sessionId, userMessage, reply);
@@ -852,17 +1352,271 @@ async function handleChatInner(sessionId, userMessage) {
     return finishConvertResult(sessionId, session, userMessage, result);
   }
 
-  // A "set this field to X?" confirmation was asked last turn - this message answers it.
-  if (session.pendingFieldEditConfirm) {
-    const { code, guestName, raw, fieldKey, label, value } = session.pendingFieldEditConfirm;
-    session.pendingFieldEditConfirm = null;
+  // A "duplicate this booking?" confirmation was asked last turn - this answers it.
+  if (session.pendingDuplicateConfirm) {
+    const { code, guestName, internalId, allowSalesEntry = true } = session.pendingDuplicateConfirm;
+    session.pendingDuplicateConfirm = null;
     const yn = bookingFlow.parseYesNo(userMessage);
     if (yn === true) {
       try {
-        await editBooking.applySimpleFieldEdit(raw, fieldKey, value);
-        const reply = `Done — ${label} for **${code}** (${guestName}) is now "${value}".`;
+        const created = await duplicateBooking.performDuplicate(internalId, { allowSalesEntry });
+        const newCode = created ? created.BookingId || created.QuotationId : null;
+        if (newCode) session.lastBookingCode = newCode;
+        const reply = `Done — duplicated **${code}** (${guestName}) into a new record${newCode ? ` (**${newCode}**)` : ''}. Do you want to edit anything on it?`;
+        // Rather than leaving "what to update" as a free-text question, offer it as its own
+        // yes/no-then-menu step (pendingPostDuplicateEdit below) - the point of chip-driving this
+        // whole chain is that nothing after "duplicate" requires typing a field name from memory.
+        session.pendingPostDuplicateEdit = newCode ? { code: newCode, guestName } : null;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0, quickReplies: newCode ? YES_NO_CHIPS : undefined };
+      } catch (err) {
+        if (err.code === 'AGENT_ACCOUNT_NOT_FOUND') {
+          const reply = `**${code}**'s agent account wasn't found, so duplicating it would skip creating a sales entry. Duplicate anyway without a sales entry?`;
+          session.pendingDuplicateConfirm = { code, guestName, internalId, allowSalesEntry: false };
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+        }
+        throw err;
+      }
+    }
+    if (yn === false) {
+      const reply = `Okay, cancelled — **${code}** was not duplicated.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const reply = `Reply "yes" to duplicate **${code}**, or "no" to cancel.`;
+    session.pendingDuplicateConfirm = { code, guestName, internalId };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // "Do you want to edit anything on it?" (asked right after a duplicate succeeds) - this answers
+  // it. Yes opens the section-choice menu below; a clear no ends the chain; anything unclear re-asks.
+  if (session.pendingPostDuplicateEdit) {
+    const { code, guestName } = session.pendingPostDuplicateEdit;
+    session.pendingPostDuplicateEdit = null;
+    const yn = bookingFlow.parseYesNo(userMessage);
+    if (yn === true) {
+      session.pendingEditSectionChoice = { code, guestName };
+      const reply = `What would you like to update on **${code}** (${guestName})?`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+    }
+    if (yn === false) {
+      const reply = `Okay, no changes made to **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const reply = `Reply "yes" to edit **${code}**, or "no" to leave it as is.`;
+    session.pendingPostDuplicateEdit = { code, guestName };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // "What would you like to update?" TOP-LEVEL menu (EDIT_SECTION_CHIPS) was just shown - mirrors
+  // the real Edit Booking page's own sections. Itinerary hands off to the existing guided
+  // itinerary-edit draft; Basic Details, Hotel Details, Price Details, General Remarks, and Extra
+  // Note & Emergency Contact each open their own field sub-menu (openEditSection below); "Nothing
+  // else" ends the chain.
+  if (session.pendingEditSectionChoice) {
+    const { code, guestName } = session.pendingEditSectionChoice;
+    session.pendingEditSectionChoice = null;
+    return openEditSection(sessionId, session, userMessage, code, guestName, userMessage, true);
+  }
+
+  // BASIC_FIELD_CHOICE_CHIPS menu was just shown - a simple field asks for its new value next
+  // (pendingFieldValueEntry below); "Back" returns to the top-level section menu.
+  if (session.pendingBasicFieldChoice) {
+    const { code, guestName } = session.pendingBasicFieldChoice;
+    session.pendingBasicFieldChoice = null;
+    const t = userMessage.trim().toLowerCase();
+    if (/\bback\b/.test(t)) {
+      session.pendingEditSectionChoice = { code, guestName };
+      const reply = `What would you like to update on **${code}** (${guestName})?`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+    }
+    // Destinations gets the same multi-select checklist expectingField(draft) shows during
+    // new-booking creation's own destinationNames step (public/app.js's 'destination' lookup, ticked
+    // checkboxes) - pre-checked here with the booking's CURRENT destinations (unlike the blank-start
+    // creation-time checklist) so staff see and adjust the existing selection instead of re-picking
+    // from scratch. Handled separately from EDIT_FIELD_KEY_BY_CHOICE because the saved value has to
+    // be real resolved Destination Ids (comma-joined), not whatever text was typed/ticked.
+    if (/\bdestinations?\b/.test(t)) {
+      const resolved = await editBooking.resolveForEdit(code);
+      if (resolved.status !== 'ok') {
+        const reply = `I couldn't find **${code}** in the database.`;
         pushTurn(sessionId, userMessage, reply);
         return { answer: reply, sql: null, rowCount: 0 };
+      }
+      const preselected = await resolveDestinationIdsToNames(resolved.raw.destinations);
+      session.pendingDestinationsEntry = { code: resolved.code, guestName: resolved.guestName, raw: resolved.raw };
+      const reply = `Which destinations should **${resolved.code}** cover? Tick to change the selection, then press Enter/Send.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, expecting: { field: 'destination', multi: true, preselected } };
+    }
+    const field = EDIT_FIELD_KEY_BY_CHOICE.find((f) => f.pattern.test(t));
+    if (field) {
+      session.pendingFieldValueEntry = { code, guestName, fieldKey: field.key, label: field.label };
+      const reply = `What should the new **${field.label}** be for **${code}**?`;
+      pushTurn(sessionId, userMessage, reply);
+      // Company name gets the same live agent-lookup dropdown expectingField(draft) shows during
+      // new-booking creation's own agentName step (public/app.js's LOOKUP_ENDPOINTS.agent) - picking
+      // an item there auto-sends its Name as plain text, landing on pendingFieldValueEntry below
+      // exactly like typing it would have. Missing here before - this field silently fell back to a
+      // bare text box with no dropdown, unlike every other lookup-backed field in the app.
+      const expecting = field.key === 'guestCompany' ? { field: 'agent' } : undefined;
+      return { answer: reply, sql: null, rowCount: 0, expecting };
+    }
+    session.pendingBasicFieldChoice = { code, guestName };
+    const reply = `Sorry, I didn't catch that — please pick one of the options below for **${code}**.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: BASIC_FIELD_CHOICE_CHIPS };
+  }
+
+  // The destination checklist submission - same comma/and/& split and findDestinations()
+  // resolution bookingFlow.js's own destinationNames step uses, so a bad/ambiguous name is rejected
+  // here exactly like it would be during new-booking creation, never silently attaching the wrong
+  // destination Id to a real record.
+  if (session.pendingDestinationsEntry) {
+    const { code, guestName, raw } = session.pendingDestinationsEntry;
+    session.pendingDestinationsEntry = null;
+    const names = userMessage
+      .split(/,| and | & /i)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const reask = async (problem) => {
+      const preselected = await resolveDestinationIdsToNames(raw.destinations);
+      session.pendingDestinationsEntry = { code, guestName, raw };
+      const reply = `${problem} Please try again for **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, expecting: { field: 'destination', multi: true, preselected } };
+    };
+    if (names.length === 0) return reask('Please select at least one destination.');
+    const { matches, notFound } = await findDestinations(names);
+    const ambiguous = matches.filter((m) => m.ambiguous);
+    if (notFound.length > 0) return reask(`I couldn't find a destination matching: ${notFound.join(', ')}.`);
+    if (ambiguous.length > 0) {
+      const opts = ambiguous.map((a) => `"${a.name}" could be: ${a.options.map((o) => o.Name).join(', ')}`).join('; ');
+      return reask(`A couple of destinations are ambiguous: ${opts}.`);
+    }
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status !== 'ok') {
+      const reply = `I couldn't find **${code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return finishFieldEditResolve(sessionId, session, userMessage, resolved, {
+      code,
+      field: 'destinations',
+      label: 'Destinations',
+      value: matches.map((m) => m.Id).join(','),
+      displayValue: matches.map((m) => m.Name).join(', '),
+      viaMenu: true,
+    });
+  }
+
+  // Which hotel row (only shown when a booking has more than one hotel) - this answers it, then
+  // opens that row's edit form the same way the single-hotel case does directly.
+  if (session.pendingHotelRowChoice) {
+    const { code, guestName, raw } = session.pendingHotelRowChoice;
+    session.pendingHotelRowChoice = null;
+    const hotels = raw.hotelDetails || [];
+    const n = Number(userMessage.trim());
+    if (!Number.isInteger(n) || n < 1 || n > hotels.length) {
+      session.pendingHotelRowChoice = { code, guestName, raw };
+      const reply = `Please pick one of the hotels below for **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return {
+        answer: reply,
+        sql: null,
+        rowCount: 0,
+        quickReplies: hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+      };
+    }
+    return openHotelFieldChoice(sessionId, session, userMessage, code, guestName, raw, n - 1);
+  }
+
+  // HOTEL_FIELD_CHOICE_CHIPS menu was just shown - Room Category gets the real room-type dropdown
+  // (scoped to this hotel's own hotelId, same lookup bookingFlow.js's hotelCollect step uses when
+  // adding a new hotel); Check-in/Check-out get the real calendar, bounded to the booking's own
+  // travel/return window (raw.travelDate/returnDate are already ISO - GetBookingById's own shape,
+  // exactly what the date picker's min/max expect, no conversion needed); Breakfast gets its own
+  // two-tap chips; everything else is plain text/number (no real lookup exists for these even in
+  // bookingFlow.js's own creation-time flow). "Done" returns to the top-level section menu.
+  if (session.pendingHotelFieldChoice) {
+    const { code, guestName, raw, hotelIndex } = session.pendingHotelFieldChoice;
+    session.pendingHotelFieldChoice = null;
+    const t = userMessage.trim().toLowerCase();
+    if (/\bdone\b/.test(t)) {
+      session.pendingEditSectionChoice = { code, guestName };
+      const reply = `What would you like to update on **${code}** (${guestName})?`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+    }
+    const field = HOTEL_FIELD_KEY_BY_CHOICE.find((f) => f.pattern.test(t));
+    if (field) {
+      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey: field.key, label: field.label };
+      const hotel = raw.hotelDetails[hotelIndex];
+      const reply = `What should the new **${field.label}** be for **${hotel.name}** on **${code}**?`;
+      pushTurn(sessionId, userMessage, reply);
+      if (field.key === 'roomCategory' && hotel.hotelId) {
+        return { answer: reply, sql: null, rowCount: 0, expecting: { field: 'roomType', params: { hotelId: hotel.hotelId } } };
+      }
+      if (field.key === 'checkInDate' || field.key === 'checkOutDate') {
+        return { answer: reply, sql: null, rowCount: 0, expecting: { field: 'date', params: { min: raw.travelDate, max: raw.returnDate } } };
+      }
+      if (field.key === 'breakfast') {
+        return {
+          answer: reply,
+          sql: null,
+          rowCount: 0,
+          quickReplies: [
+            { label: 'Breakfast Included', value: 'Breakfast included', autoSend: true },
+            { label: 'No Breakfast', value: 'No breakfast', autoSend: true },
+          ],
+        };
+      }
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    session.pendingHotelFieldChoice = { code, guestName, raw, hotelIndex };
+    const reply = `Sorry, I didn't catch that — please pick one of the options below.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: HOTEL_FIELD_CHOICE_CHIPS };
+  }
+
+  // The new value for whichever hotel field was picked (typed, or from the roomType/date/breakfast
+  // UI above) - confirm before saving.
+  if (session.pendingHotelFieldValue) {
+    const { code, guestName, raw, hotelIndex, fieldKey, label } = session.pendingHotelFieldValue;
+    session.pendingHotelFieldValue = null;
+    const value = userMessage.trim();
+    const isNumericField = fieldKey === 'totalRooms' || fieldKey === 'totalNights' || fieldKey === 'ratePerNight';
+    if (!value || (isNumericField && !Number.isFinite(Number(value)))) {
+      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey, label };
+      const reply = isNumericField ? `**${label}** needs to be a number — please try again.` : `Please provide a value for **${label}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const patchValue = isNumericField ? Number(value) : value;
+    const hotel = raw.hotelDetails[hotelIndex];
+    const reply = `Set **${label}** for **${hotel.name}** on **${code}** to "${value}"? (yes/no)`;
+    session.pendingHotelFieldConfirm = { code, guestName, raw, hotelIndex, fieldKey, label, value: patchValue };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // "Save this hotel change?" confirmation - patches just this one hotel row and resubmits the
+  // whole record in place (same saveRawPatch used by the other section edits).
+  if (session.pendingHotelFieldConfirm) {
+    const { code, guestName, raw, hotelIndex, fieldKey, label, value } = session.pendingHotelFieldConfirm;
+    session.pendingHotelFieldConfirm = null;
+    const yn = bookingFlow.parseYesNo(userMessage);
+    if (yn === true) {
+      try {
+        const hotelDetails = raw.hotelDetails.map((h, i) => (i === hotelIndex ? { ...h, [fieldKey]: value } : h));
+        await bookingEditForms.saveRawPatch(raw, { hotelDetails });
+        return editSectionMenuAgain(sessionId, session, userMessage, `Done — ${label} for **${code}** is now "${value}".`, code, guestName);
       } catch (err) {
         const reply = `Sorry, saving that failed: ${err.message}`;
         pushTurn(sessionId, userMessage, reply);
@@ -874,10 +1628,175 @@ async function handleChatInner(sessionId, userMessage) {
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
     }
-    const reply = `Reply "yes" to set ${label} for **${code}** to "${value}", or "no" to cancel.`;
-    session.pendingFieldEditConfirm = { code, guestName, raw, fieldKey, label, value };
+    const reply = `Reply "yes" to set ${label} to "${value}", or "no" to cancel.`;
+    session.pendingHotelFieldConfirm = { code, guestName, raw, hotelIndex, fieldKey, label, value };
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // A FIELD_SECTIONS chip menu (price/remarks/extra, opened by openFieldSection()) was just shown -
+  // "Done" returns to the top-level section menu; picking a field asks for its new value next
+  // (pendingFieldSectionValue below), with the real calendar for a date field or real Yes/No chips
+  // for a boolean one (PDF permissions), matching Hotel/Basic Details' own per-type treatment.
+  if (session.pendingFieldSectionChoice) {
+    const { code, guestName, raw, sectionKey } = session.pendingFieldSectionChoice;
+    session.pendingFieldSectionChoice = null;
+    const section = FIELD_SECTIONS[sectionKey];
+    const t = userMessage.trim().toLowerCase();
+    if (/\bdone\b/.test(t)) {
+      session.pendingEditSectionChoice = { code, guestName };
+      const reply = `What would you like to update on **${code}** (${guestName})?`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, quickReplies: EDIT_SECTION_CHIPS };
+    }
+    const field = section.fields.find((f) => t.includes(f.label.toLowerCase()));
+    if (field) {
+      session.pendingFieldSectionValue = { code, guestName, raw, sectionKey, fieldKey: field.key, label: field.label, type: field.type };
+      const reply = `What should the new **${field.label}** be for **${code}**?`;
+      pushTurn(sessionId, userMessage, reply);
+      if (field.type === 'date') {
+        return { answer: reply, sql: null, rowCount: 0, expecting: { field: 'date' } };
+      }
+      if (field.type === 'boolean') {
+        return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+      }
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    session.pendingFieldSectionChoice = { code, guestName, raw, sectionKey };
+    const reply = `Sorry, I didn't catch that — please pick one of the options below.`;
+    pushTurn(sessionId, userMessage, reply);
+    const chips = section.fields.map((f) => ({ label: f.label, value: f.label.toLowerCase(), autoSend: true }));
+    chips.push({ label: 'Done', value: 'done', autoSend: true });
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: chips };
+  }
+
+  // The new value for whichever price/remarks/extra field was picked - confirm before saving.
+  if (session.pendingFieldSectionValue) {
+    const { code, guestName, raw, sectionKey, fieldKey, label, type } = session.pendingFieldSectionValue;
+    session.pendingFieldSectionValue = null;
+    const typed = userMessage.trim();
+    let value;
+    if (type === 'boolean') {
+      const yn = bookingFlow.parseYesNo(typed);
+      if (yn === null) {
+        session.pendingFieldSectionValue = { code, guestName, raw, sectionKey, fieldKey, label, type };
+        const reply = `Please reply yes or no for **${label}**.`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+      }
+      value = yn;
+    } else if (type === 'number') {
+      if (!typed || !Number.isFinite(Number(typed))) {
+        session.pendingFieldSectionValue = { code, guestName, raw, sectionKey, fieldKey, label, type };
+        const reply = `**${label}** needs to be a number — please try again.`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      }
+      value = Number(typed);
+    } else {
+      if (!typed) {
+        session.pendingFieldSectionValue = { code, guestName, raw, sectionKey, fieldKey, label, type };
+        const reply = `Please provide a value for **${label}**.`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0, expecting: type === 'date' ? { field: 'date' } : undefined };
+      }
+      value = typed;
+    }
+    const shown = type === 'boolean' ? (value ? 'Yes' : 'No') : value;
+    const reply = `Set **${label}** for **${code}** to "${shown}"? (yes/no)`;
+    session.pendingFieldSectionConfirm = { code, guestName, raw, sectionKey, fieldKey, label, value, shown };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // "Save this change?" confirmation for a price/remarks/extra field edit - patches just that one
+  // top-level raw key and resubmits in place (same saveRawPatch the Hotel Details edits use).
+  if (session.pendingFieldSectionConfirm) {
+    const { code, guestName, raw, fieldKey, label, value, shown } = session.pendingFieldSectionConfirm;
+    session.pendingFieldSectionConfirm = null;
+    const yn = bookingFlow.parseYesNo(userMessage);
+    if (yn === true) {
+      try {
+        await bookingEditForms.saveRawPatch(raw, { [fieldKey]: value });
+        return editSectionMenuAgain(sessionId, session, userMessage, `Done — ${label} for **${code}** is now "${shown}".`, code, guestName);
+      } catch (err) {
+        const reply = `Sorry, saving that failed: ${err.message}`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      }
+    }
+    if (yn === false) {
+      const reply = `Okay, cancelled — nothing was changed on **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const reply = `Reply "yes" to set ${label} to "${shown}", or "no" to cancel.`;
+    session.pendingFieldSectionConfirm = { code, guestName, raw, fieldKey, label, value, shown };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // The new value for whichever field was picked from BASIC_FIELD_CHOICE_CHIPS - this message IS
+  // that value (free text, not a chip). Feeds straight into the same resolve+confirm the
+  // typed-from-scratch "update <field> to <value>" path below already uses.
+  if (session.pendingFieldValueEntry) {
+    const { code, guestName, fieldKey, label } = session.pendingFieldValueEntry;
+    session.pendingFieldValueEntry = null;
+    const value = userMessage.trim();
+    const expecting = fieldKey === 'guestCompany' ? { field: 'agent' } : undefined;
+    if (!value) {
+      session.pendingFieldValueEntry = { code, guestName, fieldKey, label };
+      const reply = `Please type the new value for **${label}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0, expecting };
+    }
+    const resolved = await editBooking.resolveForEdit(code);
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, code, resolved.matches, 'fieldEdit', { field: fieldKey, label, value, viaMenu: true });
+    }
+    return finishFieldEditResolve(sessionId, session, userMessage, resolved, { code, field: fieldKey, label, value, viaMenu: true });
+  }
+
+  // A request to duplicate an existing booking/quotation into a brand-new one - same real
+  // /booking/AddBooking write path bookingFlow.js/convertBooking.js already use, just with
+  // isDuplicateCheck:true (see duplicateBooking.js). Deterministic resolve, always confirmed first.
+  const duplicateIntent = duplicateBooking.detectDuplicateIntent(userMessage, session.lastBookingCode);
+  if (duplicateIntent && !session.draft) {
+    const resolved = await duplicateBooking.resolveForDuplicate(duplicateIntent);
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, duplicateIntent.code, resolved.matches, 'duplicate', {});
+    }
+    return finishDuplicateResolve(sessionId, session, userMessage, resolved, duplicateIntent.code || duplicateIntent.guestName);
+  }
+
+  // A "set this field to X?" confirmation was asked last turn - this message answers it.
+  if (session.pendingFieldEditConfirm) {
+    const { code, guestName, raw, fieldKey, label, value, displayValue, viaMenu } = session.pendingFieldEditConfirm;
+    session.pendingFieldEditConfirm = null;
+    const shown = displayValue != null ? displayValue : value;
+    const yn = bookingFlow.parseYesNo(userMessage);
+    if (yn === true) {
+      try {
+        await editBooking.applySimpleFieldEdit(raw, fieldKey, value);
+        const done = `Done — ${label} for **${code}** (${guestName}) is now "${shown}".`;
+        if (viaMenu) return editSectionMenuAgain(sessionId, session, userMessage, done, code, guestName);
+        pushTurn(sessionId, userMessage, done);
+        return { answer: done, sql: null, rowCount: 0 };
+      } catch (err) {
+        const reply = `Sorry, saving that failed: ${err.message}`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      }
+    }
+    if (yn === false) {
+      const reply = `Okay, cancelled — nothing was changed on **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    const reply = `Reply "yes" to set ${label} for **${code}** to "${shown}", or "no" to cancel.`;
+    session.pendingFieldEditConfirm = { code, guestName, raw, fieldKey, label, value, displayValue, viaMenu };
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
   }
 
   // A request to update one simple field (company name, phone, email, guest name, address) on an
@@ -907,6 +1826,25 @@ async function handleChatInner(sessionId, userMessage) {
       return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'itineraryEdit', {});
     }
     return finishItineraryEditResolve(sessionId, session, userMessage, resolved, itineraryEditIntent.code);
+  }
+
+  // A direct "edit the basic details of FT...", "edit hotel details of FT...", "update booking
+  // FT..." command - opens the same section-menu system the post-duplicate offer opens
+  // (openEditSection), for ANY existing record, not just one just duplicated. A section named in
+  // the message (basic/hotel/itinerary/price/remarks/extra) jumps straight to it; otherwise shows
+  // the top-level menu.
+  const editMenuIntent = detectEditMenuIntent(userMessage, session.lastBookingCode);
+  if (editMenuIntent && !session.draft) {
+    const resolved = await editBooking.resolveForEdit(editMenuIntent.code);
+    if (resolved.status === 'not_found') {
+      const reply = `I couldn't find any booking or quotation matching **${editMenuIntent.code}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    if (resolved.status === 'ambiguous') {
+      return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'editMenu', { sectionText: editMenuIntent.sectionText });
+    }
+    return openEditSection(sessionId, session, userMessage, resolved.code, resolved.guestName, editMenuIntent.sectionText, false);
   }
 
   // If a booking/quotation is already being collected in this session, stay in that flow.

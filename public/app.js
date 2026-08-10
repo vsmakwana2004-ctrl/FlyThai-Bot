@@ -28,6 +28,7 @@ const peDiscount = document.getElementById('peDiscount');
 const peFinalRate = document.getElementById('peFinalRate');
 const peDueDateBtn = document.getElementById('peDueDateBtn');
 const peDueDateLabel = document.getElementById('peDueDateLabel');
+const peSkipBtn = document.getElementById('peSkipBtn');
 const extraDetailsBox = document.getElementById('extraDetailsBox');
 const itineraryOptionalBox = document.getElementById('itineraryOptionalBox');
 const itineraryOptionalFields = document.getElementById('itineraryOptionalFields');
@@ -463,6 +464,13 @@ calBackToForm.addEventListener('click', () => {
   reserveSpaceForVisiblePopover();
 });
 
+// One tap, no separate Send press - same reasoning as the "Same as agent"/logo-choice chips
+// (stepPriceExtras() already treats any "no" reply, "skip" included, as skipping the whole form).
+peSkipBtn.addEventListener('click', () => {
+  hidePriceExtrasPicker();
+  sendMessage('Skip');
+});
+
 // Final optional-details form (note/emergency contact/booked by/PDF permission) - only ever shown
 // after the extraGate question's "Yes, add details" reply, same free-text-composing pattern as the
 // pricing-extras form above, landing on the same LLM-parsed stepExtraCollect() as before.
@@ -577,6 +585,16 @@ function setExpecting(expecting) {
   }
   currentExpecting = expecting;
 
+  // Editing an EXISTING booking's destinations (chat.js's pendingDestinationsEntry) sends the
+  // record's current selection as expecting.preselected - pre-tick those so staff see (and adjust)
+  // what's already there instead of re-picking from scratch. New-booking creation's own
+  // destinationNames step never sets this, so that checklist still starts blank as before.
+  if (expecting && expecting.field === 'destination' && Array.isArray(expecting.preselected)) {
+    selectedDestinations.clear();
+    for (const d of expecting.preselected) selectedDestinations.set(String(d.Id), d.Name);
+    syncDestinationInputValue();
+  }
+
   if (expecting && expecting.field === 'date') {
     hideLookupDropdown();
     hideTimePicker();
@@ -640,7 +658,13 @@ function setExpecting(expecting) {
     hideLookupDropdown();
     return;
   }
-  fetchLookupOptions(expecting, input.value.trim());
+  // The destination checklist's initial render always shows the FULL list, regardless of
+  // input.value - syncDestinationInputValue() above may have just pre-filled input.value with the
+  // preselected names (e.g. "Bangkok, Chiang Mai") for a live-record edit, and using that as the
+  // search query here would filter the dropdown down to (usually) nothing, hiding every checkbox
+  // including the ones that should show pre-ticked. Typing to filter afterward still works via the
+  // separate input 'input' event listener below.
+  fetchLookupOptions(expecting, expecting.field === 'destination' ? '' : input.value.trim());
 }
 
 // Picking a day either submits it immediately (same as clicking an agent/hotel dropdown item - a
@@ -922,6 +946,9 @@ function addDataToggle(wrap, rows, rowCount, rowsTruncated) {
 // chip look as the fixed suggestions row, but populated per-response from data.quickReplies.
 const QUICK_REPLY_ICONS = {
   Skip: '⏭️',
+  Yes: '✅',
+  No: '❌',
+  Done: '🏁',
   'Breakfast included': '🍳',
   'No breakfast': '🚫',
   'Single sharing': '🛏️',
@@ -937,7 +964,22 @@ const QUICK_REPLY_ICONS = {
   'With FlyThai Logo': '🌴',
   'With Agent Logo': '🏢',
   'No Logo': '🚫',
+  Transfer: '🚐',
+  Sightseeing: '🗺️',
+  Restaurant: '🍽️',
+  'Leisure Day': '🏖️',
+  'Self-booked': '🙋',
 };
+
+// Most chips send their own label as the reply text, but some (e.g. "Same as agent (0123456789)")
+// need to show a descriptive label while actually sending a fixed keyword ("same") the backend
+// checks for - those come through as {label, value, autoSend} instead of a plain string (see
+// quickRepliesFor() in src/chat.js for which fields set autoSend and why).
+function quickReplyIcon(label) {
+  if (QUICK_REPLY_ICONS[label]) return QUICK_REPLY_ICONS[label];
+  if (/^Same as /.test(label)) return '👤';
+  return '✅';
+}
 
 function renderQuickReplies(list) {
   if (!list || list.length === 0) {
@@ -946,9 +988,18 @@ function renderQuickReplies(list) {
     return;
   }
   quickReplies.innerHTML = list
-    .map((text) => `<button type="button" class="chip" data-icon="${QUICK_REPLY_ICONS[text] || '✅'}">${escapeHtml(text)}</button>`)
+    .map((item) => {
+      const label = typeof item === 'string' ? item : item.label;
+      const value = typeof item === 'string' ? item : item.value;
+      const autoSend = typeof item === 'object' && item.autoSend ? '1' : '';
+      return `<button type="button" class="chip" data-icon="${quickReplyIcon(label)}" data-value="${escapeHtml(value)}" data-autosend="${autoSend}">${escapeHtml(label)}</button>`;
+    })
     .join('');
   quickReplies.style.display = 'flex';
+  // This row appears AFTER addMessage() already scrolled to the (then-shorter) bottom, so the
+  // chat-bottom area growing by this row's own height re-covers the tail end of the last message
+  // unless the scroll position is redone now that the row's real height exists in the layout.
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 // Fills the input rather than sending immediately - these chips cover just ONE of several
@@ -958,12 +1009,14 @@ function renderQuickReplies(list) {
 //
 // Exception: the logo-choice step (which PDF logo version) is a single complete answer, not one
 // of several fields to combine - clicking a chip there sends it immediately instead, so choosing
-// a PDF version is one tap, not a tap-then-Send.
+// a PDF version is one tap, not a tap-then-Send. Same for any chip chat.js marked autoSend (e.g.
+// "Self-booked" or "Same as agent (0123456789)") - those are forks/single-field answers too, just
+// from steps other than logoChoice, so the same "one tap, no separate Send" behavior applies.
 quickReplies.addEventListener('click', (e) => {
   const el = e.target.closest('.chip');
   if (!el) return;
-  const text = el.textContent;
-  if (currentExpecting && currentExpecting.field === 'logoChoice') {
+  const text = el.dataset.value || el.textContent;
+  if ((currentExpecting && currentExpecting.field === 'logoChoice') || el.dataset.autosend === '1') {
     sendMessage(text);
     return;
   }
