@@ -132,4 +132,49 @@ async function updateBookingStatus(internalId, statusType, value) {
   return text.trim() === '1';
 }
 
-module.exports = { submitBooking, findBookingById, updateBookingStatus, safeFetch };
+// Creates a new agent/company record via the real Agent master page's own save endpoint
+// (/Agent/AddEditAgent, confirmed live from that page's manageagent.js). Phone/Email/Address are
+// all optional at the API level despite the real form marking them required client-side (verified
+// live: a blank Phone/Email round-trip creates the record fine, with those columns left null) - so
+// a brand-new agent typed straight from the booking flow can be created from just its name.
+// Returns 'created' (raw response "1"), 'duplicate' (raw response "3" - the API's own
+// case-insensitive exact-name check, same one the real UI shows "Agent already exists" for), or
+// throws for anything else (raw response "0" or an unexpected body).
+async function createAgent({ name, phone = '', email = '', address = '' }) {
+  const { base, headers } = buildHeaders();
+  const form = new FormData();
+  form.append('Id', '');
+  form.append('Name', name);
+  form.append('Phone', phone);
+  form.append('Email', email);
+  form.append('Address', address);
+  form.append('AgentLogo', '');
+
+  // content-type must come from FormData's own multipart boundary, not the shared JSON default.
+  const { 'content-type': _drop, ...rest } = headers;
+
+  const res = await safeFetch(`${base}/Agent/AddEditAgent`, {
+    method: 'POST',
+    headers: rest,
+    body: form,
+  });
+
+  const text = await res.text().catch(() => '');
+  if (!res.ok) {
+    const err = new Error(`Agent create API returned ${res.status}: ${text.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (res.url && /\/Login/i.test(res.url)) {
+    const err = new Error('The session cookie appears to be expired (redirected to login). Please re-capture FLYTHAI_SESSION_COOKIE.');
+    err.code = 'SESSION_EXPIRED';
+    throw err;
+  }
+
+  const code = text.trim();
+  if (code === '1') return 'created';
+  if (code === '3') return 'duplicate';
+  throw new Error(`FlyThai rejected the new agent (unexpected response "${code}") - nothing was saved.`);
+}
+
+module.exports = { submitBooking, findBookingById, updateBookingStatus, createAgent, safeFetch };

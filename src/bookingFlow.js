@@ -1,9 +1,13 @@
 const { callLLM } = require('./llm');
 const { findAgent, findDestinations, findHotel, findPickup, findVehicle, findPickupOrParticular, findSightseeing, findRestaurant, listDestinations, listVehicles, findHotelRoomType } = require('./lookups');
-const { submitBooking, findBookingById } = require('./bookingApi');
+const { submitBooking, findBookingById, createAgent } = require('./bookingApi');
 const { isWholeFlowCancel, isBareCancel } = require('./cancel');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Digits only (an optional leading + for a country code) - no spaces, hyphens, letters, or other
+// punctuation. 7-15 digits covers the ITU E.164 range so a short local number isn't rejected while
+// obvious garbage still is.
+const PHONE_RE = /^\+?\d{7,15}$/;
 
 // A message that names an existing record (FT.../FTQ...) is always about THAT record - "add hotel
 // details to booking FT08261781" is a request to work on it, never a request to create a new one.
@@ -42,6 +46,20 @@ function detectCreateIntent(text) {
   if (WEAK_CREATE_QUOTATION_RE.test(text)) return { kind: 'quotation', confident: false };
   if (WEAK_CREATE_BOOKING_RE.test(text)) return { kind: 'booking', confident: false };
   return null;
+}
+
+// A message that arrives with no active draft and no explicit "create a booking" wording, but is
+// unmistakably a travel agent's full trip brief (a real day-by-day itinerary), is still obviously a
+// create-booking request - making the user type "create a new booking" first and then paste the
+// exact same message again was pure friction. Requires at least two real "Day N:" lines so it can't
+// misfire on an unrelated multi-line message that happens to mention a date or "hotel" once - the
+// same low bar looksLikeAgentPaste uses further down the flow would be too loose to trust here,
+// since at this point nothing has confirmed the user wants to create anything at all yet.
+const ITINERARY_DAY_LINE_RE = /^\s*day\s*\d+\s*:/gim;
+function looksLikeStandaloneAgentPaste(text) {
+  if (EXISTING_CODE_RE.test(text)) return false; // about an existing record, not a new one
+  const dayLines = text.match(ITINERARY_DAY_LINE_RE) || [];
+  return dayLines.length >= 2;
 }
 
 function startDraft(kind) {
@@ -144,6 +162,23 @@ function todayDateObjIST() {
   return new Date(y, m - 1, d);
 }
 
+// When the pasted message included a real day-by-day itinerary (draft._agentItineraryQueue), a
+// return date earlier than the itinerary's own last day is impossible - "Day 13: ..." obviously
+// means at least a 13-day trip. Generic over however many days the message actually listed, not
+// hardcoded to any particular trip length.
+function maxItineraryDay(draft) {
+  const queue = draft._agentItineraryQueue;
+  if (!Array.isArray(queue) || queue.length === 0) return null;
+  const max = queue.reduce((m, item) => Math.max(m, Number(item.day) || 0), 0);
+  return max > 0 ? max : null;
+}
+
+function addDaysToDateObj(dateObj, days) {
+  const d = new Date(dateObj);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
 // Strict 24-hour HH:MM, matching the real Add Sightseeing form's time input.
 function parseTimeHHMM(str) {
   if (!str || typeof str !== 'string') return null;
@@ -206,7 +241,7 @@ function basicStepPrompt(stepKey, draft) {
     case 'guestName':
       return "What is the guest's name?";
     case 'agentName':
-      return 'Which travel agent or company is this booked through?';
+      return "Which travel agent or company is this booked through? (start typing and select from the list, or type the exact name — if it doesn't exist yet, hit Create to add it as a new agent)";
     case 'guestPhoneNumber':
       return draft.resolvedAgent && draft.resolvedAgent.Phone
         ? `What is the guest's phone number? (reply "same" to use the agent's number: ${draft.resolvedAgent.Phone})`
@@ -686,13 +721,14 @@ async function stepBasic(draft, userMessage) {
       draft.fields.guestName = answer;
       break;
 
-    case 'guestPhoneNumber':
-      if (/^same$/i.test(answer) && draft.resolvedAgent && draft.resolvedAgent.Phone) {
-        draft.fields.guestPhoneNumber = draft.resolvedAgent.Phone;
-      } else {
-        draft.fields.guestPhoneNumber = answer;
+    case 'guestPhoneNumber': {
+      const phone = /^same$/i.test(answer) && draft.resolvedAgent && draft.resolvedAgent.Phone ? draft.resolvedAgent.Phone : answer;
+      if (!PHONE_RE.test(phone)) {
+        return { reply: 'That doesn\'t look like a valid phone number — please enter digits only (e.g. 9825096999), no spaces or other characters.', draft };
       }
+      draft.fields.guestPhoneNumber = phone;
       break;
+    }
 
     case 'guestEmail': {
       const email = /^same$/i.test(answer) && draft.resolvedAgent && draft.resolvedAgent.Email ? draft.resolvedAgent.Email : answer;
@@ -705,16 +741,30 @@ async function stepBasic(draft, userMessage) {
 
     case 'agentName': {
       const agents = await findAgent(answer);
-      if (agents.length === 0) {
-        return { reply: `I couldn't find an agent matching "${answer}" — could you check the spelling, or give the exact name?`, draft };
+      // findAgent tries an exact (case-insensitive) name match first and only falls back to a fuzzy
+      // substring search if that comes up empty - so a single result here is always a genuine
+      // resolution, never a fuzzy coincidence. Several results only ever come from that fuzzy
+      // fallback (e.g. typing "sa" fuzzy-matches "Om Sai Tour", "Sacred Holidays", "Saavi Tourism"...)
+      // - those exist for browsing via the live dropdown above the input (clicking one there resends
+      // its exact Name, which resolves through the branch below), not a reason to block creating a
+      // new agent literally named what was typed. Mirrors the Send-button's own "Create" rule in
+      // app.js, which likewise only disables for an exact match, not a fuzzy one.
+      if (agents.length === 1) {
+        draft.resolvedAgent = agents[0];
+        draft.fields.agentName = agents[0].Name;
+        break;
       }
-      if (agents.length > 1) {
-        const opts = agents.map((a) => `- ${a.Name} (${a.Phone || 'no phone'})`).join('\n');
-        return { reply: `A few agents match "${answer}":\n${opts}\nWhich one did you mean? Please reply with the exact name.`, draft };
-      }
-      draft.resolvedAgent = agents[0];
-      draft.fields.agentName = agents[0].Name;
-      break;
+
+      // No exact match - collect the new agent's own phone/email before creating it (mirrors the
+      // real Agent master form's own required fields), then offer to reuse them for the guest too,
+      // instead of creating it blank outright. Fuzzy substring matches (e.g. typing "sa" matching
+      // "Om Sai Tour", "Sacred Holidays", ...) don't block this - those exist for browsing via the
+      // live dropdown above the input, not a reason to stop creating a new agent literally named
+      // what was typed.
+      draft._pendingNewAgentName = answer;
+      draft.phase = 'agentCreate';
+      draft.agentCreateStep = 'phone';
+      return { reply: `No agent/company named "${answer}" exists yet — let's create it. What is this agent's phone number?`, draft };
     }
 
     case 'destinationNames': {
@@ -753,6 +803,14 @@ async function stepBasic(draft, userMessage) {
       const travelDateObj = parseDateDDMMYYYY(draft.fields.travelDate);
       if (returnDateObj <= travelDateObj) {
         return { reply: `Return date must be later than the travel date (${draft.fields.travelDate}) — could you re-enter it?`, draft };
+      }
+      const maxDay = maxItineraryDay(draft);
+      if (maxDay && travelDateObj) {
+        const minReturnObj = addDaysToDateObj(travelDateObj, maxDay - 1);
+        if (returnDateObj < minReturnObj) {
+          const minReturnStr = `${String(minReturnObj.getDate()).padStart(2, '0')}-${String(minReturnObj.getMonth() + 1).padStart(2, '0')}-${minReturnObj.getFullYear()}`;
+          return { reply: `The itinerary runs through Day ${maxDay}, so the return date can't be before ${minReturnStr} — could you re-enter it?`, draft };
+        }
       }
       draft.fields.returnDate = answer;
       break;
@@ -793,6 +851,85 @@ async function stepBasic(draft, userMessage) {
     reply: `Got the basic details for **${draft.fields.guestName}**. Now — is the hotel self-booked (guest arranging their own), or would you like to add hotel details? (reply "self-booked" or "add hotel")`,
     draft,
   };
+}
+
+// ---------- phase: agentCreate (typing an agent name with no existing match, per stepBasic's
+// 'agentName' case, lands here) ----------
+// Collects the new agent/company's own phone + email (mirroring the real Agent master form's own
+// fields) before actually creating it via the real API, then offers to copy those straight onto the
+// guest/passenger - a single explicit yes/no instead of relying on the per-field "reply same"
+// shortcut quickRepliesFor already offers once draft.resolvedAgent has a Phone/Email (that shortcut
+// still works too if this gate is answered "no" and the guest steps are reached normally below).
+async function stepAgentCreate(draft, userMessage) {
+  const answer = userMessage.trim();
+
+  if (draft.agentCreateStep === 'phone') {
+    if (!PHONE_RE.test(answer)) {
+      return { reply: 'That doesn\'t look like a valid phone number — please enter digits only (e.g. 9825096999), no spaces or other characters.', draft };
+    }
+    draft._pendingNewAgentPhone = answer;
+    draft.agentCreateStep = 'email';
+    return { reply: "What is this agent's email address?", draft };
+  }
+
+  if (draft.agentCreateStep === 'email') {
+    if (!EMAIL_RE.test(answer)) {
+      return { reply: "That doesn't look like a valid email address — could you re-enter it?", draft };
+    }
+
+    const name = draft._pendingNewAgentName;
+    const phone = draft._pendingNewAgentPhone;
+    let outcome;
+    try {
+      outcome = await createAgent({ name, phone, email: answer });
+    } catch (e) {
+      return { reply: `Couldn't create a new agent for "${name}" (${e.message}). Please try again or check the spelling.`, draft };
+    }
+    const rechecked = await findAgent(name);
+    const created = rechecked.find((a) => a.Name.toLowerCase() === name.toLowerCase()) || rechecked[0];
+    if (!created) {
+      return { reply: `Something went wrong creating "${name}" — could you try again?`, draft };
+    }
+    draft.resolvedAgent = created;
+    draft.fields.agentName = created.Name;
+    delete draft._pendingNewAgentName;
+    delete draft._pendingNewAgentPhone;
+
+    // outcome === 'duplicate' means the API's own case-insensitive exact-name check found a match
+    // our own lookup missed (a genuine race - two people creating the same agent at once) - the
+    // re-fetch above still lands on the real existing record either way, so both branches end up
+    // with a correct draft.resolvedAgent; only the message (and whose phone/email get offered next)
+    // differs.
+    const notice =
+      outcome === 'duplicate'
+        ? `"${name}" already exists as an agent/company — using the existing record (${created.Phone || 'no phone'}${created.Email ? `, ${created.Email}` : ''}).`
+        : `Created a new agent/company: **${created.Name}** (${created.Phone}, ${created.Email}).`;
+
+    // A pre-existing record hit via the 'duplicate' race can have no phone/email on file - nothing
+    // to offer copying onto the guest in that case, so skip straight past the gate instead of
+    // asking "same as X" about a blank value.
+    if (!created.Phone || !created.Email) {
+      delete draft.agentCreateStep;
+      draft.phase = 'basic';
+      return { reply: `${notice}\n\n${basicNextPrompt(draft)}`, draft };
+    }
+
+    draft.agentCreateStep = 'sameAsGuest';
+    return { reply: `${notice}\n\nUse the same phone number and email for the guest/passenger too? (yes/no)`, draft };
+  }
+
+  // agentCreateStep === 'sameAsGuest'
+  const yn = parseYesNo(answer);
+  if (yn === null) {
+    return { reply: 'Reply "yes" to use the same phone/email for the guest, or "no" to enter the guest\'s own details.', draft };
+  }
+  if (yn === true) {
+    draft.fields.guestPhoneNumber = draft.resolvedAgent.Phone;
+    draft.fields.guestEmail = draft.resolvedAgent.Email;
+  }
+  delete draft.agentCreateStep;
+  draft.phase = 'basic';
+  return { reply: basicNextPrompt(draft), draft };
 }
 
 // ---------- phase: hotel (fully deterministic - one field at a time, same reasoning as Basic) ----------
@@ -2230,6 +2367,8 @@ async function step(draft, userMessage) {
       return stepAgentPasteConfirm(draft, userMessage);
     case 'basic':
       return stepBasic(draft, userMessage);
+    case 'agentCreate':
+      return stepAgentCreate(draft, userMessage);
     case 'hotelChoice':
       return stepHotelChoice(draft, userMessage);
     case 'hotelCollect':
@@ -2281,4 +2420,4 @@ async function step(draft, userMessage) {
   }
 }
 
-module.exports = { step, startDraft, detectCreateIntent, parseYesNo, startItineraryEditDraft, askItineraryChoice, nextBasicStep };
+module.exports = { step, startDraft, detectCreateIntent, looksLikeStandaloneAgentPaste, parseYesNo, startItineraryEditDraft, askItineraryChoice, nextBasicStep, maxItineraryDay };

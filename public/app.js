@@ -3,6 +3,7 @@ const messagesInner = document.getElementById('messagesInner'); // centered cont
 const form = document.getElementById('chatForm');
 const input = document.getElementById('chatInput');
 const sendBtn = document.getElementById('sendBtn');
+const sendLabel = sendBtn.querySelector('.send-label');
 const suggestions = document.getElementById('suggestions');
 const quickReplies = document.getElementById('quickReplies');
 const clearBtn = document.getElementById('clearBtn');
@@ -177,6 +178,7 @@ function renderLookupDropdown(items, emptyText, multi) {
   }
   lookupDropdown.style.display = 'block';
   reserveSpaceForVisiblePopover();
+  updateSendButtonState();
 }
 
 function hideLookupDropdown() {
@@ -185,6 +187,29 @@ function hideLookupDropdown() {
   lookupItems = [];
   lookupActiveIndex = -1;
   reserveSpaceForVisiblePopover();
+  updateSendButtonState();
+}
+
+// The Send button turns into a "Create" button for the agent/company field the instant typing
+// starts (not once the debounced lookup comes back) - a visual cue that submitting this text
+// (instead of picking a real record from the dropdown) registers it as a brand-new agent/company,
+// mirroring bookingFlow.js's own agentName step which does exactly that on the backend when
+// findAgent() finds nothing (see the case 'agentName' handler in stepBasic there). It's disabled
+// (not clickable) specifically when what's typed exactly matches an existing agent's name - findAgent
+// there would just resolve straight to that record rather than create a duplicate, so offering
+// "Create" as an actionable button in that case is misleading; the dropdown right below already
+// lets the user pick that exact record in one click.
+// Single recomputation point (called on every keystroke, whenever lookup results arrive, and
+// whenever the busy/network state changes) so the two independent reasons the button can be
+// disabled - mid-request vs exact-name-match - never fight over the same `sendBtn.disabled` flag.
+function updateSendButtonState() {
+  const isAgentField = currentExpecting && currentExpecting.field === 'agent';
+  const query = input.value.trim();
+  const offerCreate = isAgentField && query.length > 0;
+  const exactMatch = offerCreate && lookupItems.some((item) => item.Name.trim().toLowerCase() === query.toLowerCase());
+  sendLabel.textContent = offerCreate ? 'Create' : 'Send';
+  sendBtn.title = exactMatch ? 'An agent with this exact name already exists — select it from the list below' : offerCreate ? 'Create new agent/company' : 'Send';
+  sendBtn.disabled = busy || exactMatch;
 }
 
 async function fetchLookupOptions(expecting, query) {
@@ -210,7 +235,8 @@ async function fetchLookupOptions(expecting, query) {
     const res = await fetch(`${endpoint}?${qs.toString()}`);
     const data = await res.json();
     const key = Object.keys(data).find((k) => Array.isArray(data[k]));
-    renderLookupDropdown(key ? data[key] : [], LOOKUP_EMPTY_TEXT[field], multi);
+    const items = key ? data[key] : [];
+    renderLookupDropdown(items, LOOKUP_EMPTY_TEXT[field], multi);
   } catch (err) {
     hideLookupDropdown();
   }
@@ -714,6 +740,10 @@ lookupDropdown.addEventListener('mousedown', (e) => {
 
 input.addEventListener('input', () => {
   if (!currentExpecting) return;
+  // The Create/exact-match check itself runs immediately (not debounced) so the button reacts the
+  // instant typing starts - only the network lookup that refines it (fresh matches, exact-match
+  // detection) waits for the pause in typing.
+  updateSendButtonState();
   clearTimeout(lookupDebounceTimer);
   lookupDebounceTimer = setTimeout(() => fetchLookupOptions(currentExpecting, input.value.trim()), 200);
 });
@@ -734,6 +764,19 @@ input.addEventListener('keydown', (e) => {
   // method) still inserts a real newline; a plain Enter sends, matching the old input's behavior -
   // except when the lookup dropdown has an active item, where it picks that item instead (unchanged).
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // The agent/company field's Enter key always mirrors the Send/Create button exactly instead of
+    // falling into the dropdown-active-item branch below - so typing e.g. "rt" (which fuzzy-matches
+    // several real agents, arrow-highlightable in the dropdown) and pressing Enter creates a new
+    // agent literally named "rt", the same thing clicking "Create" does, rather than silently
+    // sending whatever happens to be highlighted. Disabled state (mid-request, or an exact-name
+    // match blocking "Create" - see updateSendButtonState) is respected the same way a real click
+    // on a disabled button would be. Picking an existing agent from the dropdown still works via a
+    // direct click on it (the mousedown handler below), unaffected by this.
+    if (currentExpecting && currentExpecting.field === 'agent') {
+      e.preventDefault();
+      if (!sendBtn.disabled) sendMessage(input.value);
+      return;
+    }
     const dropdownOpen = !(currentExpecting && currentExpecting.multi) && lookupDropdown.style.display === 'block' && lookupItems.length > 0;
     if (dropdownOpen && lookupActiveIndex >= 0) {
       e.preventDefault();
@@ -1122,7 +1165,7 @@ async function sendMessage(text) {
   appendMessageToChat(chatId, 'user', text);
   input.value = '';
   updateCharCount();
-  sendBtn.disabled = true;
+  updateSendButtonState();
   suggestions.style.display = 'none';
   renderQuickReplies(null);
   setExpecting(null);
@@ -1157,7 +1200,7 @@ async function sendMessage(text) {
     appendMessageToChat(chatId, 'bot', errText, { kind: 'error' });
   } finally {
     busy = false;
-    sendBtn.disabled = false;
+    updateSendButtonState();
   }
 }
 

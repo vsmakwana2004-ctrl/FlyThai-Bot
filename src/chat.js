@@ -598,7 +598,13 @@ function expectingField(draft) {
     return { field: 'date', params: { min: todayIST() } };
   }
   if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'returnDate') {
-    return { field: 'date', params: { min: ddmmyyyyToISO(draft.fields.travelDate) || todayIST() } };
+    const travelISO = ddmmyyyyToISO(draft.fields.travelDate);
+    // A pasted itinerary with real "Day N:" lines (draft._agentItineraryQueue) means the return
+    // date can't be earlier than that last day - Day 13 implies at least a 13-day trip, so every
+    // date before travelDate + (maxDay - 1) is blanked out instead of just travelDate itself.
+    const maxDay = bookingFlow.maxItineraryDay(draft);
+    const min = maxDay && travelISO ? addDaysISO(travelISO, maxDay - 1) : travelISO || todayIST();
+    return { field: 'date', params: { min } };
   }
   // Adults/children/infants step gets three number spinners instead of free-text counting -
   // adults is enforced to be at least 1 (a booking needs at least one adult traveller).
@@ -736,7 +742,10 @@ function quickRepliesFor(draft) {
   // stepSource/looksLikeAgentPaste - so there's no longer a separate manual-vs-agent choice to
   // render chips for here.
   if (draft && draft.phase === 'agentPasteConfirm') {
-    return ['Yes, use these', 'No, enter manually'];
+    return [
+      { label: 'Yes, use these', value: 'yes, use these', autoSend: true },
+      { label: 'No, enter manually', value: 'no, enter manually', autoSend: true },
+    ];
   }
   // The guest's phone/email steps offer a "reply same to use the agent's own number/email"
   // shortcut (see bookingFlow.js's basicStepPrompt) - a one-tap chip beats typing "same" from
@@ -754,6 +763,14 @@ function quickRepliesFor(draft) {
     if (next === 'guestEmail' && draft.resolvedAgent && draft.resolvedAgent.Email) {
       return [{ label: `Same as agent (${draft.resolvedAgent.Email})`, value: 'same', autoSend: true }];
     }
+  }
+  // "Use the same phone/email for the guest too?" gate, shown right after a brand-new agent/company
+  // is created (see bookingFlow.js's stepAgentCreate) - plain yes/no gate, single-tap, auto-send.
+  if (draft && draft.phase === 'agentCreate' && draft.agentCreateStep === 'sameAsGuest') {
+    return [
+      { label: 'Yes', value: 'yes', autoSend: true },
+      { label: 'No', value: 'no', autoSend: true },
+    ];
   }
   // Same "reply same" shortcut for a hotel row's rate-per-night, when the selected room type has
   // its own known rate (see hotelStepPrompt's 'ratePerNight' case).
@@ -1884,6 +1901,20 @@ async function handleChatInner(sessionId, userMessage) {
   // If a booking/quotation is already being collected in this session, stay in that flow.
   if (session.draft) {
     const { reply, draft, createdCode } = await bookingFlow.step(session.draft, userMessage);
+    session.draft = draft;
+    if (createdCode) session.lastBookingCode = createdCode;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
+  }
+
+  // A full travel-agent trip brief (real day-by-day itinerary) pasted with no "create a booking"
+  // wording at all, and no active draft, is still unambiguously a create-booking request - skip
+  // straight to extracting it instead of making the user say "create a new booking" first and then
+  // paste the exact same message again as a second turn.
+  if (!session.draft && bookingFlow.looksLikeStandaloneAgentPaste(userMessage)) {
+    const newDraft = bookingFlow.startDraft('booking');
+    newDraft.sourceStarted = true; // skip the "what's the guest's name" prompt - this message IS the paste
+    const { reply, draft, createdCode } = await bookingFlow.step(newDraft, userMessage);
     session.draft = draft;
     if (createdCode) session.lastBookingCode = createdCode;
     pushTurn(sessionId, userMessage, reply);

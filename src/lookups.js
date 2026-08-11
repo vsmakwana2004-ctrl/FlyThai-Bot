@@ -2,11 +2,25 @@ const { getPool } = require('./db');
 
 // Deterministic name -> id lookups, run in code (not the LLM) so booking data never uses a hallucinated id.
 
+// An exact (case-insensitive) name match wins outright before falling back to the fuzzy LIKE
+// search - without this, an agent whose name is a prefix of another's ("Ajay Modi" vs "Ajay Modi
+// Travels") could never be picked: typing the exact name, or clicking that exact agent from the
+// dropdown (which resends its stored Name as plain text), both re-ran the same LIKE '%Ajay Modi%'
+// search and matched both records again, re-asking "which one did you mean?" forever. Mirrors the
+// same exact-first-then-fuzzy pattern findDestinations already uses for short codes.
 async function findAgent(nameQuery) {
   const pool = await getPool();
+  const trimmed = nameQuery.trim();
+
+  const exact = await pool
+    .request()
+    .input('name', trimmed)
+    .query(`SELECT TOP 1 Id, Name, Phone, Email, Address FROM Agents WHERE IsDeleted = 0 AND UPPER(Name) = UPPER(@name)`);
+  if (exact.recordset.length === 1) return exact.recordset;
+
   const result = await pool
     .request()
-    .input('q', `%${nameQuery}%`)
+    .input('q', `%${trimmed}%`)
     .query(`SELECT TOP 5 Id, Name, Phone, Email, Address FROM Agents WHERE IsDeleted = 0 AND Name LIKE @q ORDER BY Name`);
   return result.recordset;
 }
@@ -21,6 +35,23 @@ async function listAgents(nameQuery = '') {
     .input('q', `%${nameQuery}%`)
     .query(`SELECT TOP 20 Id, Name, Phone FROM Agents WHERE IsDeleted = 0 AND Name LIKE @q ORDER BY Name`);
   return result.recordset;
+}
+
+// "Koh" and "Ko" are both common transliterations of the Thai island prefix (เกาะ) - agents type
+// either one interchangeably ("Koh Samui" / "Ko Samui"), and the Destination table itself isn't
+// consistent about which spelling it stores (Ko Samui, Ko Phangan, Ko Tao vs koh yao noi). Swapping
+// the prefix and retrying is a safe alternate spelling, not a guess, so it's tried before giving up.
+function swapKohKoPrefix(name) {
+  if (/^koh\s/i.test(name)) return name.replace(/^koh\s/i, 'Ko ');
+  if (/^ko\s/i.test(name)) return name.replace(/^ko\s/i, 'Koh ');
+  return null;
+}
+
+async function queryDestinationsByName(pool, trimmed) {
+  return pool
+    .request()
+    .input('q', `%${trimmed}%`)
+    .query(`SELECT TOP 3 Id, Name, ShortCode FROM Destination WHERE IsDelete = 0 AND (Name LIKE @q OR ShortCode LIKE @q) ORDER BY Name`);
 }
 
 // Accepts either the full destination name ("Bangkok") or the real short code shown on the real
@@ -42,10 +73,11 @@ async function findDestinations(names) {
       continue;
     }
 
-    const result = await pool
-      .request()
-      .input('q', `%${trimmed}%`)
-      .query(`SELECT TOP 3 Id, Name, ShortCode FROM Destination WHERE IsDelete = 0 AND (Name LIKE @q OR ShortCode LIKE @q) ORDER BY Name`);
+    let result = await queryDestinationsByName(pool, trimmed);
+    if (result.recordset.length === 0) {
+      const altTrimmed = swapKohKoPrefix(trimmed);
+      if (altTrimmed) result = await queryDestinationsByName(pool, altTrimmed);
+    }
     if (result.recordset.length === 1) matches.push(result.recordset[0]);
     else if (result.recordset.length > 1) matches.push({ ambiguous: true, name, options: result.recordset });
     else notFound.push(name);
