@@ -855,11 +855,13 @@ async function stepBasic(draft, userMessage) {
 
 // ---------- phase: agentCreate (typing an agent name with no existing match, per stepBasic's
 // 'agentName' case, lands here) ----------
-// Collects the new agent/company's own phone + email (mirroring the real Agent master form's own
-// fields) before actually creating it via the real API, then offers to copy those straight onto the
-// guest/passenger - a single explicit yes/no instead of relying on the per-field "reply same"
-// shortcut quickRepliesFor already offers once draft.resolvedAgent has a Phone/Email (that shortcut
-// still works too if this gate is answered "no" and the guest steps are reached normally below).
+// Collects the new agent/company's own phone + email + address (mirroring the real Agent master
+// form's own fields - address is the one optional/skippable one, phone and email are validated the
+// same as the guest's own) before actually creating it via the real API, then offers to copy the
+// phone/email straight onto the guest/passenger - a single explicit yes/no instead of relying on
+// the per-field "reply same" shortcut quickRepliesFor already offers once draft.resolvedAgent has a
+// Phone/Email (that shortcut still works too if this gate is answered "no" and the guest steps are
+// reached normally below).
 async function stepAgentCreate(draft, userMessage) {
   const answer = userMessage.trim();
 
@@ -876,12 +878,20 @@ async function stepAgentCreate(draft, userMessage) {
     if (!EMAIL_RE.test(answer)) {
       return { reply: "That doesn't look like a valid email address — could you re-enter it?", draft };
     }
+    draft._pendingNewAgentEmail = answer;
+    draft.agentCreateStep = 'address';
+    return { reply: 'What is this agent\'s address? (optional — reply "skip" to leave it blank)', draft };
+  }
+
+  if (draft.agentCreateStep === 'address') {
+    const address = /^skip$/i.test(answer) ? '' : answer;
 
     const name = draft._pendingNewAgentName;
     const phone = draft._pendingNewAgentPhone;
+    const email = draft._pendingNewAgentEmail;
     let outcome;
     try {
-      outcome = await createAgent({ name, phone, email: answer });
+      outcome = await createAgent({ name, phone, email, address });
     } catch (e) {
       return { reply: `Couldn't create a new agent for "${name}" (${e.message}). Please try again or check the spelling.`, draft };
     }
@@ -894,6 +904,7 @@ async function stepAgentCreate(draft, userMessage) {
     draft.fields.agentName = created.Name;
     delete draft._pendingNewAgentName;
     delete draft._pendingNewAgentPhone;
+    delete draft._pendingNewAgentEmail;
 
     // outcome === 'duplicate' means the API's own case-insensitive exact-name check found a match
     // our own lookup missed (a genuine race - two people creating the same agent at once) - the

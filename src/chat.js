@@ -15,13 +15,14 @@ const { findBookingById } = require('./bookingApi');
 const { isAnyCancel } = require('./cancel');
 const { findDestinations, listDestinations } = require('./lookups');
 const jobSheetCopy = require('./jobSheetCopy');
+const agentCreate = require('./agentCreate');
 
 // Simple in-memory per-session state (server restarts clear it — fine for an internal tool).
 const sessions = new Map();
 const MAX_TURNS = 6; // user+assistant pairs kept for context
 
 function getSession(sessionId) {
-  if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], draft: null, pendingItinerary: null, pendingDocChoice: null, pendingHotelChoice: null, pendingCodeChoice: null, pendingRecordChoice: null, pendingStatusChange: null, pendingCreateConfirm: null, pendingConvertConfirm: null, pendingFieldEditConfirm: null, lastBookingCode: null });
+  if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], draft: null, pendingItinerary: null, pendingDocChoice: null, pendingHotelChoice: null, pendingCodeChoice: null, pendingRecordChoice: null, pendingStatusChange: null, pendingCreateConfirm: null, pendingConvertConfirm: null, pendingFieldEditConfirm: null, pendingAgentCreate: null, lastBookingCode: null });
   return sessions.get(sessionId);
 }
 
@@ -51,7 +52,8 @@ function isFlowActive(session) {
     session.pendingHotelFieldConfirm ||
     session.pendingFieldSectionChoice ||
     session.pendingFieldSectionValue ||
-    session.pendingFieldSectionConfirm
+    session.pendingFieldSectionConfirm ||
+    session.pendingAgentCreate
   );
 }
 
@@ -83,6 +85,7 @@ function cancelFlows(sessionId) {
   session.pendingFieldSectionChoice = null;
   session.pendingFieldSectionValue = null;
   session.pendingFieldSectionConfirm = null;
+  session.pendingAgentCreate = null;
   return wasActive;
 }
 
@@ -764,6 +767,12 @@ function quickRepliesFor(draft) {
       return [{ label: `Same as agent (${draft.resolvedAgent.Email})`, value: 'same', autoSend: true }];
     }
   }
+  // A new agent/company's address is the one optional field in stepAgentCreate (phone/email are
+  // validated and required) - "Skip" is a complete answer on its own, so it submits immediately
+  // rather than filling the box.
+  if (draft && draft.phase === 'agentCreate' && draft.agentCreateStep === 'address') {
+    return [{ label: 'Skip', value: 'skip', autoSend: true }];
+  }
   // "Use the same phone/email for the guest too?" gate, shown right after a brand-new agent/company
   // is created (see bookingFlow.js's stepAgentCreate) - plain yes/no gate, single-tap, auto-send.
   if (draft && draft.phase === 'agentCreate' && draft.agentCreateStep === 'sameAsGuest') {
@@ -878,6 +887,14 @@ function quickRepliesFor(draft) {
       { label: 'No', value: 'no', autoSend: true },
     ];
   }
+  return null;
+}
+
+// Same "Skip" convenience for the standalone agent-creation flow's one optional field (see
+// agentCreate.js) - address is skippable, name/phone/email are validated and required so there's
+// nothing to render chips for on those steps.
+function quickRepliesForAgentCreate(pending) {
+  if (pending && pending.step === 'address') return [{ label: 'Skip', value: 'skip', autoSend: true }];
   return null;
 }
 
@@ -1221,7 +1238,8 @@ async function handleChatInner(sessionId, userMessage) {
       session.pendingHotelFieldConfirm ||
       session.pendingFieldSectionChoice ||
       session.pendingFieldSectionValue ||
-      session.pendingFieldSectionConfirm) &&
+      session.pendingFieldSectionConfirm ||
+      session.pendingAgentCreate) &&
     isAnyCancel(userMessage)
   ) {
     cancelFlows(sessionId);
@@ -1270,6 +1288,16 @@ async function handleChatInner(sessionId, userMessage) {
     session.pendingStatusChange = pending;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0 };
+  }
+
+  // Standalone "add a new agent/company" conversation (see agentCreate.js) - entirely separate
+  // from the agent-creation flow embedded inside booking creation (bookingFlow.js's
+  // stepAgentCreate), for when staff just want to register an agent with no booking involved.
+  if (session.pendingAgentCreate) {
+    const { reply, pending } = await agentCreate.step(session.pendingAgentCreate, userMessage);
+    session.pendingAgentCreate = pending;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: quickRepliesForAgentCreate(pending) };
   }
 
   // If we previously asked "which record did you mean?" (the same code matched more than one real
@@ -1938,6 +1966,16 @@ async function handleChatInner(sessionId, userMessage) {
     if (createdCode) session.lastBookingCode = createdCode;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
+  }
+
+  // Or a standalone request to register a new agent/company with no booking involved (see
+  // agentCreate.js) - separate from bookingFlow.js's own embedded agent-creation step, which only
+  // triggers when a typed agent name has no match partway through booking creation.
+  if (agentCreate.detectAgentCreateIntent(userMessage)) {
+    const { reply, pending } = agentCreate.start();
+    session.pendingAgentCreate = pending;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
   }
 
   // Or a request to change one of a booking's status dropdowns (Travel/Invoice/Voucher/
