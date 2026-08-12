@@ -8,6 +8,14 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // punctuation. 7-15 digits covers the ITU E.164 range so a short local number isn't rejected while
 // obvious garbage still is.
 const PHONE_RE = /^\+?\d{7,15}$/;
+// Whole-count fields (room count, pax) - digits only, nothing else. parseInt("5 rooms", 10) would
+// silently accept that and return 5, quietly dropping the "rooms" instead of flagging the input as
+// wrong - this rejects anything that isn't purely digits before parseInt ever runs.
+const WHOLE_NUMBER_RE = /^\d+$/;
+// Amount fields (rate per night, price per pax) - digits with an optional decimal part, nothing
+// else (no currency symbols, commas, or trailing text) - same reasoning as WHOLE_NUMBER_RE above,
+// against parseFloat("500 THB", ...) silently accepting 500.
+const DECIMAL_NUMBER_RE = /^\d+(\.\d+)?$/;
 
 // A message that names an existing record (FT.../FTQ...) is always about THAT record - "add hotel
 // details to booking FT08261781" is a request to work on it, never a request to create a new one.
@@ -1110,15 +1118,23 @@ async function stepHotelCollect(draft, userMessage) {
         break;
       }
       case 'totalRooms': {
+        if (!WHOLE_NUMBER_RE.test(answer.trim())) {
+          return { reply: 'That needs to be digits only, no other text — how many rooms?', draft };
+        }
         const n = parseInt(answer, 10);
-        if (!Number.isFinite(n) || n <= 0) return { reply: 'That needs to be a whole number greater than 0 — how many rooms?', draft };
+        if (n <= 0) return { reply: 'That needs to be a whole number greater than 0 — how many rooms?', draft };
         h.totalRooms = n;
         break;
       }
       case 'ratePerNight': {
-        const n = /^same$/i.test(answer) && h._roomTypeRate != null ? Number(h._roomTypeRate) : parseFloat(answer);
-        if (!Number.isFinite(n) || n < 0) return { reply: 'That needs to be a number — what is the rate per night?', draft };
-        h.ratePerNight = n;
+        if (/^same$/i.test(answer) && h._roomTypeRate != null) {
+          h.ratePerNight = Number(h._roomTypeRate);
+          break;
+        }
+        if (!DECIMAL_NUMBER_RE.test(answer.trim())) {
+          return { reply: 'That needs to be digits only, no currency symbol or other text — what is the rate per night?', draft };
+        }
+        h.ratePerNight = parseFloat(answer);
         break;
       }
       default:
@@ -2028,15 +2044,19 @@ async function stepPriceCollect(draft, userMessage) {
       m.type = answer;
       break;
     case 'pax': {
+      if (!WHOLE_NUMBER_RE.test(answer)) {
+        return { reply: 'That needs to be digits only, no other text — how many pax?', draft };
+      }
       const n = parseInt(answer, 10);
-      if (!Number.isFinite(n) || n <= 0) return { reply: 'That needs to be a whole number greater than 0 — how many pax?', draft };
+      if (n <= 0) return { reply: 'That needs to be a whole number greater than 0 — how many pax?', draft };
       m.pax = n;
       break;
     }
     case 'price': {
-      const n = parseFloat(answer);
-      if (!Number.isFinite(n) || n < 0) return { reply: 'That needs to be a number — what is the price per pax?', draft };
-      m.price = n;
+      if (!DECIMAL_NUMBER_RE.test(answer)) {
+        return { reply: 'That needs to be digits only, no currency symbol or other text — what is the price per pax?', draft };
+      }
+      m.price = parseFloat(answer);
       break;
     }
     default:

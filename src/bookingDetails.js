@@ -51,6 +51,16 @@ function detectFullDetailIntent(text) {
 // Resolves the intent to exactly one BookingMaster.Id.
 // Returns { status: 'not_found' } | { status: 'ambiguous', matches: [...] } | { status: 'ok', id, row }
 async function resolveBooking(pool, intent) {
+  // Direct by internal Id - used when a caller already resolved one exact row out of a previous
+  // ambiguous match (see chat.js's pendingAmbiguousDetail), so re-running the ambiguity check
+  // against the shared code/name would just hit the same ambiguity again.
+  if (intent.id != null) {
+    const r = await pool.request().input('id', intent.id).query(`
+      SELECT Id, BookingId, QuotationId, GuestName FROM BookingMaster WHERE IsDelete = 0 AND Id = @id
+    `);
+    if (r.recordset.length === 0) return { status: 'not_found' };
+    return { status: 'ok', id: r.recordset[0].Id };
+  }
   if (intent.exact) {
     // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode for the
     // confirmed live example of 3 rows sharing one code) - a bare TOP 1 here previously picked an

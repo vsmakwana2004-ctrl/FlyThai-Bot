@@ -876,6 +876,45 @@ body {
   border-radius: 0 0 16px 16px;
 }
 
+/* Committed destination selections, shown below the input row - separate from the search box
+   above so what's actually going to be submitted never depends on what's currently typed. */
+.destination-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 2px 0;
+}
+.destination-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--mint-100);
+  border: 1px solid var(--green-500);
+  color: var(--green-800);
+  padding: 5px 6px 5px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.destination-pill-remove {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: var(--green-600);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s ease;
+}
+.destination-pill-remove:hover { background: var(--green-800); }
+
 /* --- date picker popover ---------------------------------------------------
    A compact month-grid calendar, matching the look of the real FlyThai site's
    own travel-date picker, rather than each browser's inconsistent native

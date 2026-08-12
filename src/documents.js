@@ -254,19 +254,27 @@ async function handleDocumentRequest(intent) {
   if (matches.length === 0) {
     return { reply: `I couldn't find any booking or quotation matching ${label} in the database.` };
   }
-  if (matches.length > 1) {
-    // Never guess which record was meant (same code splitting across rows, or several guests
-    // sharing a name) - same "ask, don't pick" standard the rest of this codebase already applies
-    // to ambiguous hotel/vehicle/destination matches.
+  if (matches.length > 1 && intent.guestName) {
+    // A shared NAME means genuinely different real guests - never guess which one, same "ask,
+    // don't pick" standard the rest of this codebase applies to ambiguous hotel/vehicle/destination
+    // matches. (The same-code case below is different - see its own comment.)
     const list = matches.map((m, i) => `${i + 1}. ${describeMatch(m)}`).join('\n');
     return {
       reply: `More than one record matches ${label} — which one did you mean?\n\n${list}\n\n(Reply with the number.)`,
-      // .code alongside {intent, matches} so this fits the same {code: ...} shape every other
-      // pending-* state uses in chat.js (the cancel check and the "a different code interrupts a
-      // stale pending question" guard both key off pending.code) - left undefined for a
-      // guest-name match, since by definition those candidates don't share one single code.
       pendingCodeChoice: { code: intent.code, intent, matches },
     };
+  }
+  if (matches.length > 1) {
+    // More than one row sharing the exact same FT/FTQ code is a known real-data quirk (see
+    // resolveBookingByCode's own comment) - e.g. converting a quotation to a booking keeps the old
+    // QuotationId on that row, and the real site's own numbering can later hand that same code to a
+    // brand new, unrelated quotation. Rather than stopping to ask every time, use the most recently
+    // created row (matches is already ordered newest-first) and say so in the reply, so a mismatch
+    // is still visible instead of silently picking the wrong one - the exact failure this same-code
+    // case used to risk before it was made to ask (see that comment for the reproduced live bug).
+    const result = await buildDocumentReply(intent, matches[0]);
+    const note = `_Note: ${matches.length} records share code **${intent.code}** — showing the most recently created one (${matches[0].GuestName}, ${fmtDate(matches[0].CreatedOn)})._\n\n`;
+    return { ...result, reply: note + result.reply };
   }
   return buildDocumentReply(intent, matches[0]);
 }

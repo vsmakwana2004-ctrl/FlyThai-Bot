@@ -22,9 +22,13 @@ const FALLBACK_MODELS = [
   'openai/gpt-oss-120b',
 ];
 
-function modelsToTry() {
+// preferredModel lets a caller ask for a specific model FIRST for this one call (e.g. a fast small
+// model for a structured/mechanical task where the default GROQ_MODEL would be needless overkill),
+// while still falling through to the normal GROQ_MODEL -> FALLBACK_MODELS chain if it fails - so a
+// speed preference never becomes a hard dependency on one model actually being available.
+function modelsToTry(preferredModel) {
   const configured = process.env.GROQ_MODEL;
-  const list = configured ? [configured, ...FALLBACK_MODELS] : FALLBACK_MODELS;
+  const list = [preferredModel, configured, ...FALLBACK_MODELS].filter(Boolean);
   return [...new Set(list)];
 }
 
@@ -73,7 +77,7 @@ async function callOnce(model, apiKey, messages, temperature) {
   return content;
 }
 
-async function callLLM(messages, { temperature = 0.2 } = {}) {
+async function callLLM(messages, { temperature = 0.2, model: preferredModel } = {}) {
   const keys = keysToTry();
   if (keys.length === 0) {
     const err = new Error('No Groq API key is set. Add GROQ_API_KEY to your .env file.');
@@ -81,7 +85,7 @@ async function callLLM(messages, { temperature = 0.2 } = {}) {
     throw err;
   }
 
-  const candidates = modelsToTry();
+  const candidates = modelsToTry(preferredModel);
   let lastErr;
   // Model is the outer loop, key the inner one: this stays on the preferred model across every
   // available account before dropping to a lower-quality fallback model - so model choice only

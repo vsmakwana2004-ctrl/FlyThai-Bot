@@ -70,7 +70,6 @@
         <div class="chat-bottom-inner">
           <div class="suggestions" id="suggestions">
             <button class="chip" data-icon="✈️">Create a new booking</button>
-            <button class="chip" data-icon="🔎">Show me details of FTQ05260001</button>
             <button class="chip" data-icon="💳">Show all pending payments</button>
             <button class="chip" data-icon="📊">How many quotations were made this month</button>
             <button class="chip" data-icon="📝">Create a new quotation</button>
@@ -191,6 +190,12 @@
                 <span class="send-label">Send</span>
               </button>
             </form>
+            <!-- Selected-destination pills, decoupled from the filter/search text above - ticking
+                 a checklist item adds a pill here (and clears the search box for the next search)
+                 instead of rewriting the box with a comma-joined list; typing only ever filters,
+                 never becomes the submitted answer on its own. See renderDestinationPills() in
+                 app.js. -->
+            <div id="destinationPills" class="destination-pills" style="display:none"></div>
             <div id="charCount" class="char-count" style="display:none"></div>
           </div>
         </div>

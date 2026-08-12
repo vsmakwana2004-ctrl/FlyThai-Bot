@@ -8,6 +8,7 @@ const suggestions = document.getElementById('suggestions');
 const quickReplies = document.getElementById('quickReplies');
 const clearBtn = document.getElementById('clearBtn');
 const lookupDropdown = document.getElementById('lookupDropdown');
+const destinationPills = document.getElementById('destinationPills');
 const datePickerBox = document.getElementById('datePickerBox');
 const calPrev = document.getElementById('calPrev');
 const calNext = document.getElementById('calNext');
@@ -96,6 +97,7 @@ const LOOKUP_EMPTY_TEXT = {
   vehicle: 'No matching vehicle types found',
   destination: 'No matching destinations found',
   roomType: 'No registered room types for this hotel — just type the category',
+  ambiguousDetail: 'No matching records',
 };
 let currentExpecting = null; // { field, params, multi } | null
 let lookupDebounceTimer = null;
@@ -114,12 +116,70 @@ function lookupItemLabel(item) {
   return item.Name;
 }
 
-// Keeps the chat input in sync with the ticked checkboxes - checking a box adds its name, unticking
-// removes it, and the ordinary Send/Enter path submits whatever ends up in the box.
-function syncDestinationInputValue() {
-  input.value = Array.from(selectedDestinations.values()).join(', ');
-  updateCharCount();
+// Renders the selected-destinations pill row from selectedDestinations - decoupled from the
+// filter/search text box entirely (see the mousedown handler below and the Enter-key handling
+// further down), so what's about to be submitted is always exactly what's shown as pills, never
+// whatever happens to be typed in the box at the moment. Called whenever a pill is added/removed,
+// and once up front when editing an existing record's destinations pre-fills the set.
+function renderDestinationPills() {
+  const entries = Array.from(selectedDestinations.entries());
+  if (entries.length === 0) {
+    destinationPills.style.display = 'none';
+    destinationPills.innerHTML = '';
+    return;
+  }
+  destinationPills.innerHTML = entries
+    .map(
+      ([id, name]) =>
+        `<span class="destination-pill" data-id="${id}">${escapeHtml(name)}<button type="button" class="destination-pill-remove" data-id="${id}" aria-label="Remove ${escapeHtml(name)}">✕</button></span>`
+    )
+    .join('');
+  destinationPills.style.display = 'flex';
+  // Same reasoning as renderQuickReplies' own scroll fix below - this row growing/shrinking the
+  // chat-bottom area can re-cover the tail of the last message unless the scroll position is
+  // redone now that its real height exists in the layout.
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
+
+// If the search box has an unambiguous match - one filtered result, or an arrow-key-highlighted
+// one - commits it as a pill and clears the box. Shared by Enter and the Send button/form submit
+// (see below) so a typed-but-not-yet-clicked match is never silently dropped by either path.
+function commitDestinationMatchIfUnambiguous() {
+  const query = input.value.trim();
+  if (!query) return;
+  const match = lookupActiveIndex >= 0 && lookupItems[lookupActiveIndex] ? lookupItems[lookupActiveIndex] : lookupItems.length === 1 ? lookupItems[0] : null;
+  if (!match) return;
+  selectedDestinations.set(String(match.Id), match.Name);
+  renderDestinationPills();
+  input.value = '';
+  updateCharCount();
+  fetchLookupOptions(currentExpecting, '');
+}
+
+// Composes and sends the pill set as the actual answer - the only place selectedDestinations ever
+// turns into the message text that reaches the server.
+function submitDestinationPills() {
+  if (selectedDestinations.size === 0) return;
+  hideLookupDropdown();
+  sendMessage(Array.from(selectedDestinations.values()).join(', '));
+}
+
+// mousedown (not click) + preventDefault, same as the checklist's own item handler below - stops
+// the textarea from blurring at all, so there's no risk of its delayed hideLookupDropdown timeout
+// closing the checklist again right after this reopens it.
+destinationPills.addEventListener('mousedown', (e) => {
+  const btn = e.target.closest('.destination-pill-remove');
+  if (!btn) return;
+  e.preventDefault();
+  selectedDestinations.delete(btn.dataset.id);
+  renderDestinationPills();
+  // Keep the checklist's checkmark in sync if it's currently open, without resetting the filter
+  // the user may still be mid-search on.
+  if (currentExpecting && currentExpecting.field === 'destination' && lookupDropdown.style.display === 'block') {
+    renderLookupDropdown(lookupItems, LOOKUP_EMPTY_TEXT.destination, true);
+  }
+  input.focus();
+});
 
 // Every popover above the input (lookup dropdown, calendar, pax spinners, pricing-extras form) is
 // position:absolute and floats upward out of .chat-bottom's own box - with nothing reserving that
@@ -166,7 +226,7 @@ function renderLookupDropdown(items, emptyText, multi) {
       .join('');
     const count = selectedDestinations.size;
     lookupDropdown.innerHTML = `<div class="lookup-multi-list">${rows}</div><div class="lookup-multi-footer">${
-      count ? `${count} selected — press Enter to submit` : 'Tick one or more destinations'
+      count ? `${count} selected (see below) — clear the search and press Enter, or tap Send, to submit` : 'Type to search, or tick a destination to add it'
     }</div>`;
   } else {
     lookupDropdown.innerHTML = items
@@ -605,20 +665,22 @@ function hideItineraryOptionalPicker() {
 
 function setExpecting(expecting) {
   // Leaving the destination checklist (answer submitted, or a different field is now being asked)
-  // clears the ticks so a later booking's checklist doesn't start pre-checked from a previous one.
+  // clears the ticks/pills so a later booking's checklist doesn't start pre-checked from a
+  // previous one.
   if (currentExpecting && currentExpecting.field === 'destination' && (!expecting || expecting.field !== 'destination')) {
     selectedDestinations.clear();
+    renderDestinationPills();
   }
   currentExpecting = expecting;
 
   // Editing an EXISTING booking's destinations (chat.js's pendingDestinationsEntry) sends the
-  // record's current selection as expecting.preselected - pre-tick those so staff see (and adjust)
-  // what's already there instead of re-picking from scratch. New-booking creation's own
-  // destinationNames step never sets this, so that checklist still starts blank as before.
+  // record's current selection as expecting.preselected - pre-tick those (as pills, not text) so
+  // staff see (and adjust) what's already there instead of re-picking from scratch. New-booking
+  // creation's own destinationNames step never sets this, so that checklist still starts blank.
   if (expecting && expecting.field === 'destination' && Array.isArray(expecting.preselected)) {
     selectedDestinations.clear();
     for (const d of expecting.preselected) selectedDestinations.set(String(d.Id), d.Name);
-    syncDestinationInputValue();
+    renderDestinationPills();
   }
 
   if (expecting && expecting.field === 'date') {
@@ -684,12 +746,10 @@ function setExpecting(expecting) {
     hideLookupDropdown();
     return;
   }
-  // The destination checklist's initial render always shows the FULL list, regardless of
-  // input.value - syncDestinationInputValue() above may have just pre-filled input.value with the
-  // preselected names (e.g. "Bangkok, Chiang Mai") for a live-record edit, and using that as the
-  // search query here would filter the dropdown down to (usually) nothing, hiding every checkbox
-  // including the ones that should show pre-ticked. Typing to filter afterward still works via the
-  // separate input 'input' event listener below.
+  // The destination checklist's initial render always shows the FULL list - preselected
+  // destinations (a live-record edit) are shown as pills, not typed into the search box, so there's
+  // never leftover search text here that would filter the dropdown down to nothing. Typing to
+  // filter still works via the separate input 'input' event listener below.
   fetchLookupOptions(expecting, expecting.field === 'destination' ? '' : input.value.trim());
 }
 
@@ -721,10 +781,21 @@ lookupDropdown.addEventListener('mousedown', (e) => {
   if (multiRow) {
     e.preventDefault();
     const id = multiRow.dataset.id;
-    if (selectedDestinations.has(id)) selectedDestinations.delete(id);
-    else selectedDestinations.set(id, multiRow.dataset.name);
-    syncDestinationInputValue();
-    renderLookupDropdown(lookupItems, LOOKUP_EMPTY_TEXT.destination, true);
+    if (selectedDestinations.has(id)) {
+      // Unticking keeps whatever's currently typed/filtered as-is - the user is likely still
+      // mid-search, so only the checkmark itself should change.
+      selectedDestinations.delete(id);
+      renderDestinationPills();
+      renderLookupDropdown(lookupItems, LOOKUP_EMPTY_TEXT.destination, true);
+    } else {
+      // Ticking is a "pick", not a partial edit - the search box clears and the list resets back
+      // to the full set, ready for the next search, same as picking a recipient in a tag input.
+      selectedDestinations.set(id, multiRow.dataset.name);
+      renderDestinationPills();
+      input.value = '';
+      updateCharCount();
+      fetchLookupOptions(currentExpecting, '');
+    }
     input.focus();
     return;
   }
@@ -777,7 +848,17 @@ input.addEventListener('keydown', (e) => {
       if (!sendBtn.disabled) sendMessage(input.value);
       return;
     }
-    const dropdownOpen = !(currentExpecting && currentExpecting.multi) && lookupDropdown.style.display === 'block' && lookupItems.length > 0;
+    // The destination checklist's Enter key never sends raw typed text - typing is only ever a
+    // search there (see commitDestinationMatchIfUnambiguous). With something still typed, Enter
+    // commits the one unambiguous match as a pill and keeps the field open for more; with the
+    // search box empty, Enter submits whatever pills have been picked so far.
+    if (currentExpecting && currentExpecting.multi) {
+      e.preventDefault();
+      if (input.value.trim()) commitDestinationMatchIfUnambiguous();
+      else submitDestinationPills();
+      return;
+    }
+    const dropdownOpen = lookupDropdown.style.display === 'block' && lookupItems.length > 0;
     if (dropdownOpen && lookupActiveIndex >= 0) {
       e.preventDefault();
       const item = lookupItems[lookupActiveIndex];
@@ -979,7 +1060,7 @@ function addDataToggle(wrap, rows, rowCount, rowsTruncated) {
   btn.className = 'show-more-btn';
   btn.textContent = rowsTruncated
     ? `View all ${rows.length} of ${rowCount} ${noun}`
-    : `View ${rows.length} ${noun} from the database`;
+    : `View ${rows.length} ${noun}`;
   btn.addEventListener('click', () => openDataDrawer(rows, rowCount, rowsTruncated));
 
   wrap.appendChild(btn);
@@ -1230,6 +1311,14 @@ input.addEventListener('input', updateCharCount);
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
+  // Same rule as the Enter key: the destination checklist's Send button never sends raw typed
+  // text. Any leftover unambiguous search match gets committed as a pill first, so clicking Send
+  // right after typing a match (without an extra click on it) doesn't silently drop it.
+  if (currentExpecting && currentExpecting.multi) {
+    commitDestinationMatchIfUnambiguous();
+    submitDestinationPills();
+    return;
+  }
   sendMessage(input.value);
 });
 

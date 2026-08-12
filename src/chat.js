@@ -13,7 +13,7 @@ const duplicateBooking = require('./duplicateBooking');
 const bookingEditForms = require('./bookingEditForms');
 const { findBookingById } = require('./bookingApi');
 const { isAnyCancel } = require('./cancel');
-const { findDestinations, listDestinations } = require('./lookups');
+const { findDestinations, listDestinations, findHotel, findHotelRoomType } = require('./lookups');
 const jobSheetCopy = require('./jobSheetCopy');
 const agentCreate = require('./agentCreate');
 
@@ -22,39 +22,79 @@ const sessions = new Map();
 const MAX_TURNS = 6; // user+assistant pairs kept for context
 
 function getSession(sessionId) {
-  if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], draft: null, pendingItinerary: null, pendingDocChoice: null, pendingHotelChoice: null, pendingCodeChoice: null, pendingRecordChoice: null, pendingStatusChange: null, pendingCreateConfirm: null, pendingConvertConfirm: null, pendingFieldEditConfirm: null, pendingAgentCreate: null, lastBookingCode: null });
+  if (!sessions.has(sessionId))
+    sessions.set(sessionId, {
+      history: [],
+      draft: null,
+      pendingItinerary: null,
+      pendingDocChoice: null,
+      pendingHotelChoice: null,
+      pendingCodeChoice: null,
+      pendingRecordChoice: null,
+      pendingStatusChange: null,
+      pendingCreateConfirm: null,
+      pendingConvertConfirm: null,
+      pendingFieldEditConfirm: null,
+      pendingAgentCreate: null,
+      pendingAddHotel: null,
+      pendingAmbiguousDetail: null,
+      lastBookingCode: null,
+      // Interrupt-and-resume (see detectAnyFreshIntent/handleChatInner's interrupt check and
+      // handleChat's resume check below): pausedFlows is a stack so a request can interrupt an
+      // already-interrupted flow too, each popped back in reverse order. lastFlowSnapshot is
+      // refreshed after every turn a flow is active, so whichever one is live always has an
+      // up-to-date {reply, expecting, quickReplies} ready to pause if the very next message
+      // turns out to be an interruption.
+      pausedFlows: [],
+      lastFlowSnapshot: null,
+    });
   return sessions.get(sessionId);
 }
+
+// Single source of truth for every session field that represents "a guided flow is waiting on the
+// next message" - isFlowActive/cancelFlows/activeStateKey (interrupt-and-resume, below) all derive
+// from this same list so they can never drift out of sync with each other again.
+const PENDING_STATE_KEYS = [
+  'draft',
+  'pendingStatusChange',
+  'pendingItinerary',
+  'pendingDocChoice',
+  'pendingHotelChoice',
+  'pendingCodeChoice',
+  'pendingRecordChoice',
+  'pendingCreateConfirm',
+  'pendingConvertConfirm',
+  'pendingFieldEditConfirm',
+  'pendingDuplicateConfirm',
+  'pendingPostDuplicateEdit',
+  'pendingEditSectionChoice',
+  'pendingBasicFieldChoice',
+  'pendingHotelRowChoice',
+  'pendingFieldValueEntry',
+  'pendingDestinationsEntry',
+  'pendingHotelFieldChoice',
+  'pendingHotelFieldValue',
+  'pendingHotelFieldConfirm',
+  'pendingFieldSectionChoice',
+  'pendingFieldSectionValue',
+  'pendingFieldSectionConfirm',
+  'pendingAgentCreate',
+  'pendingAddHotel',
+  'pendingAmbiguousDetail',
+];
 
 // True while the session is inside a guided multi-message flow, so the UI can offer a visible
 // "Cancel" button instead of relying on the user knowing the right word to type.
 function isFlowActive(session) {
-  return !!(
-    session.draft ||
-    session.pendingStatusChange ||
-    session.pendingItinerary ||
-    session.pendingDocChoice ||
-    session.pendingHotelChoice ||
-    session.pendingCodeChoice ||
-    session.pendingRecordChoice ||
-    session.pendingCreateConfirm ||
-    session.pendingConvertConfirm ||
-    session.pendingFieldEditConfirm ||
-    session.pendingDuplicateConfirm ||
-    session.pendingPostDuplicateEdit ||
-    session.pendingEditSectionChoice ||
-    session.pendingBasicFieldChoice ||
-    session.pendingHotelRowChoice ||
-    session.pendingFieldValueEntry ||
-    session.pendingDestinationsEntry ||
-    session.pendingHotelFieldChoice ||
-    session.pendingHotelFieldValue ||
-    session.pendingHotelFieldConfirm ||
-    session.pendingFieldSectionChoice ||
-    session.pendingFieldSectionValue ||
-    session.pendingFieldSectionConfirm ||
-    session.pendingAgentCreate
-  );
+  return PENDING_STATE_KEYS.some((key) => !!session[key]);
+}
+
+// Whichever ONE of PENDING_STATE_KEYS is currently truthy (this codebase never has more than one
+// active at once - every entry point into a new flow only fires from a fully clean session), or
+// null if none is. Used by the interrupt-and-resume mechanism to know which field to snapshot/
+// restore without hardcoding a duplicate list of its own.
+function activeStateKey(session) {
+  return PENDING_STATE_KEYS.find((key) => !!session[key]) || null;
 }
 
 // Hard reset of every guided flow - what the UI's Cancel button calls. Deliberately unconditional
@@ -62,31 +102,66 @@ function isFlowActive(session) {
 function cancelFlows(sessionId) {
   const session = getSession(sessionId);
   const wasActive = isFlowActive(session);
-  session.draft = null;
-  session.pendingItinerary = null;
-  session.pendingDocChoice = null;
-  session.pendingHotelChoice = null;
-  session.pendingCodeChoice = null;
-  session.pendingRecordChoice = null;
-  session.pendingStatusChange = null;
-  session.pendingCreateConfirm = null;
-  session.pendingConvertConfirm = null;
-  session.pendingFieldEditConfirm = null;
-  session.pendingDuplicateConfirm = null;
-  session.pendingPostDuplicateEdit = null;
-  session.pendingEditSectionChoice = null;
-  session.pendingBasicFieldChoice = null;
-  session.pendingHotelRowChoice = null;
-  session.pendingFieldValueEntry = null;
-  session.pendingDestinationsEntry = null;
-  session.pendingHotelFieldChoice = null;
-  session.pendingHotelFieldValue = null;
-  session.pendingHotelFieldConfirm = null;
-  session.pendingFieldSectionChoice = null;
-  session.pendingFieldSectionValue = null;
-  session.pendingFieldSectionConfirm = null;
-  session.pendingAgentCreate = null;
+  for (const key of PENDING_STATE_KEYS) session[key] = null;
   return wasActive;
+}
+
+// Cheap, synchronous "would ANY fresh-message intent fire for this text" check - reuses every
+// intent detector the fresh-message dispatch chain in handleChatInner already calls, WITHOUT
+// actually resolving/running any of them (no DB calls, no side effects). Used only to decide
+// whether a message arriving while a flow is already active should interrupt it - see
+// handleChatInner's interrupt check below, which (if this returns true) pauses the active flow and
+// lets the SAME message fall through to that real dispatch chain afterward, unchanged.
+// Deliberately does NOT fall back to "did nothing else match" (the generic SQL-planner path has no
+// detector of its own - it's the last resort for everything else) - that would make literally any
+// unrecognised text interrupt the active flow, including a plain answer like a guest's name that
+// just doesn't happen to look like anything else. Only a SPECIFIC, high-precision intent match
+// counts as an interruption.
+function detectAnyFreshIntent(userMessage, session) {
+  const specificMatch = !!(
+    convertBooking.detectConvertIntent(userMessage, session.lastBookingCode) ||
+    duplicateBooking.detectDuplicateIntent(userMessage, session.lastBookingCode) ||
+    editBooking.detectSimpleFieldEditIntent(userMessage, session.lastBookingCode) ||
+    editBooking.detectItineraryEditIntent(userMessage, session.lastBookingCode) ||
+    detectEditMenuIntent(userMessage, session.lastBookingCode) ||
+    bookingFlow.detectCreateIntent(userMessage) ||
+    agentCreate.detectAgentCreateIntent(userMessage) ||
+    statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode) ||
+    jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST()) ||
+    documents.detectDocumentIntent(userMessage, session.lastBookingCode) ||
+    (!ANY_CODE_RE.test(userMessage) && financeReports.detectFinanceReportIntent(userMessage)) ||
+    accountTransactions.detectAccountTransactionsIntent(userMessage, session.lastBookingCode) ||
+    bookingDetails.detectFullDetailIntent(userMessage) ||
+    bookingFlow.looksLikeStandaloneAgentPaste(userMessage)
+  );
+  if (specificMatch) return true;
+
+  // A plain read-only question ("what is the status of FT08261803", "give me details of FTQ...")
+  // often matches none of the specific detectors above by design - detectStatusUpdateIntent, for
+  // instance, deliberately only fires on a change INSTRUCTION, never a question. Those questions
+  // have no detector of their own; they're answered by the generic SQL-planner fallback, which this
+  // function otherwise never treats as a signal (see the function's own top comment for why). But a
+  // DIFFERENT FT/FTQ code than whatever the active flow already concerns itself with is still a
+  // strong, low-risk signal of a genuine context switch on its own - the same "different code means
+  // different intent" rule the narrower pendingXxx.code guard elsewhere in this file already uses.
+  // Falling through to the fresh-dispatch chain with nothing else active naturally lands such a
+  // question on that same SQL-planner path and answers it correctly.
+  const codeMatch = userMessage.match(ANY_CODE_RE);
+  if (!codeMatch) return false;
+  const activeCode = getActiveFlowCode(session);
+  return !activeCode || activeCode.toUpperCase() !== codeMatch[0].toUpperCase();
+}
+
+// The record code (if any) the currently active flow already concerns itself with - draft-based
+// flows only carry one via editContext (an itinerary-edit draft seeded from a live record); a
+// brand-new booking/quotation draft has no code yet at all. Every pendingXxx shape that's about a
+// specific record stores it as a plain .code property.
+function getActiveFlowCode(session) {
+  const key = activeStateKey(session);
+  if (!key) return null;
+  if (key === 'draft') return (session.draft.editContext && session.draft.editContext.code) || null;
+  const state = session[key];
+  return (state && state.code) || null;
 }
 
 const TABLE_LINE_RE = /^\s*\|.*\|\s*$/;
@@ -334,6 +409,25 @@ function extractSql(text) {
   return null;
 }
 
+// Runs BEFORE any SQL is written - asks the model to restate what the question is actually asking
+// for, grounded in the real schema (which table(s), which columns, which filters, how tables relate
+// if a join is needed), instead of jumping straight from question to query in one shot. Genuinely
+// reduces wrong/half-right SQL on ambiguous or multi-step questions ("top agents by bookings last
+// quarter" needs a GROUP BY + date filter + ORDER BY all correctly combined) by forcing the model to
+// reason about intent first. Costs a second Groq call per question - this app's free-tier quota is
+// already juggled across several models/keys (see llm.js) specifically because of that added load,
+// so this is deliberately only used for the read-only Q&A path, not the booking-creation/status
+// flows, which stay single-call and deterministic.
+function understandSystemPrompt() {
+  return `You are FlyThai's internal database assistant. Before any SQL gets written, restate what this question is actually asking for, in concrete terms grounded in the real schema below - which table(s), which columns, which filters (dates, statuses, IDs, names), and how multiple tables relate if a join is needed. If the question is ambiguous, state the most reasonable interpretation and any assumption you're making explicit (e.g. "this month" -> the current calendar month, "top agents" -> ranked by count of their bookings).
+Today's date is ${todayIST()} and the current time is ${nowTimeIST()} (Asia/Kolkata timezone).
+
+DATABASE SCHEMA:
+${SCHEMA_DOC}
+
+Reply with a short plain-text plan only (3-6 lines) - table(s)/columns/filters/joins needed and why. Do NOT write SQL here. If the message is a greeting, thanks, or general chit-chat that clearly needs no DB lookup, reply with exactly: NONE`;
+}
+
 function plannerSystemPrompt() {
   return `You are FlyThai's internal database assistant, used by travel-agency staff to look up quotations, bookings, hotels, job sheets, accounts, agents and inquiries.
 You must answer ONLY using real data fetched from the company's live SQL Server database. Never invent, guess, or assume data that isn't returned by a query.
@@ -420,6 +514,48 @@ JOB SHEET / VENDOR CONFIRMATION LIST ANSWERS — always use this fixed layout fo
 - One markdown table row per job sheet (JobSheetMaster row) — per the MULTI-RECORD LIST rule above, several job sheets sharing one Booking ID are separate real records here and each gets its own row, never merged.
 - Table columns, in this order, including only the columns the JSON actually has data for: Booking ID | Guest Name | Vendor Name | Travel Date | Vendor Confirmation | Customer Update | Lunch Status | Dinner Status. (BookingSentStatus is "Vendor Confirmation", CustomerSentStatus is "Customer Update".)
 - Open with the count exactly as the COUNTS note instructs (e.g. "Found 46 job sheets with vendor confirmation pending:").`;
+}
+
+// Turns a resolved (status 'ok') full-detail lookup into the final answer - shared by the first
+// attempt (bookingDetails.detectFullDetailIntent matched unambiguously right away) and the
+// pendingAmbiguousDetail continuation below (resolved via dropdown selection instead).
+async function finishFullDetailAnswer(sessionId, userMessage, resolved) {
+  const answererMessages = [
+    { role: 'system', content: answererSystemPrompt() },
+    {
+      role: 'user',
+      content: `User's question: ${userMessage}\n\nFull booking data, as JSON (booking = main record, hotels = hotel stays, hotelExtras = extra charges per hotel keyed by BookingHotelId, itinerary = day-by-day activities, costBreakdown = traveller-type pricing rows, costSummary = precomputed Total Cost/ROE/Total After ROE/Discount/Final Amount - already calculated correctly, just format it, do not recompute):\n${JSON.stringify(resolved.data)}`,
+    },
+  ];
+  let answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
+  // See buildCostBreakdownSection's own comment - the model asked for this section sometimes drops
+  // it entirely, and sometimes keeps the section but gets a row wrong (reproduced live for
+  // FT08261794/Devansh: it showed each row's raw per-person Price instead of Price x PAX - e.g.
+  // "THB 10,000" for a 3-pax row that should read 30,000 - a real financial figure staff could act
+  // on, even though the Total Cost line taken straight from costSummary was correct). Always REPLACE
+  // whatever the model produced for this section (or insert one if it produced none) with a
+  // deterministically-built one, rather than only filling a gap - money math here is never trusted
+  // to the model, matching the same standard accountTransactions.js already applies.
+  const hasCostData = (resolved.data.costBreakdown && resolved.data.costBreakdown.length > 0) || resolved.data.costSummary;
+  if (hasCostData) {
+    const withoutLLMSection = answer.replace(/###\s*cost breakdown[\s\S]*?(?=\n###\s|$)/i, '').trim();
+    const section = buildCostBreakdownSection(resolved.data);
+    // Keeps the fixed section order the prompt itself specifies (Cost Breakdown before Payments/Job
+    // Sheet/Other) when that section is present; otherwise just appends at the end.
+    answer = /###\s*payments/i.test(withoutLLMSection)
+      ? withoutLLMSection.replace(/(?=###\s*payments)/i, `${section}\n\n`)
+      : `${withoutLLMSection}\n\n${section}`;
+  }
+  pushTurn(sessionId, userMessage, answer);
+  return { answer, sql: null, rowCount: 1 };
+}
+
+// Same idea for a resolved (status 'ok') account-transactions lookup.
+function finishAcctTxnAnswer(sessionId, userMessage, result) {
+  const reply = accountTransactions.formatAccountTransactionsAnswer(result);
+  const rows = [...result.salePurchase, ...result.receiptPayment];
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: rows.length, rows: rows.length ? rows : undefined, rowsTruncated: false };
 }
 
 const ANY_CODE_RE = /\bFTQ?\d+\b/i;
@@ -854,6 +990,14 @@ function quickRepliesFor(draft) {
       { label: 'Add pricing line', value: 'add pricing line', autoSend: true },
     ];
   }
+  // "Add another pricing line?" after one's just been added (stepPriceCollectAnother) - plain
+  // yes/no gate, single-tap, auto-send, same as hotelAddAnother above.
+  if (draft && draft.phase === 'priceCollectAnother') {
+    return [
+      { label: 'Yes', value: 'yes', autoSend: true },
+      { label: 'No', value: 'no', autoSend: true },
+    ];
+  }
   if (draft && draft.phase === 'priceExtras') return ['Skip'];
   // Gate before the final note/emergency-contact/booked-by/PDF-permission form - most bookings
   // need none of it, so "Skip" goes straight to confirm without ever opening the form.
@@ -909,8 +1053,31 @@ function weekdayNameFromDDMMYYYY(dateStr) {
 }
 
 async function handleChat(sessionId, userMessage) {
-  const result = await handleChatInner(sessionId, userMessage);
-  return { ...result, flowActive: isFlowActive(getSession(sessionId)) };
+  let result = await handleChatInner(sessionId, userMessage);
+  const session = getSession(sessionId);
+
+  if (!isFlowActive(session) && session.pausedFlows.length > 0) {
+    // Whatever just ran (the interruption, or a normal message with nothing paused before it) has
+    // now fully finished on its own - resume the most recently paused flow by restoring its session
+    // field and re-showing the exact question it was asking, so "continue back where we stopped"
+    // means literally that, not just silently un-pausing state with no visible prompt.
+    const paused = session.pausedFlows.pop();
+    session[paused.stateKey] = paused.stateValue;
+    result = {
+      ...result,
+      answer: `${result.answer}\n\n---\nContinuing where we left off:\n\n${paused.reply}`,
+      expecting: paused.expecting,
+      quickReplies: paused.quickReplies,
+    };
+    // Refreshed immediately so a SECOND interruption right after this one still has a correct,
+    // up-to-date snapshot to pause in turn.
+    session.lastFlowSnapshot = { reply: paused.reply, expecting: paused.expecting, quickReplies: paused.quickReplies };
+  } else {
+    const key = activeStateKey(session);
+    if (key) session.lastFlowSnapshot = { reply: result.answer, expecting: result.expecting, quickReplies: result.quickReplies };
+  }
+
+  return { ...result, flowActive: isFlowActive(session) };
 }
 
 // Shared "which one did you mean?" prompt for a code that matched more than one real row (convert/
@@ -923,6 +1090,30 @@ function askWhichRecord(sessionId, session, userMessage, code, matches, kind, ex
   session.pendingRecordChoice = { code, matches, kind, extra };
   pushTurn(sessionId, userMessage, reply);
   return { answer: reply, sql: null, rowCount: 0 };
+}
+
+// Same "which one did you mean?" situation as askWhichRecord above, but for the two read-only
+// detail paths (full booking detail, account transactions) - rendered as a real dropdown popover
+// (the same single-select lookup UI agent/hotel/destination already use) instead of a numbered
+// list, since picking one is genuinely "select from these real records", not free text. Selecting
+// an item sends back its own BookingId/QuotationId as plain text; pendingAmbiguousDetail below
+// resolves it directly against pending.matches and re-runs the same lookup by internal Id - no
+// re-parsing of "detail"/"account transactions" keywords needed.
+function respondAmbiguousDetail(sessionId, session, userMessage, label, matches, kind) {
+  // The list itself lives only in the dropdown below (expecting.options) - repeating it as text
+  // here too was pure duplication, since selecting only ever happens from that dropdown anyway.
+  const reply = `**${label}** matches more than one record — select the one you meant below.`;
+  session.pendingAmbiguousDetail = { matches, kind };
+  pushTurn(sessionId, userMessage, reply);
+  return {
+    answer: reply,
+    sql: null,
+    rowCount: matches.length,
+    expecting: {
+      field: 'ambiguousDetail',
+      options: matches.map((m) => ({ Id: m.Id, Name: m.BookingId || m.QuotationId, ShortCode: m.GuestName })),
+    },
+  };
 }
 
 // Finishes a convert-to-booking check (not_found/already_booking/invalid/ok) - shared by the fresh
@@ -1037,21 +1228,28 @@ async function openEditSection(sessionId, session, userMessage, code, guestName,
     }
     const hotels = resolved.raw.hotelDetails || [];
     if (hotels.length === 0) {
-      const reply = `**${code}** is self-booked for hotel — there's no hotel entry to edit.`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
+      // Nothing existing to choose between (self-booked, or no hotel added yet) - go straight to
+      // adding one instead of a dead-end "nothing to edit" message.
+      return startAddHotel(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw);
     }
-    if (hotels.length === 1) {
-      return openHotelFieldChoice(sessionId, session, userMessage, resolved.code, resolved.guestName, resolved.raw, 0);
-    }
+    // Always offers a choice, even with just one existing hotel - previously jumped straight into
+    // editing that one hotel's fields, with no way to instead add a brand-new hotel to the booking
+    // (there was no path to that at all from here). "Add new hotel" sits alongside whichever
+    // existing hotel(s) are on file so picking one to edit is still just as fast as before.
     session.pendingHotelRowChoice = { code: resolved.code, guestName: resolved.guestName, raw: resolved.raw };
-    const reply = `**${resolved.code}** has more than one hotel — which one would you like to update?`;
+    const reply =
+      hotels.length === 1
+        ? `**${resolved.code}** has **${hotels[0].name}** on file — update it, or add a new hotel to this booking?`
+        : `**${resolved.code}** has more than one hotel — which one would you like to update, or add a new one?`;
     pushTurn(sessionId, userMessage, reply);
     return {
       answer: reply,
       sql: null,
       rowCount: 0,
-      quickReplies: hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+      quickReplies: [
+        ...hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+        { label: 'Add new hotel', value: 'add new hotel', autoSend: true },
+      ],
     };
   }
   if (/\bprice\b/.test(t)) {
@@ -1099,6 +1297,335 @@ function openHotelFieldChoice(sessionId, session, userMessage, code, guestName, 
   return { answer: reply, sql: null, rowCount: 0, quickReplies: HOTEL_FIELD_CHOICE_CHIPS };
 }
 
+// ---------- add a brand-new hotel row to an already-saved booking/quotation ----------
+// Mirrors bookingFlow.js's own hotelCollect step (same 7 required fields, same order, same real
+// dropdown/calendar UI, same findHotel/findHotelRoomType lookups) for a NEW booking's hotel - this
+// is that same collection, just appending the finished row onto a live record's raw.hotelDetails
+// and resubmitting via bookingEditForms.saveRawPatch instead of building a fresh draft.
+
+const ADD_HOTEL_WHOLE_NUMBER_RE = /^\d+$/;
+const ADD_HOTEL_DECIMAL_NUMBER_RE = /^\d+(\.\d+)?$/;
+
+// Same strict DD-MM-YYYY validation as bookingFlow.js's own parseDateDDMMYYYY (rejects impossible
+// calendar dates like 31-02-2026, which new Date(y, m, d) alone would silently roll over instead
+// of catching) - redefined here since bookingFlow.js doesn't export it.
+function parseStrictDDMMYYYY(str) {
+  if (!str || typeof str !== 'string') return null;
+  const parts = str.trim().split('-');
+  if (parts.length !== 3) return null;
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+  if (Number.isNaN(day) || Number.isNaN(month) || Number.isNaN(year)) return null;
+  const date = new Date(year, month, day);
+  if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) return null;
+  return date;
+}
+
+function isoToLocalDateOnly(iso) {
+  if (!iso) return null;
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function addHotelDestOptions(destinations) {
+  return destinations.map((d) => (d.ShortCode ? `${d.Name} (${d.ShortCode})` : d.Name)).join(', ');
+}
+
+function addHotelStepPrompt(stepKey, pending) {
+  switch (stepKey) {
+    case 'destinationName':
+      return `Which destination is this hotel for? Available: ${addHotelDestOptions(pending.destinations)}`;
+    case 'hotelName':
+      return "What is the hotel's name?";
+    case 'checkInDate':
+      return 'What is the check-in date? (DD-MM-YYYY)';
+    case 'checkOutDate':
+      return 'What is the check-out date? (DD-MM-YYYY)';
+    case 'roomCategory':
+      return 'What is the room category? (e.g. "Superior Room Sin/Dou")';
+    case 'totalRooms':
+      return 'How many rooms?';
+    case 'ratePerNight': {
+      const h = pending.current;
+      if (h._roomTypeRate != null) {
+        return `What is the rate per night? (reply "same" to use this room type's own rate: ${h._roomTypeRate} ${h._roomTypeCurrency || 'THB'})`;
+      }
+      return 'What is the rate per night? (just the number - currency defaults to THB)';
+    }
+    default:
+      return '';
+  }
+}
+
+const ADD_HOTEL_FIELD_ORDER = ['destinationName', 'hotelName', 'checkInDate', 'checkOutDate', 'roomCategory', 'totalRooms', 'ratePerNight'];
+
+// Entry point - reached either when a booking/quotation has nothing existing to choose from
+// (self-booked, or no hotel added yet) or by picking "Add new hotel" alongside existing ones (see
+// the /\bhotel\b/ branch in openEditSection and the pendingHotelRowChoice handler below).
+async function startAddHotel(sessionId, session, userMessage, code, guestName, raw) {
+  const destinations = await resolveDestinationIdsToNames(raw.destinations);
+  const current = {};
+  let step;
+  if (destinations.length === 1) {
+    current.destinationId = destinations[0].Id;
+    current.destinationName = destinations[0].Name;
+    step = 'hotelName';
+  } else {
+    step = 'destinationName';
+  }
+  session.pendingAddHotel = { code, guestName, raw, destinations, step, current };
+  const reply = `Let's add a new hotel to **${code}**. ${addHotelStepPrompt(step, session.pendingAddHotel)}`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, expecting: expectingFieldForAddHotel(session.pendingAddHotel) };
+}
+
+// Same shape expectingField(draft) uses for bookingFlow.js's own hotelCollect step - real
+// dropdown/calendar UI per field, just keyed off pending.step instead of draft.hotelStep.
+function expectingFieldForAddHotel(pending) {
+  const h = pending.current;
+  switch (pending.step) {
+    case 'destinationName':
+      return { field: 'destination', options: pending.destinations.map((d) => ({ Id: d.Id, Name: d.Name, ShortCode: d.ShortCode })) };
+    case 'hotelName':
+      return { field: 'hotel', params: h.destinationId ? { destinationId: h.destinationId } : {} };
+    case 'checkInDate':
+      return { field: 'date', params: { min: pending.raw.travelDate, max: pending.raw.returnDate } };
+    case 'checkOutDate': {
+      const checkInISO = h.checkInDate ? ddmmyyyyToISO(h.checkInDate) : null;
+      return { field: 'date', params: { min: checkInISO ? addDaysISO(checkInISO, 1) : pending.raw.travelDate, max: pending.raw.returnDate } };
+    }
+    case 'roomCategory':
+      return h._resolvedHotelId ? { field: 'roomType', params: { hotelId: h._resolvedHotelId } } : undefined;
+    default:
+      return undefined;
+  }
+}
+
+// Continues an in-progress add-hotel conversation - destinationName (only when the booking covers
+// more than one) -> hotelName -> checkInDate -> checkOutDate -> roomCategory -> totalRooms ->
+// ratePerNight -> confirm.
+async function stepAddHotel(sessionId, session, userMessage, pending) {
+  const { code, raw, destinations } = pending;
+  const h = pending.current;
+  const answer = userMessage.trim();
+
+  if (pending.step === 'confirm') {
+    const yn = bookingFlow.parseYesNo(answer);
+    if (yn === true) {
+      try {
+        const checkIn = parseStrictDDMMYYYY(h.checkInDate);
+        const checkOut = parseStrictDDMMYYYY(h.checkOutDate);
+        const totalNights = Math.round((checkOut - checkIn) / 86400000);
+        const newRow = {
+          id: 0,
+          destinationId: h.destinationId,
+          hotelId: h._resolvedHotelId || 0,
+          name: h.hotelName,
+          roomCategory: h.roomCategory,
+          totalRooms: h.totalRooms,
+          totalNights,
+          checkInDate: h.checkInDate,
+          checkOutDate: h.checkOutDate,
+          roomRemarks: '',
+          address: '',
+          contact: '',
+          email: '',
+          ratePerNight: h.ratePerNight,
+          ratePerNightCurrency: 'THB',
+          totalAdults: '0',
+          children: 0,
+          infants: 0,
+          destinationname: h.destinationName,
+          selfBooked: false,
+          confirmationId: '',
+          attributes: [],
+          adultCostType: '',
+          childCostType: '',
+          breakfast: '',
+        };
+        const hotelDetails = [...(raw.hotelDetails || []), newRow];
+        await bookingEditForms.saveRawPatch(raw, { hotelDetails });
+        const reply = `Added **${h.hotelName}** (${h.roomCategory}, ${totalNights} night(s)) to **${code}**.`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      } catch (err) {
+        const reply = `Sorry, saving that failed: ${err.message}`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      }
+    }
+    if (yn === false) {
+      const reply = `Okay, cancelled — no new hotel was added to **${code}**.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    session.pendingAddHotel = pending;
+    const reply = `Reply "yes" to add this hotel, or "no" to cancel.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+  }
+
+  // Resolve a pending "which hotel did you mean?" sub-question from the previous turn first - same
+  // "show real matches, never silently accept whatever was typed" standard as bookingFlow.js's own
+  // hotelCollect step.
+  if (h._hotelNameOptions) {
+    const picked = h._hotelNameOptions.find((o) => o.Name.toLowerCase() === answer.toLowerCase());
+    if (picked) {
+      h.hotelName = picked.Name;
+      h._resolvedHotelId = picked.Id;
+    } else if (/^new\b/i.test(answer)) {
+      h._resolvedHotelId = 0;
+    } else {
+      session.pendingAddHotel = pending;
+      const opts = h._hotelNameOptions.map((o) => `- ${o.Name}`).join('\n');
+      const reply = `Please reply with the exact hotel name from the list, or "new" to add "${h.hotelName}" as a new entry:\n${opts}`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    delete h._hotelNameOptions;
+  } else {
+    switch (pending.step) {
+      case 'destinationName': {
+        const destQuery = answer.toLowerCase();
+        const dest = destinations.find((d) => d.Name.toLowerCase() === destQuery || (d.ShortCode && d.ShortCode.toLowerCase() === destQuery));
+        if (!dest) {
+          session.pendingAddHotel = pending;
+          const reply = `"${answer}" isn't one of this booking's destinations (${addHotelDestOptions(destinations)}). Which one is this hotel for?`;
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.destinationId = dest.Id;
+        h.destinationName = dest.Name;
+        break;
+      }
+      case 'hotelName': {
+        const found = await findHotel(answer);
+        if (found.length > 1) {
+          h._hotelNameOptions = found;
+          h.hotelName = answer;
+          session.pendingAddHotel = pending;
+          const opts = found.map((o) => `- ${o.Name}`).join('\n');
+          const reply = `A few hotels match "${answer}":\n${opts}\nWhich one did you mean? (or reply "new" to add "${answer}" as a new hotel entry)`;
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.hotelName = found.length === 1 ? found[0].Name : answer;
+        h._resolvedHotelId = found.length === 1 ? found[0].Id : 0;
+        break;
+      }
+      case 'checkInDate': {
+        const checkIn = parseStrictDDMMYYYY(answer);
+        if (!checkIn) {
+          session.pendingAddHotel = pending;
+          const reply = 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        const travelDate = isoToLocalDateOnly(raw.travelDate);
+        const returnDate = isoToLocalDateOnly(raw.returnDate);
+        if ((travelDate && checkIn < travelDate) || (returnDate && checkIn > returnDate)) {
+          session.pendingAddHotel = pending;
+          const reply = `Check-in needs to fall within the trip's own dates (${raw.travelDate} to ${raw.returnDate}) — could you re-enter it?`;
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.checkInDate = answer;
+        break;
+      }
+      case 'checkOutDate': {
+        const checkOut = parseStrictDDMMYYYY(answer);
+        if (!checkOut) {
+          session.pendingAddHotel = pending;
+          const reply = 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        if (checkOut <= parseStrictDDMMYYYY(h.checkInDate)) {
+          session.pendingAddHotel = pending;
+          const reply = 'Check-out date must be after check-in date — could you re-enter it?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        const returnDate = isoToLocalDateOnly(raw.returnDate);
+        if (returnDate && checkOut > returnDate) {
+          session.pendingAddHotel = pending;
+          const reply = `Check-out can't be after the trip's return date (${raw.returnDate}) — could you re-enter it?`;
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.checkOutDate = answer;
+        break;
+      }
+      case 'roomCategory': {
+        h.roomCategory = answer;
+        const roomType = h._resolvedHotelId ? await findHotelRoomType(h._resolvedHotelId, answer) : null;
+        if (roomType) {
+          h._roomTypeRate = roomType.RatePerNight;
+          h._roomTypeCurrency = roomType.Currency;
+        }
+        break;
+      }
+      case 'totalRooms': {
+        if (!ADD_HOTEL_WHOLE_NUMBER_RE.test(answer)) {
+          session.pendingAddHotel = pending;
+          const reply = 'That needs to be digits only, no other text — how many rooms?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        const n = parseInt(answer, 10);
+        if (n <= 0) {
+          session.pendingAddHotel = pending;
+          const reply = 'That needs to be a whole number greater than 0 — how many rooms?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.totalRooms = n;
+        break;
+      }
+      case 'ratePerNight': {
+        if (/^same$/i.test(answer) && h._roomTypeRate != null) {
+          h.ratePerNight = Number(h._roomTypeRate);
+          break;
+        }
+        if (!ADD_HOTEL_DECIMAL_NUMBER_RE.test(answer)) {
+          session.pendingAddHotel = pending;
+          const reply = 'That needs to be digits only, no currency symbol or other text — what is the rate per night?';
+          pushTurn(sessionId, userMessage, reply);
+          return { answer: reply, sql: null, rowCount: 0 };
+        }
+        h.ratePerNight = parseFloat(answer);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  const next = ADD_HOTEL_FIELD_ORDER.find((k) => h[k] === undefined || h[k] === null || h[k] === '');
+  if (next) {
+    pending.step = next;
+    session.pendingAddHotel = pending;
+    const reply = addHotelStepPrompt(next, pending);
+    pushTurn(sessionId, userMessage, reply);
+    // Same one-tap "Same as room type" shortcut the other two hotel flows (new-booking creation,
+    // and editing an existing hotel's rate) already offer - was missing here even though the
+    // prompt text itself already mentioned replying "same".
+    const quickReplies =
+      next === 'ratePerNight' && h._roomTypeRate != null
+        ? [{ label: `Same as room type (${h._roomTypeRate} ${h._roomTypeCurrency || 'THB'})`, value: 'same', autoSend: true }]
+        : undefined;
+    return { answer: reply, sql: null, rowCount: 0, expecting: expectingFieldForAddHotel(pending), quickReplies };
+  }
+
+  pending.step = 'confirm';
+  session.pendingAddHotel = pending;
+  const totalNightsPreview = Math.round((parseStrictDDMMYYYY(h.checkOutDate) - parseStrictDDMMYYYY(h.checkInDate)) / 86400000);
+  const reply = `Add **${h.hotelName}** for **${h.destinationName}** (${h.roomCategory}, ${h.totalRooms} room(s), ${totalNightsPreview} night(s), ${h.checkInDate} → ${h.checkOutDate}, ${h.ratePerNight}/night) to **${code}**? (yes/no)`;
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0, quickReplies: YES_NO_CHIPS };
+}
+
 // Opens a FIELD_SECTIONS field picker (price/remarks/extra) - the flat-field counterpart to
 // openHotelFieldChoice above (these patch a top-level raw key directly, not a nested hotelDetails
 // row, so they share one generic implementation instead of three near-identical copies).
@@ -1124,7 +1651,12 @@ function finishItineraryEditResolve(sessionId, session, userMessage, resolved, f
   session.draft = draft;
   const reply = `Let's add itinerary details to **${resolved.code}** (${resolved.guestName}).\n\n${bookingFlow.askItineraryChoice()}`;
   pushTurn(sessionId, userMessage, reply);
-  return { answer: reply, sql: null, rowCount: 0 };
+  // draft.phase is 'itineraryChoice' with an empty itineraryItems, same shape the new-booking
+  // creation flow's own itinerary question uses - quickRepliesFor already has chips for exactly
+  // this case (Transfer/Sightseeing/Restaurant/Leisure Day/Self-booked), this just wasn't wired up
+  // to return them here. expectingField included too, matching every other draft-based response in
+  // this file, though itineraryChoice itself has no special lookup UI to offer.
+  return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
 }
 
 // Finishes a duplicate-booking resolve (not_found/ok) - shared by the fresh duplicateIntent path
@@ -1239,13 +1771,31 @@ async function handleChatInner(sessionId, userMessage) {
       session.pendingFieldSectionChoice ||
       session.pendingFieldSectionValue ||
       session.pendingFieldSectionConfirm ||
-      session.pendingAgentCreate) &&
+      session.pendingAgentCreate ||
+      session.pendingAddHotel ||
+      session.pendingAmbiguousDetail) &&
     isAnyCancel(userMessage)
   ) {
     cancelFlows(sessionId);
     const reply = 'Okay, cancelled — nothing was changed. What would you like to know?';
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0 };
+  }
+
+  // Interrupt-and-resume: a message that clearly wants something else entirely (a different
+  // booking's status, a brand-new agent, a PDF, a totally different booking to create...) no longer
+  // gets blindly swallowed as if it were the answer to whatever question is currently pending.
+  // Pause the active flow onto session.pausedFlows (its own current session field, plus the exact
+  // {reply, expecting, quickReplies} it last showed - see lastFlowSnapshot's own comment), clear
+  // that field, and let this same message fall through to the normal fresh-dispatch chain below,
+  // exactly as if nothing had been active. handleChat (the outer wrapper) pops and restores the
+  // paused flow, replaying its last question, once whatever interrupted it fully finishes.
+  if (isFlowActive(session) && !isAnyCancel(userMessage) && detectAnyFreshIntent(userMessage, session)) {
+    const key = activeStateKey(session);
+    if (key && session.lastFlowSnapshot) {
+      session.pausedFlows.push({ stateKey: key, stateValue: session[key], ...session.lastFlowSnapshot });
+      session[key] = null;
+    }
   }
 
   // Remember the last booking/quotation code mentioned in this session, so a pronoun follow-up
@@ -1298,6 +1848,63 @@ async function handleChatInner(sessionId, userMessage) {
     session.pendingAgentCreate = pending;
     pushTurn(sessionId, userMessage, reply);
     return { answer: reply, sql: null, rowCount: 0, quickReplies: quickRepliesForAgentCreate(pending) };
+  }
+
+  // In-progress "add a new hotel to this already-saved booking/quotation" conversation (see
+  // startAddHotel/stepAddHotel above) - continues it. stepAddHotel builds the whole response and
+  // re-arms session.pendingAddHotel itself when the flow isn't finished, same as the other
+  // pendingHotelXxx handlers below.
+  if (session.pendingAddHotel) {
+    const pending = session.pendingAddHotel;
+    session.pendingAddHotel = null;
+    return stepAddHotel(sessionId, session, userMessage, pending);
+  }
+
+  // Resolves a respondAmbiguousDetail dropdown selection (or a typed code) against the matches it
+  // was shown - by internal Id, never by re-resolving the shared code/name, which would just hit
+  // the same ambiguity again (see bookingDetails.js/accountTransactions.js's own intent.id fast
+  // path). An unrecognised reply re-shows the same dropdown rather than silently falling through to
+  // an unrelated intent.
+  if (session.pendingAmbiguousDetail) {
+    const pending = session.pendingAmbiguousDetail;
+    session.pendingAmbiguousDetail = null;
+    const trimmed = userMessage.trim();
+    const codeMatch = trimmed.match(ANY_CODE_RE);
+    let chosen = codeMatch ? pending.matches.find((m) => (m.BookingId || m.QuotationId || '').toUpperCase() === codeMatch[0].toUpperCase()) : null;
+    // No exact FT/FTQ code typed - fall back to the same substring rule the live dropdown itself
+    // already filters by (e.g. "1803" narrows the list to just FT08261803), and commit it IF that
+    // narrows to exactly one candidate - same "commit an unambiguous match" rule the destination
+    // pills use, so bare digits or a partial guest name (with nothing left ambiguous) resolves
+    // directly instead of just re-showing the same dropdown.
+    if (!chosen && trimmed) {
+      const q = trimmed.toLowerCase();
+      const fuzzyMatches = pending.matches.filter((m) => {
+        const code = (m.BookingId || m.QuotationId || '').toLowerCase();
+        const name = (m.GuestName || '').toLowerCase();
+        return code.includes(q) || name.includes(q);
+      });
+      if (fuzzyMatches.length === 1) chosen = fuzzyMatches[0];
+    }
+    if (!chosen) {
+      const label = pending.matches[0].GuestName;
+      return respondAmbiguousDetail(sessionId, session, userMessage, label, pending.matches, pending.kind);
+    }
+    if (pending.kind === 'fullDetail') {
+      const resolved = await bookingDetails.fetchFullBookingDetails({ id: chosen.Id });
+      if (resolved.status !== 'ok') {
+        const reply = `I couldn't find **${chosen.BookingId || chosen.QuotationId}** in the database.`;
+        pushTurn(sessionId, userMessage, reply);
+        return { answer: reply, sql: null, rowCount: 0 };
+      }
+      return finishFullDetailAnswer(sessionId, userMessage, resolved);
+    }
+    const result = await accountTransactions.fetchAccountTransactions({ id: chosen.Id });
+    if (result.status !== 'ok') {
+      const reply = `I couldn't find **${chosen.BookingId || chosen.QuotationId}** in the database.`;
+      pushTurn(sessionId, userMessage, reply);
+      return { answer: reply, sql: null, rowCount: 0 };
+    }
+    return finishAcctTxnAnswer(sessionId, userMessage, result);
   }
 
   // If we previously asked "which record did you mean?" (the same code matched more than one real
@@ -1595,22 +2202,28 @@ async function handleChatInner(sessionId, userMessage) {
     });
   }
 
-  // Which hotel row (only shown when a booking has more than one hotel) - this answers it, then
-  // opens that row's edit form the same way the single-hotel case does directly.
+  // Which hotel row to edit, or add a new one - this answers it, then either opens that row's edit
+  // form (same as the old single-hotel fast path did directly) or starts the add-hotel flow.
   if (session.pendingHotelRowChoice) {
     const { code, guestName, raw } = session.pendingHotelRowChoice;
     session.pendingHotelRowChoice = null;
     const hotels = raw.hotelDetails || [];
+    if (/\badd\b/i.test(userMessage) && /\bhotel\b/i.test(userMessage)) {
+      return startAddHotel(sessionId, session, userMessage, code, guestName, raw);
+    }
     const n = Number(userMessage.trim());
     if (!Number.isInteger(n) || n < 1 || n > hotels.length) {
       session.pendingHotelRowChoice = { code, guestName, raw };
-      const reply = `Please pick one of the hotels below for **${code}**.`;
+      const reply = `Please pick one of the hotels below for **${code}**, or add a new one.`;
       pushTurn(sessionId, userMessage, reply);
       return {
         answer: reply,
         sql: null,
         rowCount: 0,
-        quickReplies: hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+        quickReplies: [
+          ...hotels.map((h, i) => ({ label: `${h.name} (${h.checkInDate} → ${h.checkOutDate})`, value: String(i + 1), autoSend: true })),
+          { label: 'Add new hotel', value: 'add new hotel', autoSend: true },
+        ],
       };
     }
     return openHotelFieldChoice(sessionId, session, userMessage, code, guestName, raw, n - 1);
@@ -1635,8 +2248,34 @@ async function handleChatInner(sessionId, userMessage) {
     }
     const field = HOTEL_FIELD_KEY_BY_CHOICE.find((f) => f.pattern.test(t));
     if (field) {
-      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey: field.key, label: field.label };
       const hotel = raw.hotelDetails[hotelIndex];
+      // Same "reply same to use this room type's own rate" shortcut bookingFlow.js's hotelCollect
+      // step (and the add-hotel flow above) already offer when adding a hotel - previously missing
+      // entirely when editing an EXISTING hotel's rate, even though the hotel's own roomCategory is
+      // right there to look the room type up against.
+      if (field.key === 'ratePerNight') {
+        const roomType = hotel.hotelId ? await findHotelRoomType(hotel.hotelId, hotel.roomCategory) : null;
+        const hint = roomType ? ` (reply "same" to use this room type's own rate: ${roomType.RatePerNight} ${roomType.Currency || 'THB'})` : '';
+        session.pendingHotelFieldValue = {
+          code,
+          guestName,
+          raw,
+          hotelIndex,
+          fieldKey: field.key,
+          label: field.label,
+          roomTypeRate: roomType ? roomType.RatePerNight : null,
+          roomTypeCurrency: roomType ? roomType.Currency : null,
+        };
+        const reply = `What should the new **${field.label}** be for **${hotel.name}** on **${code}**?${hint}`;
+        pushTurn(sessionId, userMessage, reply);
+        return {
+          answer: reply,
+          sql: null,
+          rowCount: 0,
+          quickReplies: roomType ? [{ label: `Same as room type (${roomType.RatePerNight} ${roomType.Currency || 'THB'})`, value: 'same', autoSend: true }] : undefined,
+        };
+      }
+      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey: field.key, label: field.label };
       const reply = `What should the new **${field.label}** be for **${hotel.name}** on **${code}**?`;
       pushTurn(sessionId, userMessage, reply);
       if (field.key === 'roomCategory' && hotel.hotelId) {
@@ -1667,12 +2306,15 @@ async function handleChatInner(sessionId, userMessage) {
   // The new value for whichever hotel field was picked (typed, or from the roomType/date/breakfast
   // UI above) - confirm before saving.
   if (session.pendingHotelFieldValue) {
-    const { code, guestName, raw, hotelIndex, fieldKey, label } = session.pendingHotelFieldValue;
+    const { code, guestName, raw, hotelIndex, fieldKey, label, roomTypeRate, roomTypeCurrency } = session.pendingHotelFieldValue;
     session.pendingHotelFieldValue = null;
-    const value = userMessage.trim();
+    const rawValue = userMessage.trim();
+    // "same" resolves to the room type's own rate, set alongside the "Same as room type" chip when
+    // this field was opened - only meaningful for ratePerNight, and only when that lookup found one.
+    const value = /^same$/i.test(rawValue) && fieldKey === 'ratePerNight' && roomTypeRate != null ? String(roomTypeRate) : rawValue;
     const isNumericField = fieldKey === 'totalRooms' || fieldKey === 'totalNights' || fieldKey === 'ratePerNight';
     if (!value || (isNumericField && !Number.isFinite(Number(value)))) {
-      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey, label };
+      session.pendingHotelFieldValue = { code, guestName, raw, hotelIndex, fieldKey, label, roomTypeRate, roomTypeCurrency };
       const reply = isNumericField ? `**${label}** needs to be a number — please try again.` : `Please provide a value for **${label}**.`;
       pushTurn(sessionId, userMessage, reply);
       return { answer: reply, sql: null, rowCount: 0 };
@@ -2086,16 +2728,9 @@ async function handleChatInner(sessionId, userMessage) {
       return { answer: reply, sql: null, rowCount: 0 };
     }
     if (result.status === 'ambiguous') {
-      const list = result.matches.map((m) => `- **${m.BookingId || m.QuotationId}** (${m.GuestName})`).join('\n');
-      const hint = acctTxnIntent.code ? 'Please ask again including the guest\'s name too.' : 'Please ask again using the specific FT/FTQ code.';
-      const reply = `More than one record matches **${label}** — which one did you mean?\n\n${list}\n\n${hint}`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: result.matches.length };
+      return respondAmbiguousDetail(sessionId, session, userMessage, label, result.matches, 'acctTxn');
     }
-    const reply = accountTransactions.formatAccountTransactionsAnswer(result);
-    const rows = [...result.salePurchase, ...result.receiptPayment];
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: rows.length, rows: rows.length ? rows : undefined, rowsTruncated: false };
+    return finishAcctTxnAnswer(sessionId, userMessage, result);
   }
 
   // Broad "booking detail" requests are fetched deterministically (fixed SQL, not LLM-authored)
@@ -2115,52 +2750,44 @@ async function handleChatInner(sessionId, userMessage) {
     }
 
     if (resolved.status === 'ambiguous') {
-      const list = resolved.matches
-        .map((m) => `- **${m.BookingId || m.QuotationId}** (${m.GuestName})`)
-        .join('\n');
-      const hint = fullDetailIntent.guestName ? 'Please ask again using the specific FT/FTQ code.' : 'Please ask again with the full code.';
-      const reply = `**${label}** matches more than one record — did you mean one of these?\n\n${list}\n\n${hint}`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: resolved.matches.length };
+      return respondAmbiguousDetail(sessionId, session, userMessage, label, resolved.matches, 'fullDetail');
     }
 
-    const answererMessages = [
-      { role: 'system', content: answererSystemPrompt() },
-      {
-        role: 'user',
-        content: `User's question: ${userMessage}\n\nFull booking data, as JSON (booking = main record, hotels = hotel stays, hotelExtras = extra charges per hotel keyed by BookingHotelId, itinerary = day-by-day activities, costBreakdown = traveller-type pricing rows, costSummary = precomputed Total Cost/ROE/Total After ROE/Discount/Final Amount - already calculated correctly, just format it, do not recompute):\n${JSON.stringify(resolved.data)}`,
-      },
-    ];
-    let answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
-    // See buildCostBreakdownSection's own comment - the model asked for this section sometimes
-    // drops it entirely, and sometimes keeps the section but gets a row wrong (reproduced live for
-    // FT08261794/Devansh: it showed each row's raw per-person Price instead of Price x PAX - e.g.
-    // "THB 10,000" for a 3-pax row that should read 30,000 - a real financial figure staff could
-    // act on, even though the Total Cost line taken straight from costSummary was correct). Always
-    // REPLACE whatever the model produced for this section (or insert one if it produced none) with
-    // a deterministically-built one, rather than only filling a gap - money math here is never
-    // trusted to the model, matching the same standard accountTransactions.js already applies.
-    const hasCostData = (resolved.data.costBreakdown && resolved.data.costBreakdown.length > 0) || resolved.data.costSummary;
-    if (hasCostData) {
-      const withoutLLMSection = answer.replace(/###\s*cost breakdown[\s\S]*?(?=\n###\s|$)/i, '').trim();
-      const section = buildCostBreakdownSection(resolved.data);
-      // Keeps the fixed section order the prompt itself specifies (Cost Breakdown before Payments/
-      // Job Sheet/Other) when that section is present; otherwise just appends at the end.
-      answer = /###\s*payments/i.test(withoutLLMSection)
-        ? withoutLLMSection.replace(/(?=###\s*payments)/i, `${section}\n\n`)
-        : `${withoutLLMSection}\n\n${section}`;
-    }
-    pushTurn(sessionId, userMessage, answer);
-    return { answer, sql: null, rowCount: 1 };
+    return finishFullDetailAnswer(sessionId, userMessage, resolved);
   }
+
+  // Understand-then-query: figure out what's actually needed before ever attempting SQL (see
+  // understandSystemPrompt's own comment for why). Same conversation history as the planner gets,
+  // so a follow-up ("and for last week?") is understood in context too. A plain "NONE" (chit-chat,
+  // no DB lookup) is passed through unchanged - the planner below still makes that call itself, this
+  // just saves folding a useless plan into its prompt.
+  const understandMessages = [
+    { role: 'system', content: understandSystemPrompt() },
+    ...session.history,
+    { role: 'user', content: userMessage },
+  ];
+  // FAST_STRUCTURED_MODEL: the understand and initial-SQL steps are structured/mechanical (restate
+  // intent against a known schema, then translate an already-worked-out plan into SQL syntax) - a
+  // small fast model handles that reliably, and by the time SQL gets written the hard reasoning
+  // (what does this question actually need) has already been done by the understand step. The
+  // default GROQ_MODEL stays on for the SQL-repair retry below and the final answerer call, so a
+  // wrong query still gets corrected by the more capable model, and the actual prose the user reads
+  // is never written by the fast model - this is a latency optimization, not an accuracy trade.
+  const FAST_STRUCTURED_MODEL = 'llama-3.1-8b-instant';
+
+  const understanding = await callLLM(understandMessages, { model: FAST_STRUCTURED_MODEL });
+  const hasPlan = !/^\s*none\s*$/i.test(understanding.trim());
 
   const plannerMessages = [
     { role: 'system', content: plannerSystemPrompt() },
     ...session.history,
-    { role: 'user', content: userMessage },
+    {
+      role: 'user',
+      content: hasPlan ? `${userMessage}\n\n(Internal plan of what's needed, already worked out - use this to write accurate SQL: ${understanding.trim()})` : userMessage,
+    },
   ];
 
-  let plannerReply = await callLLM(plannerMessages);
+  let plannerReply = await callLLM(plannerMessages, { model: FAST_STRUCTURED_MODEL });
   let sql = extractSql(plannerReply);
 
   if (!sql) {

@@ -199,13 +199,35 @@ async function findVehicle(nameQuery) {
   return result.recordset;
 }
 
+// RestaurantMaster has real near-duplicate rows sharing one name (differing only in stray leading/
+// trailing whitespace) with no Address/price to tell them apart either - confirmed live: 4 separate
+// "Dinner Coupon" rows (Ids 7/11/13/17), every distinguishing column null, created days apart.
+// Left un-deduped, both findRestaurant (the answer-resolution lookup) and listRestaurants (the live
+// dropdown) surface every one as if they were meaningfully different choices - findRestaurant then
+// treats that as a real ambiguity and asks "which one did you mean?" with 4 IDENTICAL-looking
+// options and no way to tell them apart, a dead end the user can never actually answer. Collapsing
+// to one representative (lowest Id, since callers ORDER BY Name, Id) per normalized (trimmed,
+// case-insensitive) name fixes both: findRestaurant now resolves straight through since only one
+// row remains, and the dropdown stops repeating the same-looking entry.
+function dedupeByNormalizedName(rows) {
+  const seen = new Set();
+  const deduped = [];
+  for (const row of rows) {
+    const key = row.Name.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push({ ...row, Name: row.Name.trim() });
+  }
+  return deduped;
+}
+
 async function findRestaurant(nameQuery) {
   const pool = await getPool();
   const result = await pool
     .request()
     .input('q', `%${nameQuery}%`)
-    .query(`SELECT TOP 5 Id, Name, Address, LunchPriceForAdults, DinnerPriceForAdults FROM RestaurantMaster WHERE IsDelete = 0 AND Name LIKE @q ORDER BY Name`);
-  return result.recordset;
+    .query(`SELECT TOP 5 Id, Name, Address, LunchPriceForAdults, DinnerPriceForAdults FROM RestaurantMaster WHERE IsDelete = 0 AND Name LIKE @q ORDER BY Name, Id`);
+  return dedupeByNormalizedName(result.recordset);
 }
 
 // Wider, typeahead-style listing for the chat UI's live restaurant-name dropdown (mirrors
@@ -217,8 +239,8 @@ async function listRestaurants(nameQuery = '') {
   const result = await pool
     .request()
     .input('q', `%${nameQuery}%`)
-    .query(`SELECT TOP 20 Id, Name, Address FROM RestaurantMaster WHERE IsDelete = 0 AND Name LIKE @q ORDER BY Name`);
-  return result.recordset;
+    .query(`SELECT TOP 20 Id, Name, Address FROM RestaurantMaster WHERE IsDelete = 0 AND Name LIKE @q ORDER BY Name, Id`);
+  return dedupeByNormalizedName(result.recordset);
 }
 
 // Full option lists for fields the real site shows as a fixed dropdown/checkbox set (not a
