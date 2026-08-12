@@ -7,6 +7,9 @@
 <!-- Same favicon the booking site serves, so the chatbot tab sits next to it looking like one product. -->
 <link rel="icon" type="image/png" href="img/favicon.png" />
 <link rel="apple-touch-icon" href="img/favicon.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -43,6 +46,15 @@
         </div>
 
         <div class="topbar-actions">
+          <select id="roleSelect" class="role-select" title="Your FlyThai role — controls what the bot lets you do">
+            <option value="">Select your role…</option>
+          </select>
+          <button type="button" id="rolePermRefreshBtn" class="role-refresh-btn" title="Re-fetch role permissions from FlyThai now">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 4v5h-5" />
+            </svg>
+          </button>
           <button id="clearBtn" class="clear-btn" title="Clear conversation">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 5v14M5 12h14" />
@@ -69,10 +81,22 @@
       <div class="chat-bottom">
         <div class="chat-bottom-inner">
           <div class="suggestions" id="suggestions">
-            <button class="chip" data-icon="✈️">Create a new booking</button>
-            <button class="chip" data-icon="💳">Show all pending payments</button>
-            <button class="chip" data-icon="📊">How many quotations were made this month</button>
-            <button class="chip" data-icon="📝">Create a new quotation</button>
+            <button type="button" class="chip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-1 .1-1.3.5l-.4.6c-.4.6-.2 1.4.4 1.8L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.4.6 1.2.8 1.8.4l.6-.4c.4-.3.6-.8.5-1.3Z" /></svg>
+              <span>Create a new booking</span>
+            </button>
+            <button type="button" class="chip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2" /><line x1="2" y1="10" x2="22" y2="10" /></svg>
+              <span>Show all pending payments</span>
+            </button>
+            <button type="button" class="chip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="20" x2="12" y2="10" /><line x1="18" y1="20" x2="18" y2="4" /><line x1="6" y1="20" x2="6" y2="16" /></svg>
+              <span>How many quotations were made this month</span>
+            </button>
+            <button type="button" class="chip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><path d="M14 2v6h6" /><line x1="16" y1="13" x2="8" y2="13" /><line x1="16" y1="17" x2="8" y2="17" /><line x1="10" y1="9" x2="8" y2="9" /></svg>
+              <span>Create a new quotation</span>
+            </button>
           </div>
 
           <!-- Tap-to-answer shortcuts for a guided-flow step (e.g. the hotel optional-details

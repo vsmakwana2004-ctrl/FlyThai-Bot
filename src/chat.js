@@ -16,6 +16,8 @@ const { isAnyCancel } = require('./cancel');
 const { findDestinations, listDestinations, findHotel, findHotelRoomType } = require('./lookups');
 const jobSheetCopy = require('./jobSheetCopy');
 const agentCreate = require('./agentCreate');
+const { canUseBot, requirePermission, DEGRADED_NOTE } = require('./rolePermissions');
+const { TABLE_PERMISSION_MAP } = require('./tablePermissionMap');
 
 // Simple in-memory per-session state (server restarts clear it — fine for an internal tool).
 const sessions = new Map();
@@ -24,6 +26,7 @@ const MAX_TURNS = 6; // user+assistant pairs kept for context
 function getSession(sessionId) {
   if (!sessions.has(sessionId))
     sessions.set(sessionId, {
+      role: null,
       history: [],
       draft: null,
       pendingItinerary: null,
@@ -944,15 +947,25 @@ function quickRepliesFor(draft) {
       { label: 'No', value: 'no', autoSend: true },
     ];
   }
-  // The FIRST itinerary question (askItineraryChoice) offers 5 forks, each a complete answer -
-  // auto-send like the other forks above.
+  // The FIRST itinerary question (askItineraryChoice) offers 4 forks, each a complete answer -
+  // auto-send like the other forks above. Self-booked used to be a 5th whole-itinerary fork here;
+  // it's now asked per-item instead (see transferSelfBookedGate/sightseeingSelfBookedGate below),
+  // once a date has actually been given for that day.
   if (draft && draft.phase === 'itineraryChoice' && draft.itineraryItems && draft.itineraryItems.length === 0) {
     return [
       { label: 'Transfer', value: 'transfer', autoSend: true },
       { label: 'Sightseeing', value: 'sightseeing', autoSend: true },
       { label: 'Restaurant', value: 'restaurant', autoSend: true },
       { label: 'Leisure Day', value: 'leisure day', autoSend: true },
+    ];
+  }
+  // Per-day self-booked fork, shown right after the date for a Transfer/Sightseeing item - same
+  // "self-booked vs add details" pattern as the hotelChoice chips below, just per itinerary day
+  // instead of once for the whole hotel/itinerary.
+  if (draft && (draft.phase === 'transferSelfBookedGate' || draft.phase === 'sightseeingSelfBookedGate')) {
+    return [
       { label: 'Self-booked', value: 'self-booked', autoSend: true },
+      { label: 'Add pickup point details', value: 'add pickup point details', autoSend: true },
     ];
   }
   // Once at least one item exists, this same phase re-asks via askAddMoreItinerary instead
@@ -1052,9 +1065,15 @@ function weekdayNameFromDDMMYYYY(dateStr) {
   return Number.isNaN(d.getTime()) ? null : WEEKDAY_NAMES[d.getDay()];
 }
 
-async function handleChat(sessionId, userMessage) {
-  let result = await handleChatInner(sessionId, userMessage);
+async function handleChat(sessionId, userMessage, role) {
   const session = getSession(sessionId);
+  if (typeof role === 'string' && role) session.role = role;
+
+  let result = await handleChatInner(sessionId, userMessage);
+
+  if (session._permissionDegraded) {
+    result = { ...result, answer: `${DEGRADED_NOTE}${result.answer}` };
+  }
 
   if (!isFlowActive(session) && session.pausedFlows.length > 0) {
     // Whatever just ran (the interruption, or a normal message with nothing paused before it) has
@@ -1445,7 +1464,12 @@ async function stepAddHotel(sessionId, session, userMessage, pending) {
           breakfast: '',
         };
         const hotelDetails = [...(raw.hotelDetails || []), newRow];
-        await bookingEditForms.saveRawPatch(raw, { hotelDetails });
+        // A booking created as "self-booked" (no hotel) still carries raw.selfBookedHotel: true from
+        // its original save - saveRawPatch spreads patch over raw, so without clearing it here a real
+        // hotel row would be added but the record would still read as self-booked on the real site
+        // (reproduced live: hotel added successfully, admin panel kept "Self Booked" checked and
+        // showed no hotel rows at all).
+        await bookingEditForms.saveRawPatch(raw, { hotelDetails, selfBookedHotel: false });
         const reply = `Added **${h.hotelName}** (${h.roomCategory}, ${totalNights} night(s)) to **${code}**.`;
         pushTurn(sessionId, userMessage, reply);
         return { answer: reply, sql: null, rowCount: 0 };
@@ -1743,8 +1767,28 @@ async function resumeRecordChoice(sessionId, session, pending, chosen, userMessa
   return { answer: result.reply, sql: null, rowCount: 0 };
 }
 
+// FTQ... codes are quotations, FT... codes (no Q) are confirmed bookings (see schema.js's
+// BookingMaster doc, IsBooking column) - the reliable, cheap way for a specific-record capability
+// guard to know whether it should check Booking or Quotation permission, without an extra DB round
+// trip just to find out. Falls back to 'Booking' when no code is available yet (e.g. a guest-name
+// lookup that hasn't resolved to a specific record) - same as this guard's pre-existing behaviour.
+function bookingOrQuotationPage(code) {
+  return code && /^FTQ/i.test(code) ? 'Quotation' : 'Booking';
+}
+
 async function handleChatInner(sessionId, userMessage) {
   const session = getSession(sessionId);
+
+  // Master gate: mirrors FlyThai's own "Chat Bot System" role permission (Manage Users -> Roles) -
+  // a role without view access there can't use the bot at all, whatever else it's allowed to do.
+  // Checked before anything else, including cancel, so an unauthorized role gets a clear reason
+  // instead of the bot silently working for some messages and not others.
+  const botGate = canUseBot(session.role);
+  session._permissionDegraded = !!botGate.degraded;
+  if (!botGate.allowed) {
+    pushTurn(sessionId, userMessage, botGate.message);
+    return { answer: botGate.message, sql: null, rowCount: 0 };
+  }
 
   // Any pending question ("which logo?", "which status?") is a dead end if the user changes their
   // mind — each of those handlers just re-asks forever on an unrecognised reply. One shared check
@@ -2031,6 +2075,13 @@ async function handleChatInner(sessionId, userMessage) {
   // and so the actual write only ever happens after an explicit yes.
   const convertIntent = convertBooking.detectConvertIntent(userMessage, session.lastBookingCode);
   if (convertIntent && !session.draft) {
+    const convertPerm = requirePermission(session.role, 'Quotation', 'addedit').allowed
+      ? requirePermission(session.role, 'Booking', 'addedit')
+      : requirePermission(session.role, 'Quotation', 'addedit');
+    if (!convertPerm.allowed) {
+      pushTurn(sessionId, userMessage, convertPerm.message);
+      return { answer: convertPerm.message, sql: null, rowCount: 0 };
+    }
     const result = await convertBooking.checkConversion(convertIntent.code);
     if (result.status === 'ambiguous') {
       return askWhichRecord(sessionId, session, userMessage, result.code, result.matches, 'convert', {});
@@ -2483,6 +2534,11 @@ async function handleChatInner(sessionId, userMessage) {
   // isDuplicateCheck:true (see duplicateBooking.js). Deterministic resolve, always confirmed first.
   const duplicateIntent = duplicateBooking.detectDuplicateIntent(userMessage, session.lastBookingCode);
   if (duplicateIntent && !session.draft) {
+    const duplicatePerm = requirePermission(session.role, bookingOrQuotationPage(duplicateIntent.code), 'addedit');
+    if (!duplicatePerm.allowed) {
+      pushTurn(sessionId, userMessage, duplicatePerm.message);
+      return { answer: duplicatePerm.message, sql: null, rowCount: 0 };
+    }
     const resolved = await duplicateBooking.resolveForDuplicate(duplicateIntent);
     if (resolved.status === 'ambiguous') {
       return askWhichRecord(sessionId, session, userMessage, duplicateIntent.code, resolved.matches, 'duplicate', {});
@@ -2525,6 +2581,11 @@ async function handleChatInner(sessionId, userMessage) {
   // read/write path as convert-to-booking so the "current state" it edits is never stale/guessed.
   const fieldEditIntent = editBooking.detectSimpleFieldEditIntent(userMessage, session.lastBookingCode);
   if (fieldEditIntent && !session.draft) {
+    const fieldEditPerm = requirePermission(session.role, bookingOrQuotationPage(fieldEditIntent.code), 'addedit');
+    if (!fieldEditPerm.allowed) {
+      pushTurn(sessionId, userMessage, fieldEditPerm.message);
+      return { answer: fieldEditPerm.message, sql: null, rowCount: 0 };
+    }
     const resolved = await editBooking.resolveForEdit(fieldEditIntent.code);
     if (resolved.status === 'ambiguous') {
       return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'fieldEdit', {
@@ -2542,6 +2603,11 @@ async function handleChatInner(sessionId, userMessage) {
   // through the ordinary `session.draft` handling right below, unchanged.
   const itineraryEditIntent = editBooking.detectItineraryEditIntent(userMessage, session.lastBookingCode);
   if (itineraryEditIntent && !session.draft) {
+    const itineraryEditPerm = requirePermission(session.role, bookingOrQuotationPage(itineraryEditIntent.code), 'addedit');
+    if (!itineraryEditPerm.allowed) {
+      pushTurn(sessionId, userMessage, itineraryEditPerm.message);
+      return { answer: itineraryEditPerm.message, sql: null, rowCount: 0 };
+    }
     const resolved = await editBooking.resolveForEdit(itineraryEditIntent.code);
     if (resolved.status === 'ambiguous') {
       return askWhichRecord(sessionId, session, userMessage, resolved.code, resolved.matches, 'itineraryEdit', {});
@@ -2556,6 +2622,11 @@ async function handleChatInner(sessionId, userMessage) {
   // the top-level menu.
   const editMenuIntent = detectEditMenuIntent(userMessage, session.lastBookingCode);
   if (editMenuIntent && !session.draft) {
+    const editMenuPerm = requirePermission(session.role, bookingOrQuotationPage(editMenuIntent.code), 'addedit');
+    if (!editMenuPerm.allowed) {
+      pushTurn(sessionId, userMessage, editMenuPerm.message);
+      return { answer: editMenuPerm.message, sql: null, rowCount: 0 };
+    }
     const resolved = await editBooking.resolveForEdit(editMenuIntent.code);
     if (resolved.status === 'not_found') {
       const reply = `I couldn't find any booking or quotation matching **${editMenuIntent.code}** in the database.`;
@@ -2594,6 +2665,11 @@ async function handleChatInner(sessionId, userMessage) {
   // Otherwise check if this message wants to start a new booking/quotation.
   const createIntent = bookingFlow.detectCreateIntent(userMessage);
   if (createIntent) {
+    const createPerm = requirePermission(session.role, createIntent.kind === 'quotation' ? 'Quotation' : 'Booking', 'addedit');
+    if (!createPerm.allowed) {
+      pushTurn(sessionId, userMessage, createPerm.message);
+      return { answer: createPerm.message, sql: null, rowCount: 0 };
+    }
     // Ambiguous phrasing ("the new booking") gets confirmed first — starting a 15-question flow by
     // mistake used to be effectively unrecoverable.
     if (!createIntent.confident) {
@@ -2614,6 +2690,11 @@ async function handleChatInner(sessionId, userMessage) {
   // agentCreate.js) - separate from bookingFlow.js's own embedded agent-creation step, which only
   // triggers when a typed agent name has no match partway through booking creation.
   if (agentCreate.detectAgentCreateIntent(userMessage)) {
+    const agentPerm = requirePermission(session.role, 'Agents Configuration', 'addedit');
+    if (!agentPerm.allowed) {
+      pushTurn(sessionId, userMessage, agentPerm.message);
+      return { answer: agentPerm.message, sql: null, rowCount: 0 };
+    }
     const { reply, pending } = agentCreate.start();
     session.pendingAgentCreate = pending;
     pushTurn(sessionId, userMessage, reply);
@@ -2625,6 +2706,11 @@ async function handleChatInner(sessionId, userMessage) {
   // updateStatus endpoint with allow-listed values only, and always confirms before submitting.
   const statusIntent = statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode);
   if (statusIntent) {
+    const statusPerm = requirePermission(session.role, bookingOrQuotationPage(statusIntent.code), 'addedit');
+    if (!statusPerm.allowed) {
+      pushTurn(sessionId, userMessage, statusPerm.message);
+      return { answer: statusPerm.message, sql: null, rowCount: 0 };
+    }
     const result = await statusUpdate.start(statusIntent, userMessage);
     if (result.ambiguous) {
       return askWhichRecord(sessionId, session, userMessage, statusIntent.code, result.matches, 'statusUpdate', { userMessage });
@@ -2639,6 +2725,11 @@ async function handleChatInner(sessionId, userMessage) {
   // Handled deterministically against the real /Jobsheet/GetBookingById endpoint, never guessed.
   const jobSheetCopyIntent = jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST());
   if (jobSheetCopyIntent) {
+    const jobSheetPerm = requirePermission(session.role, 'Job Sheet', 'addedit');
+    if (!jobSheetPerm.allowed) {
+      pushTurn(sessionId, userMessage, jobSheetPerm.message);
+      return { answer: jobSheetPerm.message, sql: null, rowCount: 0 };
+    }
     if (!jobSheetCopyIntent.scope) {
       const reply = `Copy for which job sheet(s)? Give me an FT/FTQ code, or a day (today/tomorrow/yesterday/a date).`;
       pushTurn(sessionId, userMessage, reply);
@@ -2656,6 +2747,11 @@ async function handleChatInner(sessionId, userMessage) {
   // for hotel vouchers, a real BookingHotel id), never guessed.
   const docIntent = documents.detectDocumentIntent(userMessage, session.lastBookingCode);
   if (docIntent) {
+    const docPerm = requirePermission(session.role, bookingOrQuotationPage(docIntent.code), 'view');
+    if (!docPerm.allowed) {
+      pushTurn(sessionId, userMessage, docPerm.message);
+      return { answer: docPerm.message, sql: null, rowCount: 0 };
+    }
     if (docIntent.type === 'needsCode') {
       const reply = `Which booking or quotation is that for? Please give me the code (e.g. FT08261781 or FTQ05260001).`;
       pushTurn(sessionId, userMessage, reply);
@@ -2679,6 +2775,11 @@ async function handleChatInner(sessionId, userMessage) {
   // aggregate one, even though it matches the same wording.
   const financeIntent = !ANY_CODE_RE.test(userMessage) ? financeReports.detectFinanceReportIntent(userMessage) : null;
   if (financeIntent) {
+    const financePerm = requirePermission(session.role, 'Account Report', 'view');
+    if (!financePerm.allowed) {
+      pushTurn(sessionId, userMessage, financePerm.message);
+      return { answer: financePerm.message, sql: null, rowCount: 0 };
+    }
     if (financeIntent.kind === 'income') {
       const result = await financeReports.fetchIncomeReport(financeIntent.period);
       const reply = financeReports.formatIncomeAnswer(result);
@@ -2718,6 +2819,11 @@ async function handleChatInner(sessionId, userMessage) {
   // elsewhere in this file - not a risk worth taking on financial totals.
   const acctTxnIntent = accountTransactions.detectAccountTransactionsIntent(userMessage, session.lastBookingCode);
   if (acctTxnIntent) {
+    const acctTxnPerm = requirePermission(session.role, 'Account Master', 'view');
+    if (!acctTxnPerm.allowed) {
+      pushTurn(sessionId, userMessage, acctTxnPerm.message);
+      return { answer: acctTxnPerm.message, sql: null, rowCount: 0 };
+    }
     const result = await accountTransactions.fetchAccountTransactions(acctTxnIntent);
     // acctTxnIntent may have been resolved by an explicit FT/FTQ code OR by a bare guest name
     // (e.g. "account detail of guest karan") - .code is only set in the former case.
@@ -2738,6 +2844,11 @@ async function handleChatInner(sessionId, userMessage) {
   // on whether to join those tables (it was found to sometimes skip them).
   const fullDetailIntent = bookingDetails.detectFullDetailIntent(userMessage);
   if (fullDetailIntent) {
+    const fullDetailPerm = requirePermission(session.role, bookingOrQuotationPage(fullDetailIntent.code), 'view');
+    if (!fullDetailPerm.allowed) {
+      pushTurn(sessionId, userMessage, fullDetailPerm.message);
+      return { answer: fullDetailPerm.message, sql: null, rowCount: 0 };
+    }
     const resolved = await bookingDetails.fetchFullBookingDetails(fullDetailIntent);
     // fullDetailIntent may have been resolved by an explicit FT/FTQ code, bare digits, OR a bare
     // guest name (e.g. "booking details of guest karan") - .code is only set in the first two cases.
@@ -2794,6 +2905,37 @@ async function handleChatInner(sessionId, userMessage) {
     // Direct chit-chat style reply, no DB involved.
     pushTurn(sessionId, userMessage, plannerReply);
     return { answer: plannerReply, sql: null, rowCount: 0 };
+  }
+
+  // Free-form NL-to-SQL has no per-query field/table allowlist of its own (assertSafeSelect in
+  // db.js only enforces query SHAPE - a single read-only statement, not which tables it touches) -
+  // so gate it the same way as every other capability, against whichever FlyThai pages the tables
+  // the generated query actually references map to (see tablePermissionMap.js).
+  const queriedTables = new Set();
+  for (const m of sql.matchAll(/\b(?:FROM|JOIN)\s+\[?(\w+)\]?/gi)) queriedTables.add(m[1]);
+
+  // BookingMaster and its child tables (all mapped to 'Booking' in tablePermissionMap.js) hold
+  // BOTH quotations and confirmed bookings in the same rows, split only by the IsBooking bit column
+  // (see schema.js) - gating them on 'Booking' access alone would wrongly block a Quotation-only
+  // role from a query that's actually scoped to quotations, and vice versa. Read the generated
+  // SQL's own IsBooking filter (if any) to know which side of that split this query is really
+  // asking about; with no such filter the query could return either, so require both.
+  const isBookingFilter = sql.match(/\bIsBooking\s*=\s*'?([01])'?/i);
+  const bookingSidePages = isBookingFilter ? [isBookingFilter[1] === '1' ? 'Booking' : 'Quotation'] : ['Booking', 'Quotation'];
+
+  const blockedPages = new Set();
+  for (const table of queriedTables) {
+    const page = TABLE_PERMISSION_MAP[table];
+    if (!page) continue;
+    const pagesToCheck = page === 'Booking' ? bookingSidePages : [page];
+    for (const p of pagesToCheck) {
+      if (!requirePermission(session.role, p, 'view').allowed) blockedPages.add(p);
+    }
+  }
+  if (blockedPages.size > 0) {
+    const reply = `The **${session.role}** role doesn't have view access to ${[...blockedPages].join(', ')}, so I can't run that query.`;
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql, rowCount: 0 };
   }
 
   let queryResult;

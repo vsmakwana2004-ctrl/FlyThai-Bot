@@ -903,6 +903,53 @@ function getSessionId() {
 }
 let sessionId = getSessionId();
 
+// Mirrors FlyThai's own Manage Users -> Roles system (see rolePermissions.js) so the bot can gate
+// its capabilities the same way the real admin panel does - manually picked here since the bot has
+// no login of its own yet, not a security boundary against a dishonest user.
+function getRole() {
+  return localStorage.getItem('flythai_role') || '';
+}
+function setRole(role) {
+  localStorage.setItem('flythai_role', role);
+}
+
+async function loadRoleOptions() {
+  const select = document.getElementById('roleSelect');
+  if (!select) return;
+  try {
+    const res = await fetch('/api/roles');
+    const data = await readJsonResponse(res);
+    const roles = Array.isArray(data.roles) ? data.roles : [];
+    const current = getRole();
+    select.innerHTML =
+      '<option value="">Select your role…</option>' +
+      roles.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('');
+    if (current && roles.includes(current)) select.value = current;
+  } catch (err) {
+    // The role list is a nice-to-have gate, not core chat functionality - a failed fetch here
+    // (server still starting up, FlyThai unreachable) shouldn't block using the chat itself.
+    console.warn('Could not load role list:', err);
+  }
+}
+loadRoleOptions();
+document.getElementById('roleSelect')?.addEventListener('change', (e) => setRole(e.target.value));
+
+document.getElementById('rolePermRefreshBtn')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  try {
+    const res = await fetch('/api/roles/refresh', { method: 'POST' });
+    await readJsonResponse(res);
+    await loadRoleOptions();
+  } catch (err) {
+    console.warn('Could not refresh role permissions:', err);
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => btn.classList.remove('spinning'), 700);
+  }
+});
+
 function escapeHtml(str) {
   return str
     .replace(/&/g, '&amp;')
@@ -1256,7 +1303,7 @@ async function sendMessage(text) {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, sessionId: chatId }),
+      body: JSON.stringify({ message: text, sessionId: chatId, role: getRole() }),
     });
     const data = await readJsonResponse(res);
     loadingEl.remove();
@@ -1323,9 +1370,10 @@ form.addEventListener('submit', (e) => {
 });
 
 suggestions.addEventListener('click', (e) => {
-  if (e.target.classList.contains('chip')) {
-    sendMessage(e.target.textContent);
-  }
+  // .closest (not a direct classList check) since each chip now wraps an icon + label instead of
+  // being one plain text node - a click can land on either child, not just the button itself.
+  const chip = e.target.closest('.chip');
+  if (chip) sendMessage(chip.textContent.trim());
 });
 
 // The suggestion row is a single horizontally-scrolling line. A trackpad swipes

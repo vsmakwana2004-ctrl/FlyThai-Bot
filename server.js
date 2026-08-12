@@ -4,6 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { handleChat, cancelFlows } = require('./src/chat');
 const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles, listDestinations, listHotelRoomTypes } = require('./src/lookups');
+const { initRolePermissions, refreshPermissions, getRoleList } = require('./src/rolePermissions');
 
 const app = express();
 app.use(cors());
@@ -19,7 +20,7 @@ const MAX_MESSAGE_CHARS = 2000;
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, sessionId } = req.body || {};
+    const { message, sessionId, role } = req.body || {};
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Please type a question first.' });
     }
@@ -27,7 +28,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: `That message is a bit long (${message.length} characters). Please shorten it to under ${MAX_MESSAGE_CHARS} characters and try again.` });
     }
     const sid = sessionId && typeof sessionId === 'string' ? sessionId : 'default';
-    const result = await handleChat(sid, message.trim());
+    const result = await handleChat(sid, message.trim(), typeof role === 'string' ? role : undefined);
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -192,6 +193,24 @@ app.get('/api/restaurants', async (req, res) => {
   }
 });
 
+// Powers the role-selector dropdown shown at the top of the chat UI - the same roles configured
+// live in FlyThai's own Manage Users -> Roles screen, so it can never drift out of sync with them.
+app.get('/api/roles', (req, res) => {
+  res.json({ roles: getRoleList().map((r) => r.roleName) });
+});
+
+// Forces an immediate re-fetch of every role's permissions from FlyThai, rather than waiting for
+// the 20-minute background refresh - for right after saving a role change in /Role/Index.
+app.post('/api/roles/refresh', async (req, res) => {
+  try {
+    await refreshPermissions();
+    res.json({ ok: true, roles: getRoleList().map((r) => r.roleName) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not refresh role permissions: ' + err.message });
+  }
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // Everything below keeps the /api/* contract to "always JSON, never HTML". The frontend parses
@@ -215,13 +234,21 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3500;
-app.listen(PORT, () => {
-  console.log(`FlyThai DB Assistant running at http://localhost:${PORT}`);
-  // Open the SQL connection now rather than on the first question, so nobody waits ~2.7s for the
-  // pool to come up while a real query is in flight. Failure here is not fatal - runReadOnlyQuery
-  // retries and reports properly - so this only ever logs.
-  require('./src/db')
-    .getPool()
-    .then(() => console.log('SQL connection pool ready'))
-    .catch((err) => console.warn('SQL pool warm-up failed (will retry on first query):', err.message));
-});
+
+// Blocking, so the very first /api/chat request never races an empty role-permission cache -
+// refreshPermissions() swallows its own errors (fails open, see rolePermissions.js), so this never
+// rejects and never delays startup past one real network round-trip to FlyThai.
+initRolePermissions()
+  .catch((err) => console.warn('Role-permission warm-up failed (will retry on its own schedule):', err.message))
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`FlyThai DB Assistant running at http://localhost:${PORT}`);
+      // Open the SQL connection now rather than on the first question, so nobody waits ~2.7s for the
+      // pool to come up while a real query is in flight. Failure here is not fatal - runReadOnlyQuery
+      // retries and reports properly - so this only ever logs.
+      require('./src/db')
+        .getPool()
+        .then(() => console.log('SQL connection pool ready'))
+        .catch((err) => console.warn('SQL pool warm-up failed (will retry on first query):', err.message));
+    });
+  });

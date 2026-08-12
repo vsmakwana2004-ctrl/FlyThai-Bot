@@ -40,10 +40,30 @@ html, body { height: 100%; }
 
 body {
   margin: 0;
-  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  /* Plus Jakarta Sans (loaded in index.html's <head>) - same system-font fallback chain kept
+     after it so the page still renders correctly the instant before the web font finishes
+     loading, or if the request ever fails. */
+  font-family: 'Plus Jakarta Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
   color: var(--ink);
   background: var(--page);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Brand-coloured text selection - a small detail, but a default OS-blue highlight on an otherwise
+   fully green-themed page is the one moment the brand disappears entirely. */
+::selection { background: var(--green-500); color: #fff; }
+
+/* Keyboard-only focus ring, everywhere - a visible outline is priority-1 accessibility (WCAG), but
+   :focus-visible (rather than plain :focus) means a mouse click never shows it, only Tab/keyboard
+   navigation does, so it never fights with each control's own hover/active treatment. Several
+   specific controls already swap outline:none for a border-color change on :focus (text inputs,
+   date/pax fields) - this is additive to those, not a replacement, and only fires for the ones
+   that don't already have their own equivalent visible indicator. */
+:focus-visible {
+  outline: 2px solid var(--green-500);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* .layout holds .app (the chat) and #dataDrawer (the record panel) side by side. Only .layout
@@ -328,14 +348,52 @@ body {
   border: 1px solid var(--border);
   border-radius: 999px;
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
 }
 .clear-btn svg { width: 15px; height: 15px; }
 .clear-btn:hover {
   background: var(--mint-100);
   border-color: var(--green-500);
   color: var(--green-800);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -6px rgba(13, 59, 36, 0.22);
 }
+.clear-btn:active { transform: translateY(0); }
+
+.role-select {
+  flex: none;
+  padding: 9px 14px;
+  font-size: 13.5px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--green-700);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  max-width: 150px;
+}
+.role-select:hover { border-color: var(--green-500); }
+
+.role-refresh-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--green-700);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+}
+.role-refresh-btn svg { width: 15px; height: 15px; }
+.role-refresh-btn:hover { background: var(--mint-100); border-color: var(--green-500); }
+.role-refresh-btn.spinning svg { animation: role-refresh-spin 0.7s linear; }
+@keyframes role-refresh-spin { to { transform: rotate(360deg); } }
 
 /* --- message area -------------------------------------------------------- */
 
@@ -551,12 +609,15 @@ body {
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
 }
 .show-more-btn:hover {
   background: var(--mint-100);
   border-color: var(--green-500);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -6px rgba(13, 59, 36, 0.22);
 }
+.show-more-btn:active { transform: translateY(0); }
 /* Signals the click opens a separate panel now, not an inline expand. */
 .show-more-btn::after {
   content: '⤢';
@@ -682,8 +743,12 @@ body {
   display: flex;
   flex-wrap: nowrap;
   gap: 10px;
-  /* Trailing room so the last chip clears the fade at full scroll. */
-  padding: 0 44px 18px 0;
+  /* Top padding exists purely so a chip's own :hover lift (transform + shadow, see .chip:hover)
+     has room to render - overflow-y is hidden right below (needed so a stray vertical scroll
+     gesture doesn't fight the row's horizontal one), and with zero top padding that clipped the
+     lifted chip's border/shadow flush against this row's own top edge. Trailing room on the right
+     so the last chip clears the fade at full scroll. */
+  padding: 6px 44px 18px 0;
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
@@ -709,19 +774,32 @@ body {
   font-weight: 500;
   font-family: inherit;
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
 }
-/* Icons live in a pseudo-element so chip.textContent stays exactly the query
-   that gets sent to the assistant. */
-.chip::before {
+/* Dynamic quick-reply chips (renderQuickReplies in app.js) still carry their icon as a data-icon
+   attribute rendered through this pseudo-element, so chip.textContent stays exactly the query/
+   value that gets sent - scoped to [data-icon] so the static welcome chips below (which use a real
+   nested <svg> instead) don't pick up an empty ::before box. */
+.chip[data-icon]::before {
   content: attr(data-icon);
   font-size: 14px;
   line-height: 1;
 }
+/* Static welcome-suggestion chips (index.html) use a real inline SVG instead of an emoji glyph -
+   .closest('.chip') in app.js's click handler means a click landing on the icon or label still
+   resolves to the right chip either way. */
+.chip svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
 .chip:hover {
   background: var(--mint-100);
   border-color: var(--green-500);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -6px rgba(13, 59, 36, 0.25);
 }
+.chip:active { transform: translateY(0); }
 
 /* --- composer ------------------------------------------------------------ */
 
@@ -735,6 +813,10 @@ body {
   background: #fff;
   border: 1.5px solid var(--border);
   border-radius: 26px;
+  /* Barely-there resting shadow - just enough for the composer to read as the one interactive
+     surface on an otherwise flat page, without turning into the "floating card" look the rest of
+     this file deliberately avoids (see the file's own header comment). */
+  box-shadow: 0 2px 10px -6px rgba(13, 59, 36, 0.12);
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 .input-bar:focus-within {
@@ -776,10 +858,15 @@ body {
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  transition: filter 0.16s ease, opacity 0.16s ease;
+  transition: filter 0.16s ease, opacity 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
 }
 #sendBtn svg { width: 17px; height: 17px; }
-#sendBtn:hover:not(:disabled) { filter: brightness(1.12); }
+#sendBtn:hover:not(:disabled) {
+  filter: brightness(1.12);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px -6px rgba(13, 59, 36, 0.45);
+}
+#sendBtn:active:not(:disabled) { transform: translateY(0); }
 #sendBtn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .char-count {
