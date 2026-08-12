@@ -1235,21 +1235,11 @@ async function stepHotelAddAnother(draft, userMessage) {
 // ---------- phase: itinerary (transfer + restaurant only, fully deterministic) ----------
 
 function askItineraryChoice() {
-  return `Now the itinerary — the real form requires at least one item (unless self-booked). Would you like to add a **Transfer** (e.g. airport pickup/drop), **Sightseeing**, a **Restaurant**, or mark it a **Leisure Day**? Or reply "self-booked" if the guest is arranging their own itinerary.`;
+  return `Now the itinerary — the real form requires at least one item. Would you like to add a **Transfer** (e.g. airport pickup/drop), **Sightseeing**, a **Restaurant**, or mark it a **Leisure Day**?`;
 }
 
 async function stepItineraryChoice(draft, userMessage) {
   const t = userMessage.toLowerCase();
-  // "self-booked" is the ONLY thing that should set itinerarySelfBooked - it must not be
-  // conflated with "done adding items" (parseYesNo treats "done" as a no-ish answer, which
-  // previously tripped this same branch even after real items had already been added, silently
-  // flagging self-booked while still sending real itinerary data - a real bug found via a live test).
-  if (/self.?book/i.test(t)) {
-    draft.itinerarySelfBooked = true;
-    if (draft.editMode) return askConfirmItineraryEdit(draft);
-    draft.phase = 'priceCollect';
-    return { reply: askAddMembers(), draft };
-  }
   if (/transfer/i.test(t)) {
     draft.phase = 'transferCollect';
     draft.currentItemDraft = {};
@@ -1283,9 +1273,145 @@ async function stepItineraryChoice(draft, userMessage) {
     return { reply: askAddMembers(), draft };
   }
   return {
-    reply: `The real form needs at least one itinerary item. Please reply "transfer", "sightseeing", "restaurant", "leisure", or "self-booked".`,
+    reply: `The real form needs at least one itinerary item. Please reply "transfer", "sightseeing", "restaurant", or "leisure".`,
     draft,
   };
+}
+
+// Asked right after an item's date is captured (transfer/sightseeing only - the two types with a
+// pickup point), as a per-day alternative to the old whole-itinerary "self-booked" shortcut that
+// used to sit on the initial askItineraryChoice() fork. Lets the guest's own itinerary be a mix of
+// real items and self-arranged days instead of an all-or-nothing choice.
+function askItemSelfBookedGate() {
+  return `Is this self-booked (guest arranging their own), or would you like to add the pickup point details?`;
+}
+
+// Same shape as a real transfer item (see finishTransferItem) with pickup/dropoff/vehicle left
+// blank - mirrors the proven-correct self-booked shape the Leisure Day flow already sends.
+function finishSelfBookedTransferItem(draft) {
+  const t = draft.currentItemDraft;
+  draft.itineraryItems.push({
+    type: 'transfer',
+    id: '',
+    dayNumber: computeDayNumber(t.date, draft.fields.travelDate),
+    date: t.date,
+    time: '',
+    pickupPointId: '',
+    pickupPointName: '',
+    dropOffPointId: '',
+    dropOffPointName: '',
+    particularId: '',
+    transferCode: '',
+    transferName: '',
+    vehicleId: '',
+    vehicleName: '',
+    vehicleCount: '0',
+    vehiclePrice: '0',
+    vehiclePriceCurrency: draft.fields.currency || 'THB',
+    currency: draft.fields.currency || 'THB',
+    capacity: '',
+    remarks: '',
+    flightNo: '',
+    selfBooked: true,
+    finalPrice: 0,
+    costPerAdult: 0,
+    costPerChild: 0,
+    costPerInfant: 0,
+    totalAdult: String(draft.fields.guestAdults || 0),
+    totalChild: String(draft.fields.guestChildrens || 0),
+    totalInfant: String(draft.fields.guestInfants || 0),
+  });
+
+  draft.currentItemDraft = null;
+  const addedMsg = `Added a self-booked day for ${t.date}. `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
+  draft.phase = 'itineraryChoice';
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
+}
+
+async function stepTransferSelfBookedGate(draft, userMessage) {
+  const answer = userMessage.trim();
+  if (isCancelItemIntent(answer)) {
+    draft.currentItemDraft = null;
+    if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+      return processAgentItineraryQueue(draft, 'Okay, not adding this transfer. ');
+    }
+    draft.phase = 'itineraryChoice';
+    return { reply: `Okay, not adding this transfer. ${askItineraryChoice()}`, draft };
+  }
+  const wantsAdd = /\b(add|pickup|detail)\b/i.test(answer) && !/self.?book/i.test(answer);
+  const selfBooked = parseYesNo(answer) === false || /self.?book/i.test(answer);
+  if (selfBooked && !wantsAdd) return finishSelfBookedTransferItem(draft);
+  if (wantsAdd || parseYesNo(answer) === true) {
+    draft.phase = 'transferCollect';
+    draft.itemStep = 'pickupPointName';
+    return { reply: transferStepPrompt('pickupPointName', draft), draft };
+  }
+  return { reply: `Sorry, could you clarify — reply "self-booked" or "add pickup point details"?`, draft };
+}
+
+// Same shape as a real sightseeing item (see finishSightseeingItem) with time/pickup/particular
+// left blank - identical to what a Leisure Day already sends (see finishLeisureDay-equivalent push
+// in stepLeisureDayCollect below), since a self-booked sightseeing day and a Leisure Day are the
+// same record shape on the real site.
+function finishSelfBookedSightseeingItem(draft) {
+  const s = draft.currentItemDraft;
+  draft.itineraryItems.push({
+    type: 'sightseeing',
+    id: '',
+    dayNumber: computeDayNumber(s.date, draft.fields.travelDate),
+    date: s.date,
+    time: '',
+    pickupPointId: '',
+    pickupPointName: '',
+    particularId: '',
+    transferName: '',
+    transferCode: '',
+    totalAdult: '0',
+    adultPrice: '0',
+    totalChild: '0',
+    childPrice: '0',
+    currency: draft.fields.currency || 'THB',
+    remarks: '',
+    selfBooked: true,
+    finalPrice: 0,
+    costPerAdult: 0,
+    costPerChild: 0,
+    costPerInfant: 0,
+    totalInfant: String(draft.fields.guestInfants || 0),
+    flightNo: null,
+  });
+
+  draft.currentItemDraft = null;
+  const addedMsg = `Added a self-booked day for ${s.date}. `;
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return processAgentItineraryQueue(draft, addedMsg);
+  }
+  draft.phase = 'itineraryChoice';
+  return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
+}
+
+async function stepSightseeingSelfBookedGate(draft, userMessage) {
+  const answer = userMessage.trim();
+  if (isCancelItemIntent(answer)) {
+    draft.currentItemDraft = null;
+    if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+      return processAgentItineraryQueue(draft, 'Okay, not adding this sightseeing. ');
+    }
+    draft.phase = 'itineraryChoice';
+    return { reply: `Okay, not adding this sightseeing. ${askItineraryChoice()}`, draft };
+  }
+  const wantsAdd = /\b(add|pickup|detail)\b/i.test(answer) && !/self.?book/i.test(answer);
+  const selfBooked = parseYesNo(answer) === false || /self.?book/i.test(answer);
+  if (selfBooked && !wantsAdd) return finishSelfBookedSightseeingItem(draft);
+  if (wantsAdd || parseYesNo(answer) === true) {
+    draft.phase = 'sightseeingCollect';
+    draft.itemStep = 'time';
+    return { reply: sightseeingStepPrompt('time'), draft };
+  }
+  return { reply: `Sorry, could you clarify — reply "self-booked" or "add pickup point details"?`, draft };
 }
 
 // --- edit mode: adding itinerary items to an ALREADY-SAVED booking/quotation ---
@@ -1369,11 +1495,17 @@ async function finishItineraryEdit(draft) {
   // right before every save) - a first attempt that set only itinearyDetails silently saved
   // nothing, so both are populated here the same way.
   const itinearies = Object.entries(merged).flatMap(([day, items]) => items.map((item) => ({ ...item, day })));
+  // This function is only reached once at least one real item has been added (see
+  // stepItineraryChoice - the old whole-itinerary "self-booked" shortcut that used to set
+  // draft.itinerarySelfBooked no longer exists), so a booking/quotation that was previously saved
+  // self-booked must have that flag cleared now - otherwise raw.selfBookedItineary carries the old
+  // "true" forward even though real itinerary rows are being added, the same staleness bug hit live
+  // on the hotel side (see startAddHotel's saveRawPatch in chat.js).
   const patched = {
     ...raw,
     itinearyDetails: merged,
     itinearies,
-    selfBookedItineary: draft.itinerarySelfBooked || !!raw.selfBookedItineary,
+    selfBookedItineary: false,
   };
 
   const trySave = async (allowSalesEntry) => submitBooking(patched, !!patched.isBooking, { allowSalesEntry });
@@ -1497,7 +1629,8 @@ async function stepTransferCollect(draft, userMessage) {
         const err = validateItineraryItemDate(answer, draft);
         if (err) return { reply: err, draft };
         t.date = answer;
-        break;
+        draft.phase = 'transferSelfBookedGate';
+        return { reply: askItemSelfBookedGate(), draft };
       }
       case 'pickupPointName':
       case 'dropOffPointName':
@@ -1672,7 +1805,8 @@ async function stepSightseeingCollect(draft, userMessage) {
         const err = validateItineraryItemDate(answer, draft);
         if (err) return { reply: err, draft };
         s.date = answer;
-        break;
+        draft.phase = 'sightseeingSelfBookedGate';
+        return { reply: askItemSelfBookedGate(), draft };
       }
       case 'time':
         if (!parseTimeHHMM(answer)) {
@@ -2192,10 +2326,10 @@ function buildConfirmationSummary(draft) {
     out += `Self-booked (guest arranging own itinerary)\n\n`;
   } else {
     for (const item of draft.itineraryItems) {
-      if (item.type === 'transfer') {
+      if (item.selfBooked) {
+        out += `- Day ${item.dayNumber} (${item.date}): Self-booked\n`;
+      } else if (item.type === 'transfer') {
         out += `- Day ${item.dayNumber} (${item.date}): Transfer — ${item.pickupPointName} → ${item.dropOffPointName}, ${item.vehicleName}\n`;
-      } else if (item.type === 'sightseeing' && item.selfBooked) {
-        out += `- Day ${item.dayNumber} (${item.date}): Leisure Day\n`;
       } else if (item.type === 'sightseeing') {
         out += `- Day ${item.dayNumber} (${item.date}): Sightseeing — ${item.transferName} (${item.pickupPointName}, ${item.time})\n`;
       } else {
@@ -2371,7 +2505,7 @@ async function stepConfirmNoSalesEntry(draft, userMessage) {
 // give "cancel"/"no" a narrower meaning via isCancelItemIntent - "don't add this one", not "throw
 // the whole booking away". A bare "cancel" is left to them; only the explicit whole-flow wording
 // (isWholeFlowCancel) overrides it there.
-const ITEM_LEVEL_CANCEL_PHASES = new Set(['hotelCollect', 'transferCollect', 'sightseeingCollect', 'restaurantCollect', 'leisureDayCollect', 'priceCollect']);
+const ITEM_LEVEL_CANCEL_PHASES = new Set(['hotelCollect', 'transferCollect', 'transferSelfBookedGate', 'sightseeingCollect', 'sightseeingSelfBookedGate', 'restaurantCollect', 'leisureDayCollect', 'priceCollect']);
 
 function itemLevelCancelApplies(draft) {
   const midItem = !!(draft.currentHotelDraft || draft.currentItemDraft);
@@ -2414,12 +2548,16 @@ async function step(draft, userMessage) {
       return stepConfirmItineraryEdit(draft, userMessage);
     case 'transferCollect':
       return stepTransferCollect(draft, userMessage);
+    case 'transferSelfBookedGate':
+      return stepTransferSelfBookedGate(draft, userMessage);
     case 'transferOptionalGate':
       return stepTransferOptionalGate(draft, userMessage);
     case 'transferOptionalCollect':
       return stepTransferOptionalCollect(draft, userMessage);
     case 'sightseeingCollect':
       return stepSightseeingCollect(draft, userMessage);
+    case 'sightseeingSelfBookedGate':
+      return stepSightseeingSelfBookedGate(draft, userMessage);
     case 'sightseeingOptionalGate':
       return stepSightseeingOptionalGate(draft, userMessage);
     case 'sightseeingOptionalCollect':
