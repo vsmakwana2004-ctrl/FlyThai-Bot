@@ -1,4 +1,5 @@
 const { getPool } = require('./db');
+const { getFlythaiCookie } = require('./requestContext');
 
 // Node's built-in fetch (undici) throws a bare "fetch failed" TypeError for ANY network-level
 // failure before a response arrives (DNS lookup, connection refused/reset, TLS handshake, timeout)
@@ -20,9 +21,13 @@ async function safeFetch(url, options) {
 }
 
 function buildHeaders() {
-  const cookie = process.env.FLYTHAI_SESSION_COOKIE;
+  // The logged-in chat session's own FlyThai cookie (see requestContext.js) takes priority, so
+  // FlyThai records the real person as who made this change - falls back to the one shared
+  // FLYTHAI_SESSION_COOKIE only when nobody's logged in for this call (e.g. not wrapped in a
+  // request context at all).
+  const cookie = getFlythaiCookie() || process.env.FLYTHAI_SESSION_COOKIE;
   if (!cookie) {
-    const err = new Error('FLYTHAI_SESSION_COOKIE is not set in .env. Capture it from the browser (F12 -> Network -> Copy as cURL on Add Booking) and add it.');
+    const err = new Error('Not logged in, and FLYTHAI_SESSION_COOKIE is not set in .env either. Please log in, or capture a fallback cookie (F12 -> Network -> Copy as cURL on Add Booking) and add it.');
     err.code = 'NO_SESSION_COOKIE';
     throw err;
   }

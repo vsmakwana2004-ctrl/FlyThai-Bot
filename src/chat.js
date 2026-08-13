@@ -18,6 +18,7 @@ const jobSheetCopy = require('./jobSheetCopy');
 const agentCreate = require('./agentCreate');
 const { canUseBot, requirePermission, DEGRADED_NOTE } = require('./rolePermissions');
 const { TABLE_PERMISSION_MAP } = require('./tablePermissionMap');
+const { runWithFlythaiCookie } = require('./requestContext');
 
 // Simple in-memory per-session state (server restarts clear it — fine for an internal tool).
 const sessions = new Map();
@@ -27,6 +28,8 @@ function getSession(sessionId) {
   if (!sessions.has(sessionId))
     sessions.set(sessionId, {
       role: null,
+      flythaiCookie: null,
+      displayName: null,
       history: [],
       draft: null,
       pendingItinerary: null,
@@ -121,6 +124,15 @@ function cancelFlows(sessionId) {
 // just doesn't happen to look like anything else. Only a SPECIFIC, high-precision intent match
 // counts as an interruption.
 function detectAnyFreshIntent(userMessage, session) {
+  // A bare completion/status-value word ("done", "skip", "pending"...) is ambiguous between "finish
+  // the step I'm already answering" and a fuzzy status-change follow-up - while a guided flow
+  // (session.draft) is active, its own interpretation of that word wins; only an EXPLICIT change
+  // instruction (a real change-verb, e.g. "change/mark/set FT... to done") is trusted to interrupt
+  // it. Reproduced live: saying "done" to finish editing an existing booking's itinerary was
+  // silently hijacked into "Change Payment status to Done?" because the fuzzy follow-up match fires
+  // on ANY bare value word whenever a booking code is already in session context - true for
+  // practically every step of an active draft (itinerary "done", pricing/hotel "skip", ...).
+  const statusFuzzyOk = !session.draft;
   const specificMatch = !!(
     convertBooking.detectConvertIntent(userMessage, session.lastBookingCode) ||
     duplicateBooking.detectDuplicateIntent(userMessage, session.lastBookingCode) ||
@@ -129,7 +141,7 @@ function detectAnyFreshIntent(userMessage, session) {
     detectEditMenuIntent(userMessage, session.lastBookingCode) ||
     bookingFlow.detectCreateIntent(userMessage) ||
     agentCreate.detectAgentCreateIntent(userMessage) ||
-    statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode) ||
+    statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode, { allowFuzzy: statusFuzzyOk }) ||
     jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST()) ||
     documents.detectDocumentIntent(userMessage, session.lastBookingCode) ||
     (!ANY_CODE_RE.test(userMessage) && financeReports.detectFinanceReportIntent(userMessage)) ||
@@ -739,12 +751,11 @@ function expectingField(draft) {
   if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'travelDate') {
     return { field: 'date', params: { min: todayIST() } };
   }
-  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'returnDate') {
+  // Return date is no longer asked up front - it's suggested from the itinerary just built (see
+  // bookingFlow.js's askReturnDateConfirm) and only needs a calendar if the user asks to change it.
+  if (draft && draft.phase === 'returnDateConfirm' && draft.returnDateConfirmStep === 'entering') {
     const travelISO = ddmmyyyyToISO(draft.fields.travelDate);
-    // A pasted itinerary with real "Day N:" lines (draft._agentItineraryQueue) means the return
-    // date can't be earlier than that last day - Day 13 implies at least a 13-day trip, so every
-    // date before travelDate + (maxDay - 1) is blanked out instead of just travelDate itself.
-    const maxDay = bookingFlow.maxItineraryDay(draft);
+    const maxDay = bookingFlow.maxKnownItineraryDay(draft);
     const min = maxDay && travelISO ? addDaysISO(travelISO, maxDay - 1) : travelISO || todayIST();
     return { field: 'date', params: { min } };
   }
@@ -785,6 +796,10 @@ function expectingField(draft) {
   // first, before any of those) gets the same trip-bounded calendar as every other itinerary date.
   if (draft && draft.phase === 'transferCollect') {
     if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
+    // A grid of common 30-min slots, same as Sightseeing's own time step below, instead of typing
+    // "HH:MM" blind - time is required here now (right after date), matching the real Add Transfer
+    // form's own mandatory Time field.
+    if (draft.itemStep === 'time') return { field: 'time' };
     if (draft.itemStep === 'pickupPointName' || draft.itemStep === 'dropOffPointName') return { field: 'pickup' };
     if (draft.itemStep === 'transferName') return { field: 'transfer' };
     if (draft.itemStep === 'vehicleTypeName') return { field: 'vehicle' };
@@ -806,6 +821,7 @@ function expectingField(draft) {
   // name, reading as a stuck loop.
   if (draft && draft.phase === 'restaurantCollect') {
     if (draft.itemStep === 'date') return { field: 'date', params: itineraryDateParams(draft) };
+    if (draft.itemStep === 'time') return { field: 'time' };
     if (draft.itemStep === 'restaurantName') return { field: 'restaurant' };
   }
   // Leisure Day is a single-question phase (just the date) - draft.phase alone identifies it,
@@ -822,11 +838,12 @@ function expectingField(draft) {
   // form" pattern as extraGate/extraCollect below. One generic form, fields swapped per item type -
   // same LLM-parsed step*OptionalCollect() as before, just pre-composed instead of typed from memory.
   if (draft && draft.phase === 'transferOptionalCollect') {
+    // Time is no longer offered here - it's required and already collected earlier (right after
+    // date, see TRANSFER_FIELD_ORDER) - re-showing it in this optional form was redundant leftover.
     return {
       field: 'itineraryOptionalForm',
       params: {
         fields: [
-          { key: 'time', label: 'Time', type: 'text', placeholder: 'e.g. 14:30' },
           { key: 'numberOfVehicles', label: 'Number of vehicles', type: 'number' },
           { key: 'vehiclePrice', label: 'Vehicle price', type: 'number' },
           { key: 'flightNo', label: 'Flight no', type: 'text' },
@@ -836,13 +853,18 @@ function expectingField(draft) {
     };
   }
   if (draft && draft.phase === 'sightseeingOptionalCollect') {
+    // Pre-filled (not locked) from the trip's own overall pax count, when known (e.g. "Pax: 8
+    // Adults" in a pasted agent message) - one less thing to re-type per item on a long itinerary,
+    // still fully editable/clearable right here if this particular activity's numbers differ.
+    const adults = draft.fields.guestAdults;
+    const children = draft.fields.guestChildrens;
     return {
       field: 'itineraryOptionalForm',
       params: {
         fields: [
-          { key: 'totalAdult', label: 'Adults', type: 'number' },
+          { key: 'totalAdult', label: 'Adults', type: 'number', value: adults },
           { key: 'adultPrice', label: 'Adult price', type: 'number' },
-          { key: 'totalChild', label: 'Children', type: 'number' },
+          { key: 'totalChild', label: 'Children', type: 'number', value: children },
           { key: 'childPrice', label: 'Child price', type: 'number' },
           { key: 'remarks', label: 'Remarks', type: 'text' },
         ],
@@ -850,17 +872,21 @@ function expectingField(draft) {
     };
   }
   if (draft && draft.phase === 'restaurantOptionalCollect') {
+    // Same trip-pax pre-fill as sightseeing above, applied to both lunch and dinner counts (the
+    // trip's headcount doesn't usually differ per meal) - still editable/clearable per meal here.
+    const adults = draft.fields.guestAdults;
+    const children = draft.fields.guestChildrens;
     return {
       field: 'itineraryOptionalForm',
       params: {
         fields: [
-          { key: 'lunchAdultCount', label: 'Lunch adults', type: 'number' },
+          { key: 'lunchAdultCount', label: 'Lunch adults', type: 'number', value: adults },
           { key: 'lunchAdultPrice', label: 'Lunch adult price', type: 'number' },
-          { key: 'lunchChildCount', label: 'Lunch children', type: 'number' },
+          { key: 'lunchChildCount', label: 'Lunch children', type: 'number', value: children },
           { key: 'lunchChildPrice', label: 'Lunch child price', type: 'number' },
-          { key: 'dinnerAdultCount', label: 'Dinner adults', type: 'number' },
+          { key: 'dinnerAdultCount', label: 'Dinner adults', type: 'number', value: adults },
           { key: 'dinnerAdultPrice', label: 'Dinner adult price', type: 'number' },
-          { key: 'dinnerChildCount', label: 'Dinner children', type: 'number' },
+          { key: 'dinnerChildCount', label: 'Dinner children', type: 'number', value: children },
           { key: 'dinnerChildPrice', label: 'Dinner child price', type: 'number' },
           { key: 'remarks', label: 'Remarks', type: 'text' },
         ],
@@ -884,9 +910,59 @@ function quickRepliesFor(draft) {
   // stepSource/looksLikeAgentPaste - so there's no longer a separate manual-vs-agent choice to
   // render chips for here.
   if (draft && draft.phase === 'agentPasteConfirm') {
-    return [
+    const chips = [
       { label: 'Yes, use these', value: 'yes, use these', autoSend: true },
       { label: 'No, enter manually', value: 'no, enter manually', autoSend: true },
+    ];
+    // Puts the user's own original pasted message back into the input box (not sent - see
+    // app.js's non-autoSend chip handling) so a wrong/missed detail can be fixed by editing their
+    // own text and resending it, instead of the previous all-or-nothing choice between accepting
+    // every extracted field as-is or throwing all of it away to re-type from scratch. Whatever they
+    // resend is picked up by the same paste-detection/extraction path fresh - no separate handling
+    // needed, since it's just another message that happens to look like an agent paste again.
+    if (draft.agentRawMessage) {
+      chips.push({ label: 'Edit and resend', value: draft.agentRawMessage, autoSend: false });
+    }
+    return chips;
+  }
+  // Pause between auto-added itinerary items from a pasted message (see bookingFlow.js's
+  // processAgentItineraryQueue) - a long itinerary (e.g. 13 days) means several transfer/
+  // sightseeing items in a row, each needing its own pickup/time/etc confirmed, so this offers an
+  // explicit stop point after every one instead of only at the very end.
+  if (draft && draft.phase === 'agentQueueContinue') {
+    return [
+      { label: 'Continue adding', value: 'continue', autoSend: true },
+      { label: `That's enough, stop here`, value: 'done', autoSend: true },
+    ];
+  }
+  // The return date suggested from the itinerary just built (see bookingFlow.js's
+  // askReturnDateConfirm) - "Change it" switches to the calendar (see expectingField above)
+  // instead of asking the user to type "change" from memory.
+  if (draft && draft.phase === 'returnDateConfirm' && draft.returnDateConfirmStep === 'confirm') {
+    return [
+      { label: `Yes, that's correct`, value: 'yes', autoSend: true },
+      { label: 'Change it', value: 'change', autoSend: true },
+    ];
+  }
+  // A hotel the pasted agent message named for a destination (e.g. "Phuket: Andakira or similar
+  // category") - see bookingFlow.js's stageHotelPreference - is only ever a suggestion, never
+  // applied outright. "Change it" drops straight into the normal hotelName question, which already
+  // shows the live hotel-search dropdown (see expectingField's own hotelCollect/hotelName case).
+  if (draft && draft.phase === 'hotelCollect' && draft.hotelStep === 'hotelPrefConfirm') {
+    return [
+      { label: `Yes, that's correct`, value: 'yes', autoSend: true },
+      { label: 'Change it', value: 'change', autoSend: true },
+    ];
+  }
+  // A transfer name guessed from the pasted agent message's own wording (e.g. "HKT airport to HKT
+  // hotel" auto-matched against the real "Phuket Airport to Phuket Hotel" record) - see
+  // bookingFlow.js's nextTransferStepReply/processAgentItineraryQueue - is only ever a suggestion.
+  // "Change it" drops straight into the normal transferName question, which already shows the live
+  // transfer-search dropdown (see expectingField's own transferCollect/transferName case).
+  if (draft && draft.phase === 'transferCollect' && draft.itemStep === 'transferNameConfirm') {
+    return [
+      { label: `Yes, that's correct`, value: 'yes', autoSend: true },
+      { label: 'Change it', value: 'change', autoSend: true },
     ];
   }
   // The guest's phone/email steps offer a "reply same to use the agent's own number/email"
@@ -931,7 +1007,7 @@ function quickRepliesFor(draft) {
     // Skip is its own complete answer (there's nothing left to combine it with) so it submits
     // immediately - the other chips here stay fill-the-box, since picking one shouldn't cut off
     // the chance to also add another (e.g. "Breakfast included" + "Double sharing" together).
-    return [
+    const chips = [
       { label: 'Skip', value: 'skip', autoSend: true },
       'Breakfast included',
       'No breakfast',
@@ -939,6 +1015,11 @@ function quickRepliesFor(draft) {
       'Double sharing',
       'Triple sharing',
     ];
+    // Trip's own overall pax count, when known (e.g. "Pax: 8 Adults" in a pasted agent message) -
+    // fills the box (combinable with the chips above, same as those) rather than locking it in, so
+    // it can be edited/removed if this hotel's actual occupancy differs from the trip headcount.
+    if (draft.fields.guestAdults) chips.push(`${draft.fields.guestAdults} adults staying`);
+    return chips;
   }
   // "Add another hotel?" is a plain yes/no gate - single-tap, auto-send.
   if (draft && draft.phase === 'hotelAddAnother') {
@@ -1069,7 +1150,12 @@ async function handleChat(sessionId, userMessage, role) {
   const session = getSession(sessionId);
   if (typeof role === 'string' && role) session.role = role;
 
-  let result = await handleChatInner(sessionId, userMessage);
+  // Every live FlyThai call anywhere in handleChatInner's call chain reads its cookie from this
+  // context (see requestContext.js) instead of a function parameter threaded through a dozen files
+  // - set once per logged-in session at /api/login (setSessionLogin below), null until then, in
+  // which case buildHeaders() in bookingApi.js/convertBooking.js/jobSheetCopy.js falls back to the
+  // shared FLYTHAI_SESSION_COOKIE env var.
+  let result = await runWithFlythaiCookie(session.flythaiCookie, () => handleChatInner(sessionId, userMessage));
 
   if (session._permissionDegraded) {
     result = { ...result, answer: `${DEGRADED_NOTE}${result.answer}` };
@@ -2641,11 +2727,11 @@ async function handleChatInner(sessionId, userMessage) {
 
   // If a booking/quotation is already being collected in this session, stay in that flow.
   if (session.draft) {
-    const { reply, draft, createdCode } = await bookingFlow.step(session.draft, userMessage);
+    const { reply, draft, createdCode, checkpoint } = await bookingFlow.step(session.draft, userMessage);
     session.draft = draft;
     if (createdCode) session.lastBookingCode = createdCode;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft) };
+    return { answer: reply, sql: null, rowCount: 0, expecting: expectingField(draft), quickReplies: quickRepliesFor(draft), checkpoint: checkpoint || undefined };
   }
 
   // A full travel-agent trip brief (real day-by-day itinerary) pasted with no "create a booking"
@@ -3012,4 +3098,14 @@ async function handleChatInner(sessionId, userMessage) {
   };
 }
 
-module.exports = { handleChat, cancelFlows };
+// Called once by /api/login on a successful FlyThai login - sets the session's role (for
+// permission gating, same as before) and its own FlyThai cookie (for buildHeaders() everywhere
+// else to use instead of the shared FLYTHAI_SESSION_COOKIE - see requestContext.js).
+function setSessionLogin(sessionId, { role, flythaiCookie, displayName }) {
+  const session = getSession(sessionId);
+  session.role = role;
+  session.flythaiCookie = flythaiCookie;
+  session.displayName = displayName;
+}
+
+module.exports = { handleChat, cancelFlows, setSessionLogin };

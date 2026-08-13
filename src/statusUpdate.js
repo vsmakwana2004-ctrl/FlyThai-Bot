@@ -30,7 +30,12 @@ const STATUS_TYPES = {
 
 // fallbackCode: the last booking/quotation code mentioned in this chat session, used when the
 // current message refers to it by pronoun ("change that to done") instead of repeating the code.
-function detectStatusUpdateIntent(text, fallbackCode) {
+// allowFuzzy: false when checked purely to decide whether to INTERRUPT another already-active flow
+// (see chat.js's detectAnyFreshIntent) - a bare completion word like "done"/"skip"/"pending" is
+// exactly as likely to mean "finish the step I'm already answering" as a status change, so only an
+// EXPLICIT change instruction (a real change-verb) is trusted to interrupt something else already
+// running. Real dispatch-time calls (nothing else active) keep the default fuzzy matching.
+function detectStatusUpdateIntent(text, fallbackCode, { allowFuzzy = true } = {}) {
   const hasChangeVerb = CHANGE_VERB_RE.test(text);
   const hasStatusWord = STATUS_WORD_RE.test(text);
   const hasValueWord = VALUE_WORD_RE.test(text);
@@ -40,7 +45,7 @@ function detectStatusUpdateIntent(text, fallbackCode) {
   // "done kar do") - only trust this when we already know which booking is being discussed, the
   // message is short (a real instruction, not a long unrelated sentence), and it isn't a question.
   const wordCount = text.trim().split(/\s+/).length;
-  const fuzzyFollowUp = !explicitSignal && hasValueWord && !!fallbackCode && wordCount <= 8 && !looksLikeQuestion(text);
+  const fuzzyFollowUp = allowFuzzy && !explicitSignal && hasValueWord && !!fallbackCode && wordCount <= 8 && !looksLikeQuestion(text);
 
   if (!explicitSignal && !fuzzyFollowUp) return null;
 

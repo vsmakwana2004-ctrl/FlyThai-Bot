@@ -2,9 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { handleChat, cancelFlows } = require('./src/chat');
+const { handleChat, cancelFlows, setSessionLogin } = require('./src/chat');
 const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles, listDestinations, listHotelRoomTypes } = require('./src/lookups');
 const { initRolePermissions, refreshPermissions, getRoleList } = require('./src/rolePermissions');
+const { verifyLogin, getUserRoleId } = require('./src/flythaiAuth');
 
 const app = express();
 app.use(cors());
@@ -208,6 +209,37 @@ app.post('/api/roles/refresh', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not refresh role permissions: ' + err.message });
+  }
+});
+
+// Replaces manually picking a role from a dropdown: staff log in with their real FlyThai
+// credentials, we verify them against FlyThai's own login and look up their assigned role, and the
+// frontend uses that role for every /api/chat call from then on - same wire shape as the old
+// dropdown (a plain `role` string), just sourced from a real identity check instead of a free pick.
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password, sessionId } = req.body || {};
+    if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Please enter your FlyThai username and password.' });
+    }
+    const login = await verifyLogin(username, password);
+    if (!login.ok) {
+      return res.status(401).json({ error: 'Incorrect username or password.' });
+    }
+    const { roleId, name } = await getUserRoleId(login.userId);
+    const role = getRoleList().find((r) => r.id === roleId);
+    if (!role) {
+      return res.status(500).json({ error: `Logged in, but your role isn't recognized yet - try again in a moment (role list may still be loading), or ask an Admin to check your role in Manage Users.` });
+    }
+    const sid = sessionId && typeof sessionId === 'string' ? sessionId : 'default';
+    setSessionLogin(sid, { role: role.roleName, flythaiCookie: login.sessionCookie, displayName: name });
+    res.json({ ok: true, role: role.roleName, displayName: name });
+  } catch (err) {
+    console.error(err);
+    if (err.code === 'NO_SESSION_COOKIE') {
+      return res.status(503).json({ error: 'The connection to the FlyThai booking site needs to be refreshed. Please contact your admin.' });
+    }
+    res.status(500).json({ error: 'Something went wrong while logging in. Please try again.' });
   }
 });
 

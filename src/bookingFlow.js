@@ -187,10 +187,77 @@ function addDaysToDateObj(dateObj, days) {
   return d;
 }
 
-// Strict 24-hour HH:MM, matching the real Add Sightseeing form's time input.
-function parseTimeHHMM(str) {
+function formatDateObjDDMMYYYY(dateObj) {
+  return `${String(dateObj.getDate()).padStart(2, '0')}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${dateObj.getFullYear()}`;
+}
+
+// The real max day of the itinerary actually built so far (every pushed item stores its own
+// dayNumber, computed from travelDate at push time - see computeDayNumber) - unlike maxItineraryDay
+// above, which only reads a pasted agent message's "_agentItineraryQueue" and is null for a
+// manually-built itinerary. Used to suggest a return date once itinerary collection is done (see
+// askReturnDateConfirm) instead of asking for it blind before any itinerary items exist.
+function maxItineraryItemDay(draft) {
+  const items = draft.itineraryItems;
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const max = items.reduce((m, item) => Math.max(m, Number(item.dayNumber) || 0), 0);
+  return max > 0 ? max : null;
+}
+
+// The trip's REAL length for an agent-pasted booking, from the message's own stated day-by-day
+// itinerary (e.g. "Day 13: ..." -> a 13-day trip) - not just whatever's been individually added to
+// draft.itineraryItems so far. Deliberately the higher of the two: items already built (dayNumber)
+// AND whatever's still queued but not yet processed (draft._agentItineraryQueue's own day numbers,
+// present even before a single item has been added) - so the suggested return date reflects the
+// actual trip the message described, even if the user stops early via the itinerary continue/stop
+// checkpoint (see stepAgentQueueContinue) partway through manually confirming each day's details.
+// Reproduced live: a message describing a 13-day trip, stopped after only 2 days were confirmed in
+// chat, wrongly suggested a 2-day return date - the checkpoint is about how much detail gets
+// entered right now, not about how long the trip actually is.
+function maxKnownItineraryDay(draft) {
+  const itemsMax = maxItineraryItemDay(draft) || 0;
+  const queue = draft._agentItineraryQueue;
+  const queueMax = Array.isArray(queue) && queue.length > 0 ? queue.reduce((m, l) => Math.max(m, Number(l.day) || 0), 0) : 0;
+  const max = Math.max(itemsMax, queueMax);
+  return max > 0 ? max : null;
+}
+
+// Accepts whatever shape the user actually types - "14:30", "1430", "14.30", "2:30pm", "2pm" - and
+// always normalizes to strict 24-hour "HH:mm" before it's ever stored, since that's the only format
+// the real FlyThai form itself saves. Returns null if the text isn't confidently a time at all (the
+// caller re-asks rather than guess). Bare 3-4 digit input ("1430"/"930") is read as HHmm/Hmm, never
+// as a duration or anything else - matches how every real user actually types a clock time blind.
+function parseFlexibleTime(str) {
   if (!str || typeof str !== 'string') return null;
-  return /^([01]\d|2[0-3]):([0-5]\d)$/.test(str.trim()) ? str.trim() : null;
+  const t = str.trim().toLowerCase();
+
+  const ampm = t.match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)$/);
+  if (ampm) {
+    let h = Number(ampm[1]);
+    const min = ampm[2] ? Number(ampm[2]) : 0;
+    if (h < 1 || h > 12 || min > 59) return null;
+    if (ampm[3] === 'pm' && h !== 12) h += 12;
+    if (ampm[3] === 'am' && h === 12) h = 0;
+    return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  }
+
+  const withSep = t.match(/^(\d{1,2})[:.](\d{2})$/);
+  if (withSep) {
+    const h = Number(withSep[1]);
+    const min = Number(withSep[2]);
+    if (h > 23 || min > 59) return null;
+    return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  }
+
+  const bareDigits = t.match(/^(\d{3,4})$/);
+  if (bareDigits) {
+    const digits = bareDigits[1];
+    const h = Number(digits.length === 4 ? digits.slice(0, 2) : digits.slice(0, 1));
+    const min = Number(digits.slice(-2));
+    if (h > 23 || min > 59) return null;
+    return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  }
+
+  return null;
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -242,7 +309,10 @@ function formatDest(d) {
 // Agent is asked before phone/email (not after, like the previous order) so its Phone/Email/
 // Address can be offered as a default - mirrors the real form's own getAgentDetails() behavior,
 // which auto-fills the guest's phone/email/address from the selected Company/Agent record.
-const BASIC_FIELD_ORDER = ['guestName', 'agentName', 'guestPhoneNumber', 'guestEmail', 'destinationNames', 'travelDate', 'returnDate'];
+// returnDate is deliberately NOT in this list - it's no longer asked blind, up front. Once the
+// itinerary is built, its span is used to suggest a return date and just confirm/adjust it (see
+// askReturnDateConfirm, phase 'returnDateConfirm', after itineraryChoice finishes).
+const BASIC_FIELD_ORDER = ['guestName', 'agentName', 'guestPhoneNumber', 'guestEmail', 'destinationNames', 'travelDate'];
 
 function basicStepPrompt(stepKey, draft) {
   switch (stepKey) {
@@ -262,8 +332,6 @@ function basicStepPrompt(stepKey, draft) {
       return `Which destination(s) is this trip to? You can use the full name or the short code. Available: ${draft.destinationOptions.map(formatDest).join(', ')}`;
     case 'travelDate':
       return 'What is the travel date? (format DD-MM-YYYY)';
-    case 'returnDate':
-      return 'What is the return date? (format DD-MM-YYYY)';
     default:
       return '';
   }
@@ -375,6 +443,14 @@ function basicNextPrompt(draft) {
     draft.basicPaxAsked = true;
     draft.basicCurrentStep = 'travelCount';
     return 'How many Adults/Children/Infants are travelling? e.g. "4 adults, 1 child" (optional — reply "skip" to leave this for now)';
+  }
+  // An agent-pasted message with its own day-by-day itinerary already states the trip's real
+  // length ("Day 13: ..." -> 13 days) - decided/confirmed HERE, right as the basic details finish,
+  // using that stated length (see maxKnownItineraryDay), rather than deferred until the itinerary
+  // is actually built item by item later - which might get cut short by the itinerary continue/stop
+  // checkpoint (stepAgentQueueContinue) and wrongly suggest a shorter trip than the message says.
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return askReturnDateConfirm(draft, 'hotelChoice').reply;
   }
   draft.phase = 'hotelChoice';
   return `Got the basic details for **${draft.fields.guestName}**. Now — is the hotel self-booked (guest arranging their own), or would you like to add hotel details? (reply "self-booked" or "add hotel")`;
@@ -552,18 +628,25 @@ async function tryResolveHotelName(candidateName) {
 
 // Called once a hotel row's destination is known (either auto-picked for a single-destination
 // trip, or just answered for a multi-destination one) - looks up whether the travel agent named a
-// preferred hotel for that destination and, if so, pre-fills it onto the in-progress hotel draft.
-async function applyAgentHotelPreference(draft, h) {
-  if (!draft._agentHotelPrefs || !h._destId) return false;
+// preferred hotel for that destination (e.g. "Phuket: Andakira or similar category" - the "or
+// similar" qualifier is already stripped off by the extraction prompt, see hotelPreferences above)
+// and, if it resolves to exactly one real hotel, STAGES it for confirmation rather than silently
+// applying it - "or similar" is explicitly not a firm choice, so the user gets to say yes or pick a
+// different one (via the same hotel dropdown the manual question already shows) before it's used,
+// instead of it being locked in from a single fuzzy text match with no visibility. A name with no
+// match, or an ambiguous one (2+ hotels), returns null unchanged - falls through to the normal
+// hotelName question exactly as before, since there's nothing confident enough to even suggest.
+async function stageHotelPreference(draft, h) {
+  if (!draft._agentHotelPrefs || !h._destId) return null;
   const dest = draft.resolvedDestinations.find((d) => d.Id === h._destId);
-  if (!dest) return false;
+  if (!dest) return null;
   const pref = draft._agentHotelPrefs.find((p) => p.destinationName && dest.Name.toLowerCase() === String(p.destinationName).toLowerCase());
-  if (!pref) return false;
+  if (!pref) return null;
   const resolved = await tryResolveHotelName(pref.hotelName);
-  if (!resolved) return false;
-  h.hotelName = resolved.hotelName;
-  h._resolvedHotelId = resolved.resolvedHotelId;
-  return true;
+  if (!resolved || resolved.resolvedHotelId === 0) return null;
+  h._pendingHotelPrefName = resolved.hotelName;
+  h._pendingHotelPrefId = resolved.resolvedHotelId;
+  return resolved;
 }
 
 async function tryResolvePoint(hint) {
@@ -575,7 +658,31 @@ async function tryResolvePoint(hint) {
 async function tryResolveTransferParticular(hint) {
   if (!hint) return null;
   const rows = await findPickupOrParticular(hint);
-  return rows.length === 1 ? rows[0] : null;
+  if (rows.length === 1) return rows[0];
+  // A hint that's an exact (case-insensitive) name match for ONE of several fuzzy-matched rows -
+  // e.g. "Phuket Airport to Phuket Hotel" is itself a plain substring of the real, separate
+  // "Phuket Airport to Phuket Hotel (Enroute Lunch)" record, so the LIKE search above always
+  // returns both - is still a confident single answer, not a real ambiguity.
+  if (rows.length > 1) {
+    const exact = rows.filter((r) => r.Name.toLowerCase() === hint.toLowerCase());
+    if (exact.length === 1) return exact[0];
+  }
+  return null;
+}
+
+// A pasted itinerary line's pickup/dropoff hint is often a placeholder, not a specific real
+// location - "HKT hotel"/"Phuket hotel" means "wherever the guest's hotel booking for Phuket ends
+// up being", which will never match a specific Pickup record (there is no literal "Phuket Hotel"
+// row - real hotels have their own names). But the transfer catalog itself has generic named
+// products for exactly this ("Phuket Airport to Phuket Hotel", confirmed live) - if the hint text
+// mentions one of the trip's own known destinations (by name or short code, e.g. "HKT" -> Phuket),
+// "<that destination> Hotel" is a reasonable stand-in to try in tryResolveTransferParticular's
+// query, even though it was never resolved as a real Pickup point itself.
+function guessDestinationHotelPlaceholder(hintText, resolvedDestinations) {
+  if (!hintText || !Array.isArray(resolvedDestinations)) return null;
+  const t = hintText.toLowerCase();
+  const dest = resolvedDestinations.find((d) => t.includes(d.Name.toLowerCase()) || (d.ShortCode && t.includes(String(d.ShortCode).toLowerCase())));
+  return dest ? `${dest.Name} Hotel` : null;
 }
 
 async function tryResolveSightseeing(hint, weekday) {
@@ -604,6 +711,25 @@ async function processAgentItineraryQueue(draft, prefix) {
   const queue = draft._agentItineraryQueue;
   if (!queue || queue.length === 0) {
     return { reply: `${prefix}${itineraryContinuePrompt(draft)}`, draft };
+  }
+
+  // Once at least one real (non-leisure) item has actually been added from the message, pause
+  // before pulling the next one instead of barrelling through the whole rest of a long itinerary
+  // (a 13-day trip can mean a dozen transfer/sightseeing items in a row, each needing its own
+  // pickup/time/etc confirmed) - gives an explicit, easy exit at every step instead of only at the
+  // very end. Leisure days need no back-and-forth at all, so a run of them is still added silently
+  // in one pass either way (see below) - this only ever interrupts BETWEEN real items.
+  if (draft._agentQueueRealItemAdded && queue.length > 0) {
+    draft.phase = 'agentQueueContinue';
+    const dayWord = queue.length === 1 ? 'day' : 'days';
+    return {
+      reply: `${prefix}${queue.length} more ${dayWord} left in the message's itinerary. Continue adding them, or is this enough?`,
+      draft,
+      // Lets the frontend visually set this message apart from a normal reply (see chat.js/app.js)
+      // - it's a checkpoint pause, not just conversation, so it should read as one at a glance on a
+      // long 13-day itinerary with a dozen of these in a row.
+      checkpoint: true,
+    };
   }
 
   let leisureAdded = 0;
@@ -653,6 +779,7 @@ async function processAgentItineraryQueue(draft, prefix) {
   }
 
   if (line.type === 'transfer') {
+    draft._agentQueueRealItemAdded = true;
     if (!draft.vehicleOptions) draft.vehicleOptions = await listVehicles();
     const t = { date: dateStr };
     const matched = [];
@@ -660,27 +787,58 @@ async function processAgentItineraryQueue(draft, prefix) {
     if (pickup) { t.pickupPointName = pickup.Name; t._pickupPointNameRow = pickup; matched.push(`pickup: ${pickup.Name}`); }
     const dropoff = await tryResolvePoint(line.dropoffHint);
     if (dropoff) { t.dropOffPointName = dropoff.Name; t._dropOffPointNameRow = dropoff; matched.push(`drop-off: ${dropoff.Name}`); }
-    // Real transfer master records are named "<Pickup Point> to <Drop-off Point>" (verified live
-    // against the DB, e.g. "Phuket Airport to Phuket Hotel") - once both points are themselves
-    // resolved to real records, searching on their exact names together is far more reliable than
-    // the model's own free-text transferNameHint guess, which is only used as a fallback.
-    const particularQuery = pickup && dropoff ? `${pickup.Name} to ${dropoff.Name}` : line.transferNameHint || line.pickupHint;
-    const particular = await tryResolveTransferParticular(particularQuery);
-    if (particular) { t.transferName = particular.Name; t._transferNameRow = particular; matched.push(`transfer: ${particular.Name}`); }
+    // Real transfer master records are named "<Destination> Airport to <Destination> Hotel"
+    // (verified live against the DB, e.g. "Phuket Airport to Phuket Hotel") using the DESTINATION's
+    // own full name, NOT necessarily whatever a specific Pickup record happens to be named - "HKT
+    // Airport" (the real Pickup row) doesn't textually match "Phuket Airport to Phuket Hotel" at
+    // all, even though it's the exact same place, because the trip's short code ("HKT") and the
+    // catalog's naming convention (spelled-out destination name) don't line up. So the purely
+    // destination-name-based guess is tried FIRST (highest confidence, matches the demonstrated
+    // catalog pattern directly), before the resolved-Pickup-record combination, before the model's
+    // own free-text guess. Tried in order; the first one that resolves to exactly one record wins.
+    const lineText = `${line.pickupHint || ''} ${line.dropoffHint || ''} ${line.transferNameHint || ''}`;
+    const lineDest = draft.resolvedDestinations.find((d) => {
+      const t = lineText.toLowerCase();
+      return t.includes(d.Name.toLowerCase()) || (d.ShortCode && t.includes(String(d.ShortCode).toLowerCase()));
+    });
+    const candidateQueries = [];
+    if (lineDest) candidateQueries.push(`${lineDest.Name} Airport to ${lineDest.Name} Hotel`);
+    if (pickup && dropoff) candidateQueries.push(`${pickup.Name} to ${dropoff.Name}`);
+    if (pickup && !dropoff) {
+      const destPlaceholder = guessDestinationHotelPlaceholder(line.dropoffHint, draft.resolvedDestinations);
+      if (destPlaceholder) candidateQueries.push(`${pickup.Name} to ${destPlaceholder}`);
+    }
+    if (dropoff && !pickup) {
+      const destPlaceholder = guessDestinationHotelPlaceholder(line.pickupHint, draft.resolvedDestinations);
+      if (destPlaceholder) candidateQueries.push(`${destPlaceholder} to ${dropoff.Name}`);
+    }
+    if (line.transferNameHint) candidateQueries.push(line.transferNameHint);
+    if (line.pickupHint) candidateQueries.push(line.pickupHint);
+
+    let particular = null;
+    for (const q of candidateQueries) {
+      particular = await tryResolveTransferParticular(q);
+      if (particular) break;
+    }
+    // Staged, NOT applied directly - a same-worded match ("HKT airport to HKT hotel" -> "Phuket
+    // Airport to Phuket Hotel") is a guess about which of several real transfer records was meant,
+    // not a certainty, so it's confirmed (see nextTransferStepReply) before being locked in, instead
+    // of silently applied with only a passing "(auto-matched)" mention nobody could act on.
+    if (particular) t._pendingTransferNameConfirm = particular;
 
     draft.phase = 'transferCollect';
     draft.currentItemDraft = t;
-    const next = TRANSFER_FIELD_ORDER.find((k) => t[k] === undefined || t[k] === null || t[k] === '');
     const matchedNote = matched.length > 0 ? ` (auto-matched ${matched.join(', ')})` : '';
-    if (!next) {
+    const stepReply = nextTransferStepReply(draft, t);
+    if (!stepReply) {
       draft.phase = 'transferOptionalCollect';
-      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer auto-matched${matchedNote}. Optional: time, number of vehicles, vehicle price, flight no, remarks. Reply with any of these, or "skip".`, draft };
+      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer auto-matched${matchedNote}. Optional: number of vehicles, vehicle price, flight no, remarks. Reply with any of these, or "skip".`, draft };
     }
-    draft.itemStep = next;
-    return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer from the message${matchedNote}. ${transferStepPrompt(next, draft)}`, draft };
+    return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — transfer from the message${matchedNote}. ${stepReply}`, draft };
   }
 
   if (line.type === 'sightseeing') {
+    draft._agentQueueRealItemAdded = true;
     const weekday = weekdayNameFor(dateStr);
     const s = { date: dateStr };
     const matched = [];
@@ -702,6 +860,27 @@ async function processAgentItineraryQueue(draft, prefix) {
   // Only transfer/sightseeing/leisure are ever queued (see the filter in stepAgentPaste) - nothing
   // else should reach here, but fall through safely (continue the queue) rather than get stuck.
   return processAgentItineraryQueue(draft, prefix + leisureNote);
+}
+
+// Answers the "N more days left - continue, or is this enough?" pause above. Stopping here mirrors
+// exactly what saying "done" does in the manual stepItineraryChoice flow - whatever's left in
+// draft._agentItineraryQueue is simply never processed (whether it's build manually later, from
+// this same message via "Edit and resend", or not at all is entirely up to the user from here).
+async function stepAgentQueueContinue(draft, userMessage) {
+  const yn = parseYesNo(userMessage);
+  const wantsStop = yn === false || /\b(done|enough|stop|no more)\b/i.test(userMessage);
+  if (wantsStop) {
+    if (draft.editMode) return askConfirmItineraryEdit(draft);
+    return askReturnDateConfirm(draft);
+  }
+  if (yn === true || /\bcontinue\b/i.test(userMessage)) {
+    // Cleared just for this one re-entry, so processAgentItineraryQueue's own pause check (right
+    // above the leisure-batch loop) doesn't immediately re-trigger on the item this "continue" is
+    // FOR - it gets set again once (and only once) that next real item is actually dequeued below.
+    draft._agentQueueRealItemAdded = false;
+    return processAgentItineraryQueue(draft, '');
+  }
+  return { reply: 'Reply "continue" to keep adding the rest of the itinerary, or "done" if this is enough.', draft };
 }
 
 async function stepBasic(draft, userMessage) {
@@ -803,27 +982,6 @@ async function stepBasic(draft, userMessage) {
       break;
     }
 
-    case 'returnDate': {
-      const returnDateObj = parseDateDDMMYYYY(answer);
-      if (!returnDateObj) {
-        return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
-      }
-      const travelDateObj = parseDateDDMMYYYY(draft.fields.travelDate);
-      if (returnDateObj <= travelDateObj) {
-        return { reply: `Return date must be later than the travel date (${draft.fields.travelDate}) — could you re-enter it?`, draft };
-      }
-      const maxDay = maxItineraryDay(draft);
-      if (maxDay && travelDateObj) {
-        const minReturnObj = addDaysToDateObj(travelDateObj, maxDay - 1);
-        if (returnDateObj < minReturnObj) {
-          const minReturnStr = `${String(minReturnObj.getDate()).padStart(2, '0')}-${String(minReturnObj.getMonth() + 1).padStart(2, '0')}-${minReturnObj.getFullYear()}`;
-          return { reply: `The itinerary runs through Day ${maxDay}, so the return date can't be before ${minReturnStr} — could you re-enter it?`, draft };
-        }
-      }
-      draft.fields.returnDate = answer;
-      break;
-    }
-
     case 'travelCount': {
       if (!/^skip$/i.test(answer)) {
         const adultsMatch = answer.match(/(\d+)\s*adult/i);
@@ -852,6 +1010,12 @@ async function stepBasic(draft, userMessage) {
     draft.basicPaxAsked = true;
     draft.basicCurrentStep = 'travelCount';
     return { reply: 'How many Adults/Children/Infants are travelling? e.g. "4 adults, 1 child" (optional — reply "skip" to leave this for now)', draft };
+  }
+
+  // See basicNextPrompt's identical check above (reached from the OTHER entry point into this same
+  // end-of-basic-phase transition - this is stepBasic's own per-answer path).
+  if (draft._agentItineraryQueue && draft._agentItineraryQueue.length > 0) {
+    return askReturnDateConfirm(draft, 'hotelChoice');
   }
 
   draft.phase = 'hotelChoice';
@@ -1008,12 +1172,11 @@ async function startHotelCollect(draft) {
     const dest = draft.resolvedDestinations[0];
     h.destinationName = dest.Name;
     h._destId = dest.Id;
-    // Travel-agent-sourced draft only (see applyAgentHotelPreference) - no-op for a manual one.
-    const usedPref = await applyAgentHotelPreference(draft, h);
-    if (usedPref) {
-      const next = HOTEL_FIELD_ORDER.find((k) => h[k] === undefined || h[k] === null || h[k] === '');
-      draft.hotelStep = next;
-      return `Using **${h.hotelName}** for ${h.destinationName} (from the message). ${hotelStepPrompt(next, draft)}`;
+    // Travel-agent-sourced draft only (see stageHotelPreference) - no-op for a manual one.
+    const resolved = await stageHotelPreference(draft, h);
+    if (resolved) {
+      draft.hotelStep = 'hotelPrefConfirm';
+      return `The message mentions **${resolved.hotelName}** for ${h.destinationName} — is that correct, or would you like to change it?`;
     }
     draft.hotelStep = 'hotelName';
     return hotelStepPrompt('hotelName', draft);
@@ -1065,9 +1228,30 @@ async function stepHotelCollect(draft, userMessage) {
         // Multi-destination trip - the single-destination case is handled in startHotelCollect;
         // this covers the same "does the agent's message name a hotel for this destination"
         // check once the destination question (only asked when there's more than one) is answered.
-        // No-op for a manual draft (see applyAgentHotelPreference).
-        await applyAgentHotelPreference(draft, h);
+        // No-op for a manual draft (see stageHotelPreference).
+        const resolved = await stageHotelPreference(draft, h);
+        if (resolved) {
+          draft.hotelStep = 'hotelPrefConfirm';
+          return { reply: `The message mentions **${resolved.hotelName}** for ${h.destinationName} — is that correct, or would you like to change it?`, draft };
+        }
         break;
+      }
+      case 'hotelPrefConfirm': {
+        const yn = parseYesNo(answer);
+        if (yn === true) {
+          h.hotelName = h._pendingHotelPrefName;
+          h._resolvedHotelId = h._pendingHotelPrefId;
+          delete h._pendingHotelPrefName;
+          delete h._pendingHotelPrefId;
+          break;
+        }
+        if (yn === false || /change|different|edit/i.test(answer)) {
+          delete h._pendingHotelPrefName;
+          delete h._pendingHotelPrefId;
+          draft.hotelStep = 'hotelName';
+          return { reply: hotelStepPrompt('hotelName', draft), draft };
+        }
+        return { reply: `Is **${h._pendingHotelPrefName}** the right hotel for ${h.destinationName}? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
       }
       case 'hotelName': {
         const found = await findHotel(answer);
@@ -1269,13 +1453,107 @@ async function stepItineraryChoice(draft, userMessage) {
   }
   if (draft.itineraryItems.length > 0 && (parseYesNo(userMessage) === false || /done|no more/i.test(t))) {
     if (draft.editMode) return askConfirmItineraryEdit(draft);
-    draft.phase = 'priceCollect';
-    return { reply: askAddMembers(), draft };
+    return askReturnDateConfirm(draft);
   }
   return {
     reply: `The real form needs at least one itinerary item. Please reply "transfer", "sightseeing", "restaurant", or "leisure".`,
     draft,
   };
+}
+
+// ---------- phase: returnDateConfirm (suggest a return date from the itinerary just built, confirm
+// or let it be changed) ----------
+// Asking for the return date up front (before any itinerary item exists) meant it could only ever
+// be validated against a MINIMUM day count from a pasted agent message's "Day N:" lines
+// (maxItineraryDay/_agentItineraryQueue) - a manually-built itinerary (the common case) had nothing
+// to check against at all. Now that the itinerary is already built by the time this runs,
+// maxItineraryItemDay reads its REAL last day directly, so the return date is suggested outright
+// (travelDate + last itinerary day - 1) instead of asked blind - the user just confirms it's right
+// or picks a different one via the same calendar every other trip date uses.
+// Where to resume once the return date is settled (confirmed as suggested, entered manually, or
+// already known and never even asked about - see below): 'hotelChoice' when called EARLY, right as
+// the basic details finish, for an agent-pasted itinerary that already states its own trip length
+// (see basicNextPrompt/stepBasic's own hook) - hotel/itinerary collection hasn't started yet at that
+// point. 'priceCollect' (the default) when called LATE, the original case - itinerary collection
+// (manual or the agent auto-queue) has just finished. Stashed on the draft, not just a parameter,
+// since stepReturnDateConfirm/finishReturnDateEntry resume this later from the user's own next
+// message and don't receive this argument directly.
+function proceedAfterReturnDate(draft) {
+  const nextPhase = draft._returnDateConfirmNextPhase || 'priceCollect';
+  delete draft._returnDateConfirmNextPhase;
+  if (nextPhase === 'hotelChoice') {
+    draft.phase = 'hotelChoice';
+    return {
+      reply: `Got the basic details for **${draft.fields.guestName}**. Now — is the hotel self-booked (guest arranging their own), or would you like to add hotel details? (reply "self-booked" or "add hotel")`,
+      draft,
+    };
+  }
+  draft.phase = 'priceCollect';
+  return { reply: askAddMembers(), draft };
+}
+
+function askReturnDateConfirm(draft, nextPhase = 'priceCollect') {
+  draft._returnDateConfirmNextPhase = nextPhase;
+  // Already decided - either explicitly stated in a pasted message ("Return Date: ...", extracted
+  // verbatim - a stated fact, not a guess, so there's nothing to confirm) or already confirmed
+  // earlier in this same draft (the early hook above, once hotel/itinerary collection reaches this
+  // same "itinerary is done" point later via stepAgentQueueContinue's "done"/stepItineraryChoice's
+  // "done", which still call this function unconditionally) - don't re-ask, just move straight on.
+  if (draft.fields.returnDate) {
+    return proceedAfterReturnDate(draft);
+  }
+  const travelDateObj = parseDateDDMMYYYY(draft.fields.travelDate);
+  const maxDay = maxKnownItineraryDay(draft);
+  if (!travelDateObj || !maxDay) {
+    // No dated itinerary item to infer from (shouldn't normally happen - the itinerary phase
+    // requires at least one item - but fall back to asking outright rather than guessing wrong).
+    draft.phase = 'returnDateConfirm';
+    draft.returnDateConfirmStep = 'entering';
+    return { reply: 'What is the return date? (format DD-MM-YYYY)', draft };
+  }
+  const suggestedStr = formatDateObjDDMMYYYY(addDaysToDateObj(travelDateObj, maxDay - 1));
+  draft.fields.returnDate = suggestedStr;
+  draft.phase = 'returnDateConfirm';
+  draft.returnDateConfirmStep = 'confirm';
+  return {
+    reply: `Based on the itinerary (through Day ${maxDay}), the return date should be **${suggestedStr}** — is that correct, or would you like to change it?`,
+    draft,
+  };
+}
+
+async function stepReturnDateConfirm(draft, userMessage) {
+  if (draft.returnDateConfirmStep === 'entering') {
+    return finishReturnDateEntry(draft, userMessage);
+  }
+  const yn = parseYesNo(userMessage);
+  if (yn === true) {
+    return proceedAfterReturnDate(draft);
+  }
+  if (yn === false || /change|edit|different|wrong|update/i.test(userMessage)) {
+    draft.returnDateConfirmStep = 'entering';
+    return { reply: 'What should the return date be instead? (format DD-MM-YYYY)', draft };
+  }
+  return { reply: `Is **${draft.fields.returnDate}** the right return date? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
+}
+
+function finishReturnDateEntry(draft, answer) {
+  const returnDateObj = parseDateDDMMYYYY(answer);
+  if (!returnDateObj) {
+    return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
+  }
+  const travelDateObj = parseDateDDMMYYYY(draft.fields.travelDate);
+  if (returnDateObj <= travelDateObj) {
+    return { reply: `Return date must be later than the travel date (${draft.fields.travelDate}) — could you re-enter it?`, draft };
+  }
+  const maxDay = maxKnownItineraryDay(draft);
+  if (maxDay) {
+    const minReturnObj = addDaysToDateObj(travelDateObj, maxDay - 1);
+    if (returnDateObj < minReturnObj) {
+      return { reply: `The itinerary runs through Day ${maxDay}, so the return date can't be before ${formatDateObjDDMMYYYY(minReturnObj)} — could you re-enter it?`, draft };
+    }
+  }
+  draft.fields.returnDate = answer;
+  return proceedAfterReturnDate(draft);
 }
 
 // Asked right after an item's date is captured (transfer/sightseeing only - the two types with a
@@ -1346,8 +1624,11 @@ async function stepTransferSelfBookedGate(draft, userMessage) {
   if (selfBooked && !wantsAdd) return finishSelfBookedTransferItem(draft);
   if (wantsAdd || parseYesNo(answer) === true) {
     draft.phase = 'transferCollect';
-    draft.itemStep = 'pickupPointName';
-    return { reply: transferStepPrompt('pickupPointName', draft), draft };
+    // Whichever field is next per TRANSFER_FIELD_ORDER (time, if not already answered before this
+    // gate; pickupPointName otherwise) - not hardcoded, so a required field added to that order
+    // (e.g. 'time') is never silently skipped here.
+    const stepReply = nextTransferStepReply(draft, draft.currentItemDraft);
+    return { reply: stepReply, draft };
   }
   return { reply: `Sorry, could you clarify — reply "self-booked" or "add pickup point details"?`, draft };
 }
@@ -1580,11 +1861,23 @@ function formatVehicleOption(v) {
   return v.Capacity != null ? `${v.Name} (${v.Capacity} seats)` : v.Name;
 }
 
-const TRANSFER_FIELD_ORDER = ['date', 'pickupPointName', 'dropOffPointName', 'transferName', 'vehicleTypeName'];
+// A transfer's Name is often a substring of a DIFFERENT transfer's Name (e.g. "Bangkok Hotel (10
+// Hrs Disposal)" inside "Pattaya Hotel to Bangkok Hotel (10 Hrs Disposal)") - showing/matching by
+// Code (unique per row) instead of bare Name avoids exactly the same "picking any option re-asks
+// forever" failure this file already fixed for vehicles (see findPickupOrParticular's own comment).
+// Shared by transfer AND sightseeing lookups - both are Category-scoped rows of the same Particular
+// table, with the same Code/Name shape and the same substring-collision risk.
+function formatParticularOption(t) {
+  return t.Code ? `${t.Code} — ${t.Name}` : t.Name;
+}
+
+// 'time' is required, right after date - matches the real Add Transfer form itself, where Date and
+// Time are both marked mandatory and shown first, before Pickup/DropOff/Transfer Name.
+const TRANSFER_FIELD_ORDER = ['date', 'time', 'pickupPointName', 'dropOffPointName', 'transferName', 'vehicleTypeName'];
 const TRANSFER_LOOKUPS = {
   pickupPointName: [findPickup, 'pickup point'],
   dropOffPointName: [findPickup, 'drop-off point'],
-  transferName: [findPickupOrParticular, 'transfer name'],
+  transferName: [findPickupOrParticular, 'transfer name', formatParticularOption],
   vehicleTypeName: [findVehicle, 'vehicle type', formatVehicleOption],
 };
 
@@ -1592,6 +1885,8 @@ function transferStepPrompt(stepKey, draft) {
   switch (stepKey) {
     case 'date':
       return 'What date is this transfer? (DD-MM-YYYY)';
+    case 'time':
+      return 'What time is this transfer? (e.g. "09:30", "930", or "2:30pm")';
     case 'pickupPointName':
       return 'What is the pickup point?';
     case 'dropOffPointName':
@@ -1599,10 +1894,31 @@ function transferStepPrompt(stepKey, draft) {
     case 'transferName':
       return 'What is the transfer code or name (e.g. "061" or "Airport to Hotel")?';
     case 'vehicleTypeName':
-      return `What vehicle type? Available: ${draft.vehicleOptions.map((v) => v.Name).join(', ')}`;
+      // formatVehicleOption, not bare .Name - VehicalMaster has several rows sharing one name
+      // (e.g. 5 separate "Bus" rows, one per seating capacity) - listing bare names here produced
+      // "Available: Bus, Bus, Bus, Bus, Bus, Car, SUV, Van" with no way to tell them apart.
+      return `What vehicle type? Available: ${draft.vehicleOptions.map(formatVehicleOption).join(', ')}`;
     default:
       return '';
   }
+}
+
+// Shared by processAgentItineraryQueue (auto-queue dequeue) and stepTransferCollect (every manual
+// field answer) - single place that decides what's next for a transfer item, so a same-worded
+// transferName match staged via t._pendingTransferNameConfirm (see processAgentItineraryQueue)
+// gets confirmed instead of asked blind, no matter which of those two callers reaches it first
+// (pickup/dropoff may already be resolved when queued, or may only finish after manual answers).
+// Sets draft.itemStep as a side effect, matching every other step-prompt call site's convention.
+// Returns null once every field (including transferName) is filled - caller moves on from there.
+function nextTransferStepReply(draft, t) {
+  const next = TRANSFER_FIELD_ORDER.find((k) => t[k] === undefined || t[k] === null || t[k] === '');
+  if (next === 'transferName' && t._pendingTransferNameConfirm) {
+    draft.itemStep = 'transferNameConfirm';
+    return `The message suggests the transfer is **${t._pendingTransferNameConfirm.Name}** — is that correct, or would you like to change it?`;
+  }
+  if (!next) return null;
+  draft.itemStep = next;
+  return transferStepPrompt(next, draft);
 }
 
 async function stepTransferCollect(draft, userMessage) {
@@ -1632,6 +1948,14 @@ async function stepTransferCollect(draft, userMessage) {
         draft.phase = 'transferSelfBookedGate';
         return { reply: askItemSelfBookedGate(), draft };
       }
+      case 'time': {
+        const parsedTime = parseFlexibleTime(answer);
+        if (!parsedTime) {
+          return { reply: 'That needs to be a real time (e.g. "09:30", "930", or "2:30pm") — could you re-enter it?', draft };
+        }
+        t.time = parsedTime;
+        break;
+      }
       case 'pickupPointName':
       case 'dropOffPointName':
       case 'transferName':
@@ -1641,16 +1965,28 @@ async function stepTransferCollect(draft, userMessage) {
         if (!res.resolved) return { reply: res.reply, draft };
         break;
       }
+      case 'transferNameConfirm': {
+        const yn = parseYesNo(answer);
+        if (yn === true) {
+          t.transferName = t._pendingTransferNameConfirm.Name;
+          t._transferNameRow = t._pendingTransferNameConfirm;
+          delete t._pendingTransferNameConfirm;
+          break;
+        }
+        if (yn === false || /change|different|edit/i.test(answer)) {
+          delete t._pendingTransferNameConfirm;
+          draft.itemStep = 'transferName';
+          return { reply: transferStepPrompt('transferName', draft), draft };
+        }
+        return { reply: `Is **${t._pendingTransferNameConfirm.Name}** the right transfer? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
+      }
       default:
         break;
     }
   }
 
-  const next = TRANSFER_FIELD_ORDER.find((k) => t[k] === undefined || t[k] === null || t[k] === '');
-  if (next) {
-    draft.itemStep = next;
-    return { reply: transferStepPrompt(next, draft), draft };
-  }
+  const stepReply = nextTransferStepReply(draft, t);
+  if (stepReply) return { reply: stepReply, draft };
 
   draft.phase = 'transferOptionalGate';
   return { reply: askTransferOptionalGate(), draft };
@@ -1658,7 +1994,7 @@ async function stepTransferCollect(draft, userMessage) {
 
 function transferOptionalSystemPrompt(fields) {
   return `You are collecting OPTIONAL extra details for a transfer itinerary item.
-Possible fields: time, numberOfVehicles (number), vehiclePrice (number), flightNo, remarks.
+Possible fields: numberOfVehicles (number), vehiclePrice (number), flightNo, remarks.
 Fields already known (JSON): ${JSON.stringify(fields)}
 Merge only what the user's message actually mentions - this is a single-turn step, don't ask follow-up questions.
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
@@ -1666,9 +2002,10 @@ Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
 
 // One-tap gate before the actual optional-details form - most transfers need none of this, so
 // staff with nothing to add skip straight to "item added" instead of being shown a form to skip.
-// Same pattern as askExtraGate()/stepExtraGate() below for the final booking-level extras.
+// Same pattern as askExtraGate()/stepExtraGate() below for the final booking-level extras. Time
+// itself is required and already asked earlier (see TRANSFER_FIELD_ORDER) - not offered again here.
 function askTransferOptionalGate() {
-  return `Want to add optional details for this transfer — time, number of vehicles, vehicle price, flight no, remarks?`;
+  return `Want to add optional details for this transfer — number of vehicles, vehicle price, flight no, remarks?`;
 }
 
 async function stepTransferOptionalGate(draft, userMessage) {
@@ -1769,7 +2106,7 @@ function sightseeingStepPrompt(stepKey) {
     case 'date':
       return 'What date is this sightseeing for? (DD-MM-YYYY)';
     case 'time':
-      return 'What time? (24-hour HH:MM, e.g. "09:30")';
+      return 'What time? (e.g. "09:30", "930", or "2:30pm")';
     case 'pickupPointName':
       return 'What is the pickup point?';
     case 'sightseeingName':
@@ -1797,7 +2134,7 @@ async function stepSightseeingCollect(draft, userMessage) {
   const sightseeingLookup = (q) => findSightseeing(q, weekdayNameFor(s.date));
 
   if (s._pendingField) {
-    const res = await resolveSequentialLookup(s, 'sightseeingName', '_sightseeingNameRow', sightseeingLookup, 'sightseeing', answer);
+    const res = await resolveSequentialLookup(s, 'sightseeingName', '_sightseeingNameRow', sightseeingLookup, 'sightseeing', answer, formatParticularOption);
     if (!res.resolved) return { reply: res.reply, draft };
   } else {
     switch (draft.itemStep) {
@@ -1808,19 +2145,21 @@ async function stepSightseeingCollect(draft, userMessage) {
         draft.phase = 'sightseeingSelfBookedGate';
         return { reply: askItemSelfBookedGate(), draft };
       }
-      case 'time':
-        if (!parseTimeHHMM(answer)) {
-          return { reply: 'That needs to be a real 24-hour time in HH:MM format (e.g. "09:30") — could you re-enter it?', draft };
+      case 'time': {
+        const parsedTime = parseFlexibleTime(answer);
+        if (!parsedTime) {
+          return { reply: 'That needs to be a real time (e.g. "09:30", "930", or "2:30pm") — could you re-enter it?', draft };
         }
-        s.time = answer;
+        s.time = parsedTime;
         break;
+      }
       case 'pickupPointName': {
         const res = await resolveSequentialLookup(s, 'pickupPointName', '_pickupPointNameRow', findPickup, 'pickup point', answer);
         if (!res.resolved) return { reply: res.reply, draft };
         break;
       }
       case 'sightseeingName': {
-        const res = await resolveSequentialLookup(s, 'sightseeingName', '_sightseeingNameRow', sightseeingLookup, 'sightseeing', answer);
+        const res = await resolveSequentialLookup(s, 'sightseeingName', '_sightseeingNameRow', sightseeingLookup, 'sightseeing', answer, formatParticularOption);
         if (!res.resolved) return { reply: res.reply, draft };
         break;
       }
@@ -1970,12 +2309,16 @@ async function stepLeisureDayCollect(draft, userMessage) {
   return { reply: `${addedMsg}${askAddMoreItinerary()}`, draft };
 }
 
-const RESTAURANT_FIELD_ORDER = ['date', 'restaurantName'];
+// 'time' is required, right after date - matches Transfer/Sightseeing (see TRANSFER_FIELD_ORDER/
+// SIGHTSEEING_FIELD_ORDER).
+const RESTAURANT_FIELD_ORDER = ['date', 'time', 'restaurantName'];
 
 function restaurantStepPrompt(stepKey) {
   switch (stepKey) {
     case 'date':
       return 'What date is this restaurant for? (DD-MM-YYYY)';
+    case 'time':
+      return 'What time? (e.g. "09:30", "930", or "2:30pm")';
     case 'restaurantName':
       return 'What is the restaurant name?';
     default:
@@ -2002,6 +2345,14 @@ async function stepRestaurantCollect(draft, userMessage) {
         const err = validateItineraryItemDate(answer, draft);
         if (err) return { reply: err, draft };
         r.date = answer;
+        break;
+      }
+      case 'time': {
+        const parsedTime = parseFlexibleTime(answer);
+        if (!parsedTime) {
+          return { reply: 'That needs to be a real time (e.g. "09:30", "930", or "2:30pm") — could you re-enter it?', draft };
+        }
+        r.time = parsedTime;
         break;
       }
       case 'restaurantName': {
@@ -2101,7 +2452,7 @@ function finishRestaurantItem(draft) {
     totalInfant: String(draft.fields.guestInfants || 0),
     currency: draft.fields.currency || 'THB',
     flightNo: null,
-    time: null,
+    time: r.time || null,
     dropOffPointId: null,
     dropOffPointName: null,
     pickupPointId: null,
@@ -2544,6 +2895,10 @@ async function step(draft, userMessage) {
       return stepHotelAddAnother(draft, userMessage);
     case 'itineraryChoice':
       return stepItineraryChoice(draft, userMessage);
+    case 'agentQueueContinue':
+      return stepAgentQueueContinue(draft, userMessage);
+    case 'returnDateConfirm':
+      return stepReturnDateConfirm(draft, userMessage);
     case 'confirmItineraryEdit':
       return stepConfirmItineraryEdit(draft, userMessage);
     case 'transferCollect':
@@ -2589,4 +2944,4 @@ async function step(draft, userMessage) {
   }
 }
 
-module.exports = { step, startDraft, detectCreateIntent, looksLikeStandaloneAgentPaste, parseYesNo, startItineraryEditDraft, askItineraryChoice, nextBasicStep, maxItineraryDay };
+module.exports = { step, startDraft, detectCreateIntent, looksLikeStandaloneAgentPaste, parseYesNo, startItineraryEditDraft, askItineraryChoice, nextBasicStep, maxItineraryDay, maxItineraryItemDay, maxKnownItineraryDay };

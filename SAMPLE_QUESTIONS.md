@@ -1,6 +1,6 @@
 # Sample Questions for FlyThai AI Assistant
 
-Ask these in plain English (Hindi/Hinglish input also works, but answers always come back in English). Every answer comes from a real database query, nothing is invented. Most requests are read-only lookups; the specific write actions (create, edit, status change, convert) are called out below and always ask you to confirm before saving anything.
+Ask these in plain English. Every answer comes from a real database query, nothing is invented. Most requests are read-only lookups; the specific write actions (create, edit, status change, convert) are called out below and always ask you to confirm before saving anything.
 
 ## Quotations
 

@@ -116,6 +116,21 @@ function lookupItemLabel(item) {
   return item.Name;
 }
 
+// Vehicle types have several rows sharing one bare Name (e.g. 5 separate "Bus" rows, one per
+// seating capacity), and a transfer/sightseeing's Name is often a plain substring of a DIFFERENT
+// row's Name (e.g. "Bangkok Hotel (10 Hrs Disposal)" inside "Pattaya Hotel to Bangkok Hotel (10 Hrs
+// Disposal)") - sending just item.Name on selection was indistinguishable from the other match(es),
+// so the backend's own lookup went ambiguous again and re-asked the same question forever no matter
+// which one was picked. Sending the same disambiguating text src/lookups.js's findVehicle()/
+// findPickupOrParticular()/findSightseeing() already know how to resolve straight to one exact row
+// (VEHICLE_OPTION_RE / CODE_NAME_OPTION_RE) instead - every other lookup type still sends bare Name,
+// unchanged.
+function lookupItemSendValue(item) {
+  if (item.Capacity != null) return `${item.Name} (${item.Capacity} seats)`;
+  if (item.Code) return `${item.Code} — ${item.Name}`;
+  return item.Name;
+}
+
 // Renders the selected-destinations pill row from selectedDestinations - decoupled from the
 // filter/search text box entirely (see the mousedown handler below and the Enter-key handling
 // further down), so what's about to be submitted is always exactly what's shown as pills, never
@@ -643,6 +658,9 @@ function renderItineraryOptionalForm(fields) {
     } else if (f.placeholder) {
       el.placeholder = f.placeholder;
     }
+    // Pre-filled (not locked) from a known default, e.g. the trip's own overall pax count - still
+    // just a normal editable input from here, same as if the user had typed it themselves.
+    if (f.value != null && f.value !== '') el.value = f.value;
     el.addEventListener('input', syncItineraryOptionalInputValue);
     wrap.appendChild(label);
     wrap.appendChild(el);
@@ -806,7 +824,7 @@ lookupDropdown.addEventListener('mousedown', (e) => {
   const item = lookupItems[Number(el.dataset.index)];
   if (!item) return;
   hideLookupDropdown();
-  sendMessage(item.Name);
+  sendMessage(lookupItemSendValue(item));
 });
 
 input.addEventListener('input', () => {
@@ -863,7 +881,7 @@ input.addEventListener('keydown', (e) => {
       e.preventDefault();
       const item = lookupItems[lookupActiveIndex];
       hideLookupDropdown();
-      sendMessage(item.Name);
+      sendMessage(lookupItemSendValue(item));
       return;
     }
     e.preventDefault();
@@ -904,35 +922,94 @@ function getSessionId() {
 let sessionId = getSessionId();
 
 // Mirrors FlyThai's own Manage Users -> Roles system (see rolePermissions.js) so the bot can gate
-// its capabilities the same way the real admin panel does - manually picked here since the bot has
-// no login of its own yet, not a security boundary against a dishonest user.
+// its capabilities the same way the real admin panel does - set automatically after a real FlyThai
+// login (see the login form wiring below) rather than picked from a dropdown, so it reflects who is
+// actually using the bot instead of a free/dishonest pick.
 function getRole() {
   return localStorage.getItem('flythai_role') || '';
 }
 function setRole(role) {
   localStorage.setItem('flythai_role', role);
 }
-
-async function loadRoleOptions() {
-  const select = document.getElementById('roleSelect');
-  if (!select) return;
-  try {
-    const res = await fetch('/api/roles');
-    const data = await readJsonResponse(res);
-    const roles = Array.isArray(data.roles) ? data.roles : [];
-    const current = getRole();
-    select.innerHTML =
-      '<option value="">Select your role…</option>' +
-      roles.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('');
-    if (current && roles.includes(current)) select.value = current;
-  } catch (err) {
-    // The role list is a nice-to-have gate, not core chat functionality - a failed fetch here
-    // (server still starting up, FlyThai unreachable) shouldn't block using the chat itself.
-    console.warn('Could not load role list:', err);
-  }
+function getDisplayName() {
+  return localStorage.getItem('flythai_display_name') || '';
 }
-loadRoleOptions();
-document.getElementById('roleSelect')?.addEventListener('change', (e) => setRole(e.target.value));
+function setDisplayName(name) {
+  localStorage.setItem('flythai_display_name', name);
+}
+function clearLogin() {
+  localStorage.removeItem('flythai_role');
+  localStorage.removeItem('flythai_display_name');
+}
+
+const loginOpenBtn = document.getElementById('loginOpenBtn');
+const loginPopover = document.getElementById('loginPopover');
+const loggedInStatus = document.getElementById('loggedInStatus');
+const loggedInName = document.getElementById('loggedInName');
+const loginForm = document.getElementById('loginForm');
+const loginError = document.getElementById('loginError');
+const loginSubmitBtn = document.getElementById('loginSubmitBtn');
+
+function renderAuthState() {
+  const role = getRole();
+  const name = getDisplayName();
+  const isLoggedIn = !!(role && name);
+  loggedInStatus.hidden = !isLoggedIn;
+  loginOpenBtn.hidden = isLoggedIn;
+  if (isLoggedIn) loggedInName.textContent = `${name} · ${role}`;
+}
+renderAuthState();
+
+loginOpenBtn?.addEventListener('click', () => {
+  loginPopover.hidden = !loginPopover.hidden;
+  if (!loginPopover.hidden) document.getElementById('loginUsername')?.focus();
+});
+
+document.addEventListener('click', (e) => {
+  if (!loginPopover.hidden && !loginPopover.contains(e.target) && e.target !== loginOpenBtn) {
+    loginPopover.hidden = true;
+  }
+});
+
+loginForm?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  loginError.hidden = true;
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  if (!username || !password) return;
+
+  loginSubmitBtn.disabled = true;
+  loginSubmitBtn.textContent = 'Logging in…';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, sessionId }),
+    });
+    const data = await readJsonResponse(res);
+    if (!res.ok) {
+      loginError.textContent = data.error || 'Login failed. Please try again.';
+      loginError.hidden = false;
+      return;
+    }
+    setRole(data.role);
+    setDisplayName(data.displayName);
+    loginForm.reset();
+    loginPopover.hidden = true;
+    renderAuthState();
+  } catch (err) {
+    loginError.textContent = 'Could not reach the server. Please check your connection and try again.';
+    loginError.hidden = false;
+  } finally {
+    loginSubmitBtn.disabled = false;
+    loginSubmitBtn.textContent = 'Log in';
+  }
+});
+
+document.getElementById('logoutBtn')?.addEventListener('click', () => {
+  clearLogin();
+  renderAuthState();
+});
 
 document.getElementById('rolePermRefreshBtn')?.addEventListener('click', async (e) => {
   const btn = e.currentTarget;
@@ -1313,7 +1390,12 @@ async function sendMessage(text) {
       appendMessageToChat(chatId, 'bot', errText, { kind: 'error' });
       return;
     }
-    const { wrap } = addMessage('bot', renderMarkdown(data.answer || ''));
+    const { wrap, bubble } = addMessage('bot', renderMarkdown(data.answer || ''));
+    // Marks the "N more days left - continue or is this enough?" pause between auto-added
+    // itinerary items (see bookingFlow.js's processAgentItineraryQueue) so it visually reads as a
+    // checkpoint at a glance, not just another line of conversation - useful on a long itinerary
+    // with a dozen of these in a row.
+    if (data.checkpoint) bubble.classList.add('bubble-checkpoint');
     addDataToggle(wrap, data.rows, data.rowCount, data.rowsTruncated);
     addCopyButtons(wrap, data.copyBlocks);
     appendMessageToChat(chatId, 'bot', data.answer || '');

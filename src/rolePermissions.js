@@ -116,11 +116,11 @@ function canUseBot(roleName) {
   if (isStale()) refreshPermissions();
   if (!cache) return { allowed: true, degraded: true }; // never successfully populated - fail open
   if (!roleName) {
-    return { allowed: false, degraded: false, message: 'Please pick your role from the dropdown above before we start.' };
+    return { allowed: false, degraded: false, message: 'Please log in with your FlyThai account first.' };
   }
   const perms = cache[roleName];
   if (!perms) {
-    return { allowed: false, degraded: false, message: `I don't recognize the role "${roleName}" — please pick one from the dropdown.` };
+    return { allowed: false, degraded: false, message: `I don't recognize the role "${roleName}" — please log in again.` };
   }
   const page = perms[CHAT_BOT_PAGE];
   if (page && page.view) return { allowed: true, degraded: false };

@@ -1,13 +1,14 @@
 const { getPool } = require('./db');
 const { safeFetch } = require('./bookingApi');
 const { resolveBookingByCode } = require('./documents');
+const { getFlythaiCookie } = require('./requestContext');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 
 function buildHeaders() {
-  const cookie = process.env.FLYTHAI_SESSION_COOKIE;
+  const cookie = getFlythaiCookie() || process.env.FLYTHAI_SESSION_COOKIE;
   if (!cookie) {
-    const err = new Error('FLYTHAI_SESSION_COOKIE is not set in .env.');
+    const err = new Error('Not logged in, and FLYTHAI_SESSION_COOKIE is not set in .env either.');
     err.code = 'NO_SESSION_COOKIE';
     throw err;
   }

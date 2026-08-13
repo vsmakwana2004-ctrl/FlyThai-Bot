@@ -113,8 +113,28 @@ async function findHotel(nameQuery) {
   return result.recordset;
 }
 
+// A dropdown selection sends back "CODE — Name" (the same text the dropdown showed, matching
+// bookingFlow.js's formatParticularOption()) - matched here first, by exact Code, so it resolves
+// straight to that one real row. Needed because a transfer/sightseeing Name is often a substring of
+// a DIFFERENT row's Name (e.g. "Bangkok Hotel (10 Hrs Disposal)" is literally contained inside
+// "Pattaya Hotel to Bangkok Hotel (10 Hrs Disposal)") - the fuzzy Name/Code LIKE search below
+// matches both even when the exact one was already picked, so a plain Name-only send re-triggers
+// disambiguation forever no matter which option is chosen (same failure mode fixed for vehicles -
+// see findVehicle above). Shared by findPickupOrParticular (transfers) and findSightseeing below -
+// both are Category-scoped rows of the same Particular table with the same Code/Name shape. A plain
+// typed code/name (no "CODE — Name" prefix) falls through to the fuzzy search unchanged.
+const CODE_NAME_OPTION_RE = /^(\S+)\s+—\s+(.+)$/;
+
 async function findPickupOrParticular(nameQuery) {
   const pool = await getPool();
+  const formatted = nameQuery.match(CODE_NAME_OPTION_RE);
+  if (formatted) {
+    const exact = await pool
+      .request()
+      .input('code', formatted[1].trim())
+      .query(`SELECT TOP 1 Id, Name, Code, Category, AdultsPrice, ChildrenPrice, CarPrice, SuvPrice, VanPrice, Currency FROM Particular WHERE IsDeleted = 0 AND Category = 'Transfer' AND Code = @code`);
+    if (exact.recordset.length > 0) return exact.recordset;
+  }
   const result = await pool
     .request()
     .input('q', `%${nameQuery}%`)
@@ -168,6 +188,17 @@ function weekdayFilterSql(weekday) {
 
 async function findSightseeing(nameQuery, weekday) {
   const pool = await getPool();
+  // See CODE_NAME_OPTION_RE's comment above findPickupOrParticular - same exact-Code fast path for
+  // a dropdown selection sending back "CODE — Name". No weekday filter needed here: the item was
+  // already weekday-filtered when the dropdown itself was populated, before it could be picked.
+  const formatted = nameQuery.match(CODE_NAME_OPTION_RE);
+  if (formatted) {
+    const exact = await pool
+      .request()
+      .input('code', formatted[1].trim())
+      .query(`SELECT TOP 1 Id, Name, Code, AdultsPrice, ChildrenPrice, Currency FROM Particular WHERE IsDeleted = 0 AND Category = 'SightSeeing' AND Code = @code`);
+    if (exact.recordset.length > 0) return exact.recordset;
+  }
   const result = await pool
     .request()
     .input('q', `%${nameQuery}%`)
@@ -190,8 +221,24 @@ async function listSightseeings(nameQuery = '', weekday) {
   return result.recordset;
 }
 
+// A dropdown selection sends back bookingFlow.js's own formatVehicleOption() text ("Bus (25
+// seats)") to disambiguate which same-named vehicle was actually picked - matched here first, by
+// Name + exact Capacity, resolving straight to that one real row without ever going through the
+// ambiguous multi-row path below. A plain typed name (no "(N seats)" suffix) falls through to the
+// normal fuzzy search unchanged, same as before.
+const VEHICLE_OPTION_RE = /^(.*?)\s*\((\d+)\s*seats?\)$/i;
+
 async function findVehicle(nameQuery) {
   const pool = await getPool();
+  const formatted = nameQuery.match(VEHICLE_OPTION_RE);
+  if (formatted) {
+    const result = await pool
+      .request()
+      .input('name', formatted[1].trim())
+      .input('capacity', Number(formatted[2]))
+      .query(`SELECT TOP 1 Id, Name, Capacity FROM VehicalMaster WHERE IsDeleted = 0 AND IsActive = 1 AND Name = @name AND Capacity = @capacity`);
+    if (result.recordset.length > 0) return result.recordset;
+  }
   const result = await pool
     .request()
     .input('q', `%${nameQuery}%`)
