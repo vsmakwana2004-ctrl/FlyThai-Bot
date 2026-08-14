@@ -938,48 +938,97 @@ function setDisplayName(name) {
   localStorage.setItem('flythai_display_name', name);
 }
 
-// Auto-login for the FlyThai admin panel's embedded iframe (ChatBot/Index): the panel passes the
-// already-logged-in user's own id as ?chatbot_key=<id> on the iframe src, so this signs the same
-// person in here automatically - the topbar's own username/password login UI (and the manual
-// role-refresh button) was removed entirely, since chatbot_key is now the only supported way to
-// establish who's using the bot. Always re-applied on load, even over an already-cached role/name,
-// so a different FlyThai user on a shared machine (or a freshly issued key) is picked up
-// immediately rather than reusing a stale cached identity from someone else's earlier visit.
+// Auto-login for the FlyThai admin panel's embedded iframe (ChatBot/Index): the panel knows the
+// already-logged-in user's own id (chatbot_key) and, ideally, the 3 other values FlyThai's own
+// login sets as cookies (userName/userDisplayName/userOnline - UserId is chatbot_key itself,
+// passing them lets the server rebuild a real per-user FlyThai cookie for live writes instead of
+// falling back to the one shared service-account cookie - see server.js's /api/session-from-key).
+// The topbar's own username/password login UI (and the manual role-refresh button) was removed
+// entirely, since this is now the only supported way to establish who's using the bot.
 //
-// user_name/user_display_name/user_online (all optional) are the exact 3 other values FlyThai's
-// own login sets as cookies (UserName/UserId/UserDisplayName/UserOnline - UserId is chatbot_key
-// itself) - passing them too lets the server rebuild that real per-user cookie for every live
-// write this session makes, instead of falling back to the one shared service-account cookie (see
-// server.js's /api/session-from-key). Harmless to omit - falls back exactly as before.
-//
-// sendMessage() below awaits this before ever calling /api/chat - without it, a message sent while
-// this lookup was still in flight (e.g. clicking a suggestion chip right after the page loads) went
-// out with no role at all, and the bot replied "Please log in with your FlyThai account first" even
-// though the real auto-login was seconds away from succeeding. Resolves either way (success or
-// failure) so a genuine lookup failure still lets the user try chatting rather than hanging forever.
-const authReady = (async function autoLoginFromChatbotKey() {
-  const params = new URLSearchParams(window.location.search);
-  const chatbotKey = params.get('chatbot_key');
-  if (!chatbotKey) return;
-  const userName = params.get('user_name');
-  const userDisplayName = params.get('user_display_name');
-  const userOnline = params.get('user_online');
-  try {
-    const res = await fetch('/api/session-from-key', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatbotKey, sessionId, userName, userDisplayName, userOnline }),
+// Two ways this value can reach us, since which one the embedding page can actually use depends on
+// how its own server-side code has that value available when it renders:
+//   1. ?chatbot_key=<id> (plus the optional user_name/user_display_name/user_online) on this page's
+//      own URL - works when the embedding page can put it straight into the iframe's src.
+//   2. postMessage({type:'flythai-chatbot-key', chatbotKey, userName, userDisplayName, userOnline})
+//      sent to this window - for when the value only lives in a hidden input/JS variable on the
+//      EMBEDDING page's own DOM (reproduced live: FlyThai's ChatBot/Index page has
+//      <input type="hidden" id="chatbot_key" value="..."> but the iframe's own src had no query
+//      string at all) - cross-origin iframes can't read the parent page's DOM directly (browser
+//      security, not a bug), postMessage is the one sanctioned bridge across that boundary. The
+//      parent page needs a few lines of its own JS reading that input and posting it in - see the
+//      project notes for the exact snippet.
+function loginWithChatbotKey(chatbotKey, extra = {}) {
+  if (!chatbotKey) return Promise.resolve(false);
+  return fetch('/api/session-from-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chatbotKey, sessionId, ...extra }),
+  })
+    .then(async (res) => {
+      const data = await readJsonResponse(res);
+      if (!res.ok) {
+        console.warn('chatbot_key login failed:', data.error);
+        return false;
+      }
+      setRole(data.role);
+      setDisplayName(data.displayName);
+      return true;
+    })
+    .catch((err) => {
+      console.warn('chatbot_key login failed:', err);
+      return false;
     });
-    const data = await readJsonResponse(res);
-    if (!res.ok) {
-      console.warn('Auto-login via chatbot_key failed:', data.error);
-      return;
-    }
-    setRole(data.role);
-    setDisplayName(data.displayName);
-  } catch (err) {
-    console.warn('Auto-login via chatbot_key failed:', err);
+}
+
+// sendMessage() below awaits this before ever calling /api/chat - without it, a message sent while
+// a login attempt was still in flight (e.g. clicking a suggestion chip right after the page loads)
+// went out with no role at all, and the bot replied "Please log in with your FlyThai account
+// first" even though the real auto-login was seconds away from succeeding.
+let resolveAuthReady;
+const authReady = new Promise((resolve) => {
+  resolveAuthReady = resolve;
+});
+
+// Only the real FlyThai admin panel is trusted to postMessage a chatbot_key in - without this
+// check, ANY page that embeds this chatbot in an iframe (or opens it and holds a reference to its
+// window) could postMessage a forged chatbot_key and get logged in as whichever user id it named.
+// Add an origin here for every environment that actually embeds this chatbot (production +
+// whatever local/test IPs are in real use) - a postMessage from anywhere else is silently ignored.
+const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323'];
+
+window.addEventListener('message', (event) => {
+  if (!TRUSTED_PARENT_ORIGINS.includes(event.origin)) return;
+  const data = event.data;
+  if (!data || data.type !== 'flythai-chatbot-key' || !data.chatbotKey) return;
+  loginWithChatbotKey(data.chatbotKey, {
+    userName: data.userName,
+    userDisplayName: data.userDisplayName,
+    userOnline: data.userOnline,
+  }).finally(resolveAuthReady);
+});
+
+(async function initAuth() {
+  const params = new URLSearchParams(window.location.search);
+  const urlChatbotKey = params.get('chatbot_key');
+  if (urlChatbotKey) {
+    await loginWithChatbotKey(urlChatbotKey, {
+      userName: params.get('user_name'),
+      userDisplayName: params.get('user_display_name'),
+      userOnline: params.get('user_online'),
+    });
+    resolveAuthReady();
+    return;
   }
+  // Not embedded in anyone's iframe at all (standalone tab) - nothing to wait for.
+  if (window.parent === window) {
+    resolveAuthReady();
+    return;
+  }
+  // Embedded, but no URL param - give the embedding page a short window to postMessage the key in
+  // (its own script may still be wiring up) before giving up and letting the user see whatever
+  // degraded "please log in" state that implies, rather than hanging indefinitely.
+  setTimeout(resolveAuthReady, 3000);
 })();
 
 function escapeHtml(str) {
