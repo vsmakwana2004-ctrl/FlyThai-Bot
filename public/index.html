@@ -21,9 +21,19 @@
   <aside id="historySidebar" class="history-sidebar">
     <div class="history-sidebar-header">
       <span class="history-sidebar-title">Chats</span>
+      <button type="button" id="sidebarCloseBtn" class="sidebar-close-btn" title="Close" aria-label="Close chat history">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
     </div>
     <div id="historyList" class="history-list"></div>
   </aside>
+  <!-- Mobile-only: the sidebar becomes a fixed overlay there (see the 640px media query in
+       style.css), so this dims the rest of the screen and gives an obvious tap-to-close target -
+       without it, closing the sidebar meant tapping the toggle button in the topbar, which the
+       sidebar itself sits on top of and covers while open. -->
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
   <!-- Everything except the history sidebar - keeping .app and #dataDrawer's own 50/50 split
        scoped to this wrapper (instead of the full .layout row) means opening/closing the sidebar
        never disturbs that split; it only ever eats into this wrapper's share of the width. -->

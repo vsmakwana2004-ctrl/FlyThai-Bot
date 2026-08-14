@@ -1777,6 +1777,19 @@ sidebarToggleBtn.addEventListener('click', () => {
   setSidebarCollapsed(!layoutEl.classList.contains('sidebar-collapsed'));
 });
 
+// On mobile the sidebar opens as a fixed overlay that sits on top of (and hides) the topbar's own
+// toggle button - these give it its own always-reachable close affordances instead (an explicit X
+// in the sidebar's header, and tapping the dimmed backdrop behind it). Harmless no-ops on desktop,
+// where the sidebar never covers the toggle button in the first place.
+document.getElementById('sidebarCloseBtn')?.addEventListener('click', () => {
+  sidebarAutoCollapsedForDrawer = false;
+  setSidebarCollapsed(true);
+});
+document.getElementById('sidebarBackdrop')?.addEventListener('click', () => {
+  sidebarAutoCollapsedForDrawer = false;
+  setSidebarCollapsed(true);
+});
+
 // Defaults to collapsed on a phone-width screen (no room to spare) and expanded everywhere else,
 // unless the user already made an explicit choice that's remembered in localStorage.
 (function initSidebarCollapsed() {

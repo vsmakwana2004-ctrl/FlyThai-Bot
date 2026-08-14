@@ -770,7 +770,14 @@ function expectingField(draft) {
   if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'travelDate') {
     return { field: 'date', params: { min: todayIST() } };
   }
-  // Return date is no longer asked up front - it's suggested from the itinerary just built (see
+  // Manual entry only (see bookingFlow.js's viaManualEntry) asks return date directly, right here,
+  // right after travel date - same calendar as travel date, just floored at the travel date instead
+  // of today.
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'returnDate') {
+    const travelISO = ddmmyyyyToISO(draft.fields.travelDate);
+    return { field: 'date', params: { min: travelISO || todayIST() } };
+  }
+  // For an agent-paste draft, return date is instead suggested from the itinerary just built (see
   // bookingFlow.js's askReturnDateConfirm) and only needs a calendar if the user asks to change it.
   if (draft && draft.phase === 'returnDateConfirm' && draft.returnDateConfirmStep === 'entering') {
     const travelISO = ddmmyyyyToISO(draft.fields.travelDate);
