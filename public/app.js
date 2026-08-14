@@ -945,15 +945,30 @@ function setDisplayName(name) {
 // establish who's using the bot. Always re-applied on load, even over an already-cached role/name,
 // so a different FlyThai user on a shared machine (or a freshly issued key) is picked up
 // immediately rather than reusing a stale cached identity from someone else's earlier visit.
-(async function autoLoginFromChatbotKey() {
+//
+// user_name/user_display_name/user_online (all optional) are the exact 3 other values FlyThai's
+// own login sets as cookies (UserName/UserId/UserDisplayName/UserOnline - UserId is chatbot_key
+// itself) - passing them too lets the server rebuild that real per-user cookie for every live
+// write this session makes, instead of falling back to the one shared service-account cookie (see
+// server.js's /api/session-from-key). Harmless to omit - falls back exactly as before.
+//
+// sendMessage() below awaits this before ever calling /api/chat - without it, a message sent while
+// this lookup was still in flight (e.g. clicking a suggestion chip right after the page loads) went
+// out with no role at all, and the bot replied "Please log in with your FlyThai account first" even
+// though the real auto-login was seconds away from succeeding. Resolves either way (success or
+// failure) so a genuine lookup failure still lets the user try chatting rather than hanging forever.
+const authReady = (async function autoLoginFromChatbotKey() {
   const params = new URLSearchParams(window.location.search);
   const chatbotKey = params.get('chatbot_key');
   if (!chatbotKey) return;
+  const userName = params.get('user_name');
+  const userDisplayName = params.get('user_display_name');
+  const userOnline = params.get('user_online');
   try {
     const res = await fetch('/api/session-from-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatbotKey, sessionId }),
+      body: JSON.stringify({ chatbotKey, sessionId, userName, userDisplayName, userOnline }),
     });
     const data = await readJsonResponse(res);
     if (!res.ok) {
@@ -1301,6 +1316,7 @@ async function sendMessage(text) {
     addMessage('bot', `<span class="error-note">That message is too long (${text.length} characters). Please shorten it to under ${MAX_MESSAGE_CHARS}.</span>`);
     return;
   }
+  await authReady; // see autoLoginFromChatbotKey - guarantees a role is set (or definitively isn't) first
   busy = true;
   // Captured once so a slow request still saves to the chat it was actually asked from, even
   // though sidebar switching is blocked while busy (see historyList's click handler) and can't
