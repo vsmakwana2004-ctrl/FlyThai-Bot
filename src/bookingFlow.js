@@ -391,6 +391,11 @@ async function stepSource(draft, userMessage) {
   draft.fields.guestName = answer;
   draft.basicStarted = true;
   draft.phase = 'basic';
+  // Only the true manual path (typed straight in, not extracted from a pasted agent message) asks
+  // return date directly, right after travel date - see the viaManualEntry check in basicNextPrompt/
+  // stepBasic below. The agent-paste flow keeps deriving/confirming it from the itinerary instead,
+  // untouched.
+  draft.viaManualEntry = true;
   return { reply: basicNextPrompt(draft), draft };
 }
 
@@ -423,9 +428,8 @@ Fields:
 - guestInfants: number of infants, only if explicitly stated - same rule, do NOT default to 0
 - itineraryLines: if the message has a day-by-day plan ("Day 1: ...", "Day 2: ...", etc), one entry per day-line: {"day": <number>, "type": "transfer" | "sightseeing" | "leisure", "pickupHint": <short literal place name to search for as the start point - transfer only, else null>, "dropoffHint": <short literal place name to search for as the end point - transfer only, else null>, "transferNameHint": <a short generic transfer label like "Airport to Hotel", "Hotel to Airport", "Inter Hotel Transfer" - transfer only, else null>, "activityHint": <short literal name of the tour/activity - sightseeing only, else null>}. A day that's explicitly a free/leisure day is type "leisure" (no hints needed - and don't invent an activity for it). A day that moves between an airport and a hotel, or between two hotels/islands, is type "transfer". A day naming a specific activity/tour is type "sightseeing". If one day's line actually describes TWO separate movements (e.g. "X to Y transfer + A to B transfer"), emit TWO entries with that same day number. These hints are only used to search real records already in the system - if nothing matches, that one field is simply asked about normally afterwards, so keep each hint a short literal place/activity name, not a full sentence, and never invent one that isn't grounded in the text.
 - hotelPreferences: array of {"destinationName": <one of the known destinations above>, "hotelName": <the specific hotel name mentioned for that destination, with qualifiers like "or similar"/"or similar category" stripped off>} for each destination where the message names a preferred/requested hotel. Omit a destination entirely if no specific hotel name is given for it.
-- notes: a thorough plain-text summary of everything else mentioned that isn't already captured above - hotel categories requested (star rating etc, not a specific name - those go in hotelPreferences), room-wise pax breakdown (including any children's ages), special requests (gala dinner, pool party, shows, etc). This is kept as a reference note for staff, so include detail rather than drop it - unlike the fields above, being thorough here carries no risk since nothing here is auto-saved into a structured field.
 
-Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "itineraryLines": [...], "hotelPreferences": [...], "notes": "..."}`;
+Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "itineraryLines": [...], "hotelPreferences": [...]}`;
 }
 
 // Builds the shared "what's still missing" prompt used both when the agent-provided extraction is
@@ -438,6 +442,15 @@ function basicNextPrompt(draft) {
   if (next) {
     draft.basicCurrentStep = next;
     return basicStepPrompt(next, draft);
+  }
+  // Manual entry only (typed straight in, not a travel-agent paste): ask return date directly right
+  // after travel date, instead of deriving/suggesting it later from the itinerary's length - a
+  // manually-built itinerary's item count doesn't necessarily match the actual trip length (free/
+  // unlisted days, etc). Once this is set, askReturnDateConfirm's later itinerary-done check
+  // (draft.fields.returnDate already present) just passes through without re-asking or suggesting.
+  if (draft.viaManualEntry && !draft.fields.returnDate) {
+    draft.basicCurrentStep = 'returnDate';
+    return 'What is the return date? (format DD-MM-YYYY)';
   }
   if (!draft.basicPaxAsked) {
     draft.basicPaxAsked = true;
@@ -545,12 +558,10 @@ async function stepAgentPaste(draft, userMessage) {
     filled.push(`Hotel preferences: ${hotelPreferences.map((p) => `${p.destinationName} → ${p.hotelName}`).join(', ')}`);
   }
 
-  // Free-text reference note - not a structured field the rest of the flow trusts or acts on, so
-  // it's kept regardless of whether the human accepts/rejects the structured fields above.
-  if (parsed.notes && String(parsed.notes).trim()) {
-    const note = String(parsed.notes).trim();
-    draft.extraFields.extraNote = draft.extraFields.extraNote ? `${draft.extraFields.extraNote}\n${note}` : note;
-  }
+  // No auto-generated note - extraNote only ever gets filled if the human explicitly types one in
+  // the extras step at the end of the flow (askExtras/extraSystemPrompt). An LLM-summarized note
+  // isn't something anyone asked for, and its length was also what caused FlyThai's AddBooking to
+  // silently reject bookings above ~350 chars (see EXTRA_NOTE_MAX_LENGTH/capExtraNote below).
   draft.agentRawMessage = answer;
 
   if (filled.length === 0) {
@@ -783,10 +794,13 @@ async function processAgentItineraryQueue(draft, prefix) {
     if (!draft.vehicleOptions) draft.vehicleOptions = await listVehicles();
     const t = { date: dateStr };
     const matched = [];
+    // Staged, NOT applied directly - same reasoning as transferName below (see that comment): a
+    // guessed pickup/drop-off from ambient message text is still a guess about which real point was
+    // meant, not a certainty, so it's confirmed (see nextTransferStepReply) before being locked in.
     const pickup = await tryResolvePoint(line.pickupHint);
-    if (pickup) { t.pickupPointName = pickup.Name; t._pickupPointNameRow = pickup; matched.push(`pickup: ${pickup.Name}`); }
+    if (pickup) { t._pendingPickupPointConfirm = pickup; matched.push(`pickup: ${pickup.Name}`); }
     const dropoff = await tryResolvePoint(line.dropoffHint);
-    if (dropoff) { t.dropOffPointName = dropoff.Name; t._dropOffPointNameRow = dropoff; matched.push(`drop-off: ${dropoff.Name}`); }
+    if (dropoff) { t._pendingDropOffPointConfirm = dropoff; matched.push(`drop-off: ${dropoff.Name}`); }
     // Real transfer master records are named "<Destination> Airport to <Destination> Hotel"
     // (verified live against the DB, e.g. "Phuket Airport to Phuket Hotel") using the DESTINATION's
     // own full name, NOT necessarily whatever a specific Pickup record happens to be named - "HKT
@@ -803,15 +817,23 @@ async function processAgentItineraryQueue(draft, prefix) {
     });
     const candidateQueries = [];
     if (lineDest) candidateQueries.push(`${lineDest.Name} Airport to ${lineDest.Name} Hotel`);
+    // The catalog names its products with the generic "<Destination> Hotel" placeholder, not
+    // whichever specific hotel a Pickup record happens to resolve to (see
+    // guessDestinationHotelPlaceholder's own comment) - reproduced live: "Bangkok Hotel to DMK
+    // Airport" is a real catalog record, but pickup resolved to the specific Pickup row "Happihaus
+    // Bangkok Hotel", so the old specific-name-only candidate below ("Happihaus Bangkok Hotel to DMK
+    // Airport") never matched it and the bot asked instead of auto-picking a record that was right
+    // there. Tried for BOTH sides independently, not just when only one side failed to resolve to a
+    // Pickup record at all - a resolved specific hotel is still worth trying as the generic
+    // placeholder first, before falling back to its own specific name.
+    const pickupDestPlaceholder = guessDestinationHotelPlaceholder(line.pickupHint, draft.resolvedDestinations);
+    const dropoffDestPlaceholder = guessDestinationHotelPlaceholder(line.dropoffHint, draft.resolvedDestinations);
+    const pickupSide = pickupDestPlaceholder || (pickup && pickup.Name);
+    const dropoffSide = dropoffDestPlaceholder || (dropoff && dropoff.Name);
+    if ((pickupDestPlaceholder || dropoffDestPlaceholder) && pickupSide && dropoffSide) {
+      candidateQueries.push(`${pickupSide} to ${dropoffSide}`);
+    }
     if (pickup && dropoff) candidateQueries.push(`${pickup.Name} to ${dropoff.Name}`);
-    if (pickup && !dropoff) {
-      const destPlaceholder = guessDestinationHotelPlaceholder(line.dropoffHint, draft.resolvedDestinations);
-      if (destPlaceholder) candidateQueries.push(`${pickup.Name} to ${destPlaceholder}`);
-    }
-    if (dropoff && !pickup) {
-      const destPlaceholder = guessDestinationHotelPlaceholder(line.pickupHint, draft.resolvedDestinations);
-      if (destPlaceholder) candidateQueries.push(`${destPlaceholder} to ${dropoff.Name}`);
-    }
     if (line.transferNameHint) candidateQueries.push(line.transferNameHint);
     if (line.pickupHint) candidateQueries.push(line.pickupHint);
 
@@ -851,7 +873,10 @@ async function processAgentItineraryQueue(draft, prefix) {
     const matchedNote = matched.length > 0 ? ` (auto-matched: ${matched.join(', ')})` : '';
     if (!next) {
       draft.phase = 'sightseeingOptionalCollect';
-      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — sightseeing auto-matched${matchedNote}. Optional: number of adults/children going, remarks. Reply with any, or "skip".`, draft };
+      const adults = draft.fields.guestAdults || 0;
+      const children = draft.fields.guestChildrens || 0;
+      const paxNote = children > 0 ? `${adults} adult(s), ${children} child(ren)` : `${adults} adult(s)`;
+      return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — sightseeing auto-matched${matchedNote}. Optional: a different adults/children count, remarks. Reply with any, or "skip" to save it for ${paxNote} — the trip's full group.`, draft };
     }
     draft.itemStep = next;
     return { reply: `${prefix}${leisureNote}Day ${line.day} (${dateStr}) — sightseeing from the message${matchedNote}. ${sightseeingStepPrompt(next)}`, draft };
@@ -982,6 +1007,19 @@ async function stepBasic(draft, userMessage) {
       break;
     }
 
+    case 'returnDate': {
+      const returnDateObj = parseDateDDMMYYYY(answer);
+      if (!returnDateObj) {
+        return { reply: 'That needs to be a real date in DD-MM-YYYY format — could you re-enter it?', draft };
+      }
+      const travelDateObj = parseDateDDMMYYYY(draft.fields.travelDate);
+      if (returnDateObj <= travelDateObj) {
+        return { reply: `Return date must be later than the travel date (${draft.fields.travelDate}) — could you re-enter it?`, draft };
+      }
+      draft.fields.returnDate = answer;
+      break;
+    }
+
     case 'travelCount': {
       if (!/^skip$/i.test(answer)) {
         const adultsMatch = answer.match(/(\d+)\s*adult/i);
@@ -1004,6 +1042,14 @@ async function stepBasic(draft, userMessage) {
   if (next) {
     draft.basicCurrentStep = next;
     return { reply: basicStepPrompt(next, draft), draft };
+  }
+
+  // See basicNextPrompt's identical check above (reached from the OTHER entry point into this same
+  // end-of-basic-phase transition) - manual entry only, asks return date directly right after travel
+  // date rather than deriving it from the itinerary later.
+  if (draft.viaManualEntry && !draft.fields.returnDate) {
+    draft.basicCurrentStep = 'returnDate';
+    return { reply: 'What is the return date? (format DD-MM-YYYY)', draft };
   }
 
   if (!draft.basicPaxAsked) {
@@ -1333,7 +1379,19 @@ async function stepHotelCollect(draft, userMessage) {
   }
 
   draft.phase = 'hotelOptionalCollect';
-  return { reply: 'Optional for this hotel: breakfast option, adults/children/infants staying, currency (default THB), address/contact/email/remarks, sharing type. Reply with any of these, or "skip".', draft };
+  {
+    // Same "default to the booking's own total pax" rule as sightseeing/restaurant (see
+    // finishSightseeingItem/finishRestaurantItem) - totalAdults below already defaulted from
+    // draft.fields.guestAdults when unset, this just makes that default visible/confirmable
+    // instead of a silent guess.
+    const adults = draft.fields.guestAdults || 0;
+    const children = draft.fields.guestChildrens || 0;
+    const paxNote = children > 0 ? `${adults} adult(s), ${children} child(ren)` : `${adults} adult(s)`;
+    return {
+      reply: `Optional for this hotel: breakfast option, a different adults/children/infants count, currency (default THB), address/contact/email/remarks, sharing type. Reply with any of these, or "skip" to save it for ${paxNote} — the trip's full group.`,
+      draft,
+    };
+  }
 }
 
 function hotelOptionalSystemPrompt(fields) {
@@ -1912,6 +1970,14 @@ function transferStepPrompt(stepKey, draft) {
 // Returns null once every field (including transferName) is filled - caller moves on from there.
 function nextTransferStepReply(draft, t) {
   const next = TRANSFER_FIELD_ORDER.find((k) => t[k] === undefined || t[k] === null || t[k] === '');
+  if (next === 'pickupPointName' && t._pendingPickupPointConfirm) {
+    draft.itemStep = 'pickupPointConfirm';
+    return `The message suggests the pickup point is **${t._pendingPickupPointConfirm.Name}** — is that correct, or would you like to change it?`;
+  }
+  if (next === 'dropOffPointName' && t._pendingDropOffPointConfirm) {
+    draft.itemStep = 'dropOffPointConfirm';
+    return `The message suggests the drop-off point is **${t._pendingDropOffPointConfirm.Name}** — is that correct, or would you like to change it?`;
+  }
   if (next === 'transferName' && t._pendingTransferNameConfirm) {
     draft.itemStep = 'transferNameConfirm';
     return `The message suggests the transfer is **${t._pendingTransferNameConfirm.Name}** — is that correct, or would you like to change it?`;
@@ -1979,6 +2045,36 @@ async function stepTransferCollect(draft, userMessage) {
           return { reply: transferStepPrompt('transferName', draft), draft };
         }
         return { reply: `Is **${t._pendingTransferNameConfirm.Name}** the right transfer? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
+      }
+      case 'pickupPointConfirm': {
+        const yn = parseYesNo(answer);
+        if (yn === true) {
+          t.pickupPointName = t._pendingPickupPointConfirm.Name;
+          t._pickupPointNameRow = t._pendingPickupPointConfirm;
+          delete t._pendingPickupPointConfirm;
+          break;
+        }
+        if (yn === false || /change|different|edit/i.test(answer)) {
+          delete t._pendingPickupPointConfirm;
+          draft.itemStep = 'pickupPointName';
+          return { reply: transferStepPrompt('pickupPointName', draft), draft };
+        }
+        return { reply: `Is **${t._pendingPickupPointConfirm.Name}** the right pickup point? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
+      }
+      case 'dropOffPointConfirm': {
+        const yn = parseYesNo(answer);
+        if (yn === true) {
+          t.dropOffPointName = t._pendingDropOffPointConfirm.Name;
+          t._dropOffPointNameRow = t._pendingDropOffPointConfirm;
+          delete t._pendingDropOffPointConfirm;
+          break;
+        }
+        if (yn === false || /change|different|edit/i.test(answer)) {
+          delete t._pendingDropOffPointConfirm;
+          draft.itemStep = 'dropOffPointName';
+          return { reply: transferStepPrompt('dropOffPointName', draft), draft };
+        }
+        return { reply: `Is **${t._pendingDropOffPointConfirm.Name}** the right drop-off point? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
       }
       default:
         break;
@@ -2175,7 +2271,7 @@ async function stepSightseeingCollect(draft, userMessage) {
   }
 
   draft.phase = 'sightseeingOptionalGate';
-  return { reply: askSightseeingOptionalGate(), draft };
+  return { reply: askSightseeingOptionalGate(draft), draft };
 }
 
 function sightseeingOptionalSystemPrompt(fields) {
@@ -2186,9 +2282,14 @@ Merge only what the user's message actually mentions - this is a single-turn ste
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
 }
 
-// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors.
-function askSightseeingOptionalGate() {
-  return `Want to add optional details for this sightseeing — number of adults/children going, remarks?`;
+// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors. Adults/
+// children default to the booking's own total pax if left unanswered (see finishSightseeingItem) -
+// stated up front here so that's a visible default being confirmed, not a silent guess.
+function askSightseeingOptionalGate(draft) {
+  const adults = draft.fields.guestAdults || 0;
+  const children = draft.fields.guestChildrens || 0;
+  const paxNote = children > 0 ? `${adults} adult(s), ${children} child(ren)` : `${adults} adult(s)`;
+  return `Want to add optional details for this sightseeing (remarks, or a different adults/children count)? Reply "skip" to save it for ${paxNote} — the trip's full group.`;
 }
 
 async function stepSightseeingOptionalGate(draft, userMessage) {
@@ -2217,8 +2318,12 @@ function finishSightseeingItem(draft) {
   const s = draft.currentItemDraft;
   const particular = s._sightseeingNameRow;
   const pickup = s._pickupPointNameRow;
-  const totalAdult = Number(s.totalAdult) || 0;
-  const totalChild = Number(s.totalChild) || 0;
+  // Unless staff explicitly gave a different count, default to the booking's own total pax (same
+  // convention BookingHotel rows already use - see totalAdults in buildModel's hotel mapping) rather
+  // than 0 - a sightseeing/restaurant item with nobody down for it looked like a mistake in every
+  // real trip tested, since the whole group normally goes on everything in the itinerary.
+  const totalAdult = s.totalAdult != null ? Number(s.totalAdult) : Number(draft.fields.guestAdults) || 0;
+  const totalChild = s.totalChild != null ? Number(s.totalChild) : Number(draft.fields.guestChildrens) || 0;
   const adultPrice = s.adultPrice != null ? Number(s.adultPrice) : Number(particular.AdultsPrice) || 0;
   const childPrice = s.childPrice != null ? Number(s.childPrice) : Number(particular.ChildrenPrice) || 0;
   const finalPrice = Math.round((totalAdult * adultPrice + totalChild * childPrice) * 100) / 100;
@@ -2372,7 +2477,7 @@ async function stepRestaurantCollect(draft, userMessage) {
   }
 
   draft.phase = 'restaurantOptionalGate';
-  return { reply: askRestaurantOptionalGate(), draft };
+  return { reply: askRestaurantOptionalGate(draft), draft };
 }
 
 function restaurantOptionalSystemPrompt(fields) {
@@ -2383,9 +2488,14 @@ Merge only what the user's message actually mentions - this is a single-turn ste
 Respond with ONLY JSON: {"fields": {...merged...}, "done": true}`;
 }
 
-// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors.
-function askRestaurantOptionalGate() {
-  return `Want to add optional details for this restaurant — adults/children for lunch and/or dinner (with prices), remarks?`;
+// See askTransferOptionalGate/stepTransferOptionalGate above for the pattern this mirrors. Lunch
+// and dinner adults/children default to the booking's own total pax if left unanswered entirely
+// (see finishRestaurantItem) - stated up front here so that's a visible default being confirmed.
+function askRestaurantOptionalGate(draft) {
+  const adults = draft.fields.guestAdults || 0;
+  const children = draft.fields.guestChildrens || 0;
+  const paxNote = children > 0 ? `${adults} adult(s), ${children} child(ren)` : `${adults} adult(s)`;
+  return `Want to add optional details for this restaurant (prices, or different lunch/dinner adults/children counts)? Reply "skip" to save both lunch and dinner for ${paxNote} — the trip's full group.`;
 }
 
 async function stepRestaurantOptionalGate(draft, userMessage) {
@@ -2413,13 +2523,20 @@ async function stepRestaurantOptionalCollect(draft, userMessage) {
 function finishRestaurantItem(draft) {
   const r = draft.currentItemDraft;
   const restaurant = r._restaurantNameRow;
-  const lunchAdultCount = Number(r.lunchAdultCount) || 0;
+  // Same "default to the booking's own total pax" rule as sightseeing (see finishSightseeingItem) -
+  // but only when NEITHER meal's count was ever mentioned (a fully skipped optional step). If staff
+  // gave a count for one meal specifically (e.g. "dinner for 6"), that's a deliberate choice, not
+  // something to blindly mirror onto the other meal too.
+  const neitherMealSpecified = r.lunchAdultCount == null && r.dinnerAdultCount == null;
+  const defaultAdultCount = neitherMealSpecified ? Number(draft.fields.guestAdults) || 0 : 0;
+  const defaultChildCount = neitherMealSpecified ? Number(draft.fields.guestChildrens) || 0 : 0;
+  const lunchAdultCount = r.lunchAdultCount != null ? Number(r.lunchAdultCount) : defaultAdultCount;
   const lunchAdultPrice = r.lunchAdultPrice != null ? Number(r.lunchAdultPrice) : Number(restaurant.LunchPriceForAdults) || 0;
-  const lunchChildCount = Number(r.lunchChildCount) || 0;
+  const lunchChildCount = r.lunchChildCount != null ? Number(r.lunchChildCount) : defaultChildCount;
   const lunchChildPrice = Number(r.lunchChildPrice) || 0;
-  const dinnerAdultCount = Number(r.dinnerAdultCount) || 0;
+  const dinnerAdultCount = r.dinnerAdultCount != null ? Number(r.dinnerAdultCount) : defaultAdultCount;
   const dinnerAdultPrice = r.dinnerAdultPrice != null ? Number(r.dinnerAdultPrice) : Number(restaurant.DinnerPriceForAdults) || 0;
-  const dinnerChildCount = Number(r.dinnerChildCount) || 0;
+  const dinnerChildCount = r.dinnerChildCount != null ? Number(r.dinnerChildCount) : defaultChildCount;
   const dinnerChildPrice = Number(r.dinnerChildPrice) || 0;
 
   const totalAdult = Math.max(lunchAdultCount, dinnerAdultCount);
@@ -2715,6 +2832,17 @@ function buildConfirmationSummary(draft) {
   return out;
 }
 
+// FlyThai's AddBooking endpoint silently rejects the ENTIRE booking (returns "0", no valid id,
+// no error detail) if extraNote is too long - confirmed live by bisection: 350 chars OK, 360+
+// rejected. Auto-generated notes on complex multi-destination bookings routinely exceed that, so
+// cap it well under the threshold rather than let a long note silently kill the whole save.
+const EXTRA_NOTE_MAX_LENGTH = 300;
+function capExtraNote(note) {
+  const trimmed = String(note || '').trim();
+  if (trimmed.length <= EXTRA_NOTE_MAX_LENGTH) return trimmed;
+  return `${trimmed.slice(0, EXTRA_NOTE_MAX_LENGTH - 1)}…`;
+}
+
 function buildModel(draft) {
   const f = draft.fields;
   const itinearyDetails = {};
@@ -2778,7 +2906,7 @@ function buildModel(draft) {
     // Was missing entirely - extraNote was captured, shown back in the confirmation summary (so it
     // LOOKED saved), but never actually included in the payload sent to the real API. Every note
     // anyone typed through this flow was silently discarded before this fix.
-    extraNote: draft.extraFields.extraNote || '',
+    extraNote: capExtraNote(draft.extraFields.extraNote),
     HotelIds: '',
     ItinearyIds: '',
     // The real site (managebookings.js) submits these as three independent checkboxes

@@ -123,7 +123,26 @@ function cancelFlows(sessionId) {
 // unrecognised text interrupt the active flow, including a plain answer like a guest's name that
 // just doesn't happen to look like anything else. Only a SPECIFIC, high-precision intent match
 // counts as an interruption.
+// Every one of these phases is a single-turn, all-optional free-text field extraction (extra note/
+// emergency contact/PDF download permissions, or a transfer/sightseeing/restaurant/hotel item's own
+// optional details) - the LLM extractor there is meant to accept ANY wording, so a reply that
+// happens to contain a keyword another detector watches for must never get hijacked into "do
+// something else instead". Reproduced live: answering the extras step with "...allow agent to
+// download voucher pdf" (literally describing the IsAllowForVoucher field it was just asked about)
+// matched detectDocumentIntent's "download"+"pdf" signal, pausing the almost-finished draft and
+// asking "which booking is that for?", then resurfacing as a bewildering "Continuing where we left
+// off" once that interrupting (and code-less, so unresolvable) document lookup gave up.
+const FREEFORM_OPTIONAL_COLLECT_PHASES = [
+  'extraCollect',
+  'transferOptionalCollect',
+  'sightseeingOptionalCollect',
+  'restaurantOptionalCollect',
+  'hotelOptionalCollect',
+];
+
 function detectAnyFreshIntent(userMessage, session) {
+  if (session.draft && FREEFORM_OPTIONAL_COLLECT_PHASES.includes(session.draft.phase)) return false;
+
   // A bare completion/status-value word ("done", "skip", "pending"...) is ambiguous between "finish
   // the step I'm already answering" and a fuzzy status-change follow-up - while a guided flow
   // (session.draft) is active, its own interpretation of that word wins; only an EXPLICIT change
@@ -1922,10 +1941,20 @@ async function handleChatInner(sessionId, userMessage) {
   // paused flow, replaying its last question, once whatever interrupted it fully finishes.
   if (isFlowActive(session) && !isAnyCancel(userMessage) && detectAnyFreshIntent(userMessage, session)) {
     const key = activeStateKey(session);
-    if (key && session.lastFlowSnapshot) {
+    // A draft still in phase 'source' (see startDraft/stepSource) has collected zero fields no
+    // matter whether its first question has already been shown (sourceStarted) - fields only ever
+    // gets its first entry in the same tick phase leaves 'source'. Reproduced live TWICE: typing
+    // "create a new booking" then immediately pasting the agent's message as the very next message
+    // interrupts that still-empty draft (whether or not the "guest's name?" prompt had already been
+    // shown), and once the paste-driven booking finishes saving, resuming it just re-asks "Let's
+    // create a new booking. What is the guest's name?" out of nowhere - there's nothing it actually
+    // preserved, and the user just created a booking, not asked for a second one. Discard instead of
+    // pausing.
+    const isEmptyFreshDraft = key === 'draft' && session.draft.phase === 'source';
+    if (key && session.lastFlowSnapshot && !isEmptyFreshDraft) {
       session.pausedFlows.push({ stateKey: key, stateValue: session[key], ...session.lastFlowSnapshot });
-      session[key] = null;
     }
+    if (key) session[key] = null;
   }
 
   // Remember the last booking/quotation code mentioned in this session, so a pronoun follow-up

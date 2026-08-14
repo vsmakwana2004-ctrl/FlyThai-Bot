@@ -92,6 +92,9 @@ async function submitBooking(model, isBooking, { allowSalesEntry = true, isDupli
     throw err;
   }
   if (newId <= 0) {
+    // TEMP diagnostic - narrowing down why FlyThai returns 0 for some bookings (reported live).
+    console.error('AddBooking rejected. Raw response:', JSON.stringify(text));
+    console.error('AddBooking rejected. Request model:', JSON.stringify(model));
     throw new Error('FlyThai rejected the booking (no valid id returned) - nothing was saved.');
   }
 
