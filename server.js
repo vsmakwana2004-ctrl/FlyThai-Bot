@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { handleChat, cancelFlows, setSessionLogin } = require('./src/chat');
 const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles, listDestinations, listHotelRoomTypes } = require('./src/lookups');
-const { initRolePermissions, refreshPermissions, getRoleList } = require('./src/rolePermissions');
+const { initRolePermissions, refreshPermissions, getRoleList, getUserById } = require('./src/rolePermissions');
 const { verifyLogin, getUserRoleId } = require('./src/flythaiAuth');
 
 const app = express();
@@ -240,6 +240,41 @@ app.post('/api/login', async (req, res) => {
       return res.status(503).json({ error: 'The connection to the FlyThai booking site needs to be refreshed. Please contact your admin.' });
     }
     res.status(500).json({ error: 'Something went wrong while logging in. Please try again.' });
+  }
+});
+
+// Auto-login for the FlyThai admin panel's embedded iframe (ChatBot/Index): the panel passes the
+// already-logged-in user's own [User].Id as `chatbotKey` (its "chatbot_key" URL param), so the same
+// person never has to type their FlyThai username/password a second time inside the chatbot - their
+// name/role/permissions are looked up straight from the database (see rolePermissions.getUserById).
+// SECURITY NOTE: chatbotKey is a bare, small, sequential integer with no signature/expiry - anyone
+// who can reach this chatbot's own URL (it's on the public internet on Render, unlike the admin
+// panel it's embedded in) can pass any chatbotKey value and be treated as that user. This is only
+// safe as long as nobody relies on it for anything beyond convenience/permission-DISPLAY - it must
+// NOT be trusted as proof of identity for anything sensitive. No FlyThai session cookie comes with
+// this (only a bare id), so live writes (creating a booking, etc.) still go through the shared
+// FLYTHAI_SESSION_COOKIE service account rather than this specific person's own - only read-side
+// identity/role/permissions are sourced from chatbotKey, same as before this endpoint existed.
+app.post('/api/session-from-key', async (req, res) => {
+  try {
+    const { chatbotKey, sessionId } = req.body || {};
+    const userId = Number(chatbotKey);
+    if (!chatbotKey || !Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Missing or invalid chatbot_key.' });
+    }
+    const user = await getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'No FlyThai user found for this chatbot_key.' });
+    }
+    if (!user.roleName) {
+      return res.status(500).json({ error: `Found the user, but their role isn't recognized yet - try again in a moment (role list may still be loading), or ask an Admin to check their role in Manage Users.` });
+    }
+    const sid = sessionId && typeof sessionId === 'string' ? sessionId : 'default';
+    setSessionLogin(sid, { role: user.roleName, flythaiCookie: null, displayName: user.name });
+    res.json({ ok: true, role: user.roleName, displayName: user.name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong while signing in.' });
   }
 });
 

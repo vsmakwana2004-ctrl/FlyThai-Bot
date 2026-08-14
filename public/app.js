@@ -922,9 +922,9 @@ function getSessionId() {
 let sessionId = getSessionId();
 
 // Mirrors FlyThai's own Manage Users -> Roles system (see rolePermissions.js) so the bot can gate
-// its capabilities the same way the real admin panel does - set automatically after a real FlyThai
-// login (see the login form wiring below) rather than picked from a dropdown, so it reflects who is
-// actually using the bot instead of a free/dishonest pick.
+// its capabilities the same way the real admin panel does - set automatically from the FlyThai
+// admin panel's own chatbot_key (see autoLoginFromChatbotKey below), so it reflects who is actually
+// using the bot rather than a free/dishonest pick.
 function getRole() {
   return localStorage.getItem('flythai_role') || '';
 }
@@ -937,95 +937,35 @@ function getDisplayName() {
 function setDisplayName(name) {
   localStorage.setItem('flythai_display_name', name);
 }
-function clearLogin() {
-  localStorage.removeItem('flythai_role');
-  localStorage.removeItem('flythai_display_name');
-}
 
-const loginOpenBtn = document.getElementById('loginOpenBtn');
-const loginPopover = document.getElementById('loginPopover');
-const loggedInStatus = document.getElementById('loggedInStatus');
-const loggedInName = document.getElementById('loggedInName');
-const loginForm = document.getElementById('loginForm');
-const loginError = document.getElementById('loginError');
-const loginSubmitBtn = document.getElementById('loginSubmitBtn');
-
-function renderAuthState() {
-  const role = getRole();
-  const name = getDisplayName();
-  const isLoggedIn = !!(role && name);
-  loggedInStatus.hidden = !isLoggedIn;
-  loginOpenBtn.hidden = isLoggedIn;
-  if (isLoggedIn) loggedInName.textContent = `${name} · ${role}`;
-}
-renderAuthState();
-
-loginOpenBtn?.addEventListener('click', () => {
-  loginPopover.hidden = !loginPopover.hidden;
-  if (!loginPopover.hidden) document.getElementById('loginUsername')?.focus();
-});
-
-document.addEventListener('click', (e) => {
-  if (!loginPopover.hidden && !loginPopover.contains(e.target) && e.target !== loginOpenBtn) {
-    loginPopover.hidden = true;
-  }
-});
-
-loginForm?.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  loginError.hidden = true;
-  const username = document.getElementById('loginUsername').value.trim();
-  const password = document.getElementById('loginPassword').value;
-  if (!username || !password) return;
-
-  loginSubmitBtn.disabled = true;
-  loginSubmitBtn.textContent = 'Logging in…';
+// Auto-login for the FlyThai admin panel's embedded iframe (ChatBot/Index): the panel passes the
+// already-logged-in user's own id as ?chatbot_key=<id> on the iframe src, so this signs the same
+// person in here automatically - the topbar's own username/password login UI (and the manual
+// role-refresh button) was removed entirely, since chatbot_key is now the only supported way to
+// establish who's using the bot. Always re-applied on load, even over an already-cached role/name,
+// so a different FlyThai user on a shared machine (or a freshly issued key) is picked up
+// immediately rather than reusing a stale cached identity from someone else's earlier visit.
+(async function autoLoginFromChatbotKey() {
+  const params = new URLSearchParams(window.location.search);
+  const chatbotKey = params.get('chatbot_key');
+  if (!chatbotKey) return;
   try {
-    const res = await fetch('/api/login', {
+    const res = await fetch('/api/session-from-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password, sessionId }),
+      body: JSON.stringify({ chatbotKey, sessionId }),
     });
     const data = await readJsonResponse(res);
     if (!res.ok) {
-      loginError.textContent = data.error || 'Login failed. Please try again.';
-      loginError.hidden = false;
+      console.warn('Auto-login via chatbot_key failed:', data.error);
       return;
     }
     setRole(data.role);
     setDisplayName(data.displayName);
-    loginForm.reset();
-    loginPopover.hidden = true;
-    renderAuthState();
   } catch (err) {
-    loginError.textContent = 'Could not reach the server. Please check your connection and try again.';
-    loginError.hidden = false;
-  } finally {
-    loginSubmitBtn.disabled = false;
-    loginSubmitBtn.textContent = 'Log in';
+    console.warn('Auto-login via chatbot_key failed:', err);
   }
-});
-
-document.getElementById('logoutBtn')?.addEventListener('click', () => {
-  clearLogin();
-  renderAuthState();
-});
-
-document.getElementById('rolePermRefreshBtn')?.addEventListener('click', async (e) => {
-  const btn = e.currentTarget;
-  btn.disabled = true;
-  btn.classList.add('spinning');
-  try {
-    const res = await fetch('/api/roles/refresh', { method: 'POST' });
-    await readJsonResponse(res);
-    await loadRoleOptions();
-  } catch (err) {
-    console.warn('Could not refresh role permissions:', err);
-  } finally {
-    btn.disabled = false;
-    setTimeout(() => btn.classList.remove('spinning'), 700);
-  }
-});
+})();
 
 function escapeHtml(str) {
   return str
