@@ -105,6 +105,21 @@ function detectFinanceReportIntent(text) {
   return null;
 }
 
+// These reports below only ever total across the WHOLE company - none of them take an agent/account
+// filter, unlike the general SQL planner (which correctly scopes to one agent via BookingMaster.
+// AgentId when asked, e.g. "revenue from ajay modi"). Without this check, wording that happens to
+// match INCOME_RE/ACCOUNT_SUMMARY_RE/PAYMENT_RECEIVED_RE silently swallows a named agent and answers
+// with the company-wide total instead - reproduced live: "booking revenue from 99 HOLIDAYS" returned
+// the whole company's income. This just extracts a name candidate; the caller checks it against the
+// real Agents table before trusting it, so a false-positive extraction (e.g. "income for this month")
+// simply matches no agent and the company-wide report proceeds exactly as before.
+const AGENT_HINT_RE = /\b(?:from|by|for)\s+([a-z0-9][a-z0-9 &'.-]{1,60}?)\s*\??$|^([a-z0-9][a-z0-9 &'.-]{1,60}?)\s+se\b/i;
+function extractPossibleAgentName(text) {
+  const m = text.match(AGENT_HINT_RE);
+  if (!m) return null;
+  return (m[1] || m[2] || '').trim() || null;
+}
+
 async function fetchIncomeReport(period) {
   const pool = await getPool();
   const request = pool.request();
@@ -309,6 +324,7 @@ This is the same Final Amount − Paid Amount calculation the real site's own Re
 
 module.exports = {
   detectFinanceReportIntent,
+  extractPossibleAgentName,
   fetchIncomeReport,
   formatIncomeAnswer,
   fetchPaymentReceivedReport,

@@ -13,7 +13,7 @@ const duplicateBooking = require('./duplicateBooking');
 const bookingEditForms = require('./bookingEditForms');
 const { findBookingById } = require('./bookingApi');
 const { isAnyCancel } = require('./cancel');
-const { findDestinations, listDestinations, findHotel, findHotelRoomType } = require('./lookups');
+const { findDestinations, listDestinations, findHotel, findHotelRoomType, findAgent } = require('./lookups');
 const jobSheetCopy = require('./jobSheetCopy');
 const agentCreate = require('./agentCreate');
 const { canUseBot, requirePermission, DEGRADED_NOTE } = require('./rolePermissions');
@@ -2895,7 +2895,20 @@ async function handleChatInner(sessionId, userMessage) {
   // financeReports.js itself were built to avoid. Skipped entirely when an FT/FTQ code is present -
   // "amount due for FT08261781" is a per-booking question (handled below/by the planner), not an
   // aggregate one, even though it matches the same wording.
-  const financeIntent = !ANY_CODE_RE.test(userMessage) ? financeReports.detectFinanceReportIntent(userMessage) : null;
+  let financeIntent = !ANY_CODE_RE.test(userMessage) ? financeReports.detectFinanceReportIntent(userMessage) : null;
+  if (financeIntent) {
+    // The company-wide reports below (fetchIncomeReport/fetchAccountSummary/
+    // fetchPaymentReceivedReport) have no per-agent filter at all - if the question also names a
+    // real agent ("revenue from 99 HOLIDAYS"), skip the shortcut and let it fall through to the
+    // general SQL planner further down, which already scopes correctly to one agent (verified live
+    // against BookingMaster.AgentId). A hint that doesn't match exactly one real agent (e.g. "income
+    // for this month") is ignored and the company-wide report proceeds as before.
+    const agentHint = financeReports.extractPossibleAgentName(userMessage);
+    if (agentHint) {
+      const agentMatches = await findAgent(agentHint);
+      if (agentMatches.length === 1) financeIntent = null;
+    }
+  }
   if (financeIntent) {
     const financePerm = requirePermission(session.role, 'Account Report', 'view');
     if (!financePerm.allowed) {
