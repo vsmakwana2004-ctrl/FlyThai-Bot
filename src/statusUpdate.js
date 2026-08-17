@@ -1,7 +1,7 @@
 const { getPool } = require('./db');
 const { updateBookingStatus } = require('./bookingApi');
 const { callLLM } = require('./llm');
-const { resolveBookingByCode } = require('./documents');
+const { resolveBookingByCode, resolveBookingByGuestName, extractGuestName } = require('./documents');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 const BARE_NUMBER_RE = /\b\d{4,}\b/;
@@ -16,6 +16,18 @@ const VALUE_WORD_RE = /\b(done|sent|pending|cancelled|canceled|closed|created|se
 const QUESTION_LEAD_RE = /^\s*(what|is|are|show|list|tell|give|kya|status)\b/i;
 function looksLikeQuestion(text) {
   return /\?\s*$/.test(text.trim()) || QUESTION_LEAD_RE.test(text.trim());
+}
+
+// Same "for X"/"of X" convention as documents.js's extractGuestName, but status-change phrasing
+// commonly has a trailing "to <value>"/"as <value>" clause right after the name (mirroring this
+// module's own confirmation wording, "...status to sent") that extractGuestName's generic
+// trailing-word trim doesn't know about - strip it here so "status for vandit to sent" resolves the
+// name "vandit", not "vandit to sent" (which would never match anything in the database).
+function extractGuestNameForStatus(text) {
+  const raw = extractGuestName(text);
+  if (!raw) return null;
+  const name = raw.replace(/\s+\b(to|as)\b.*$/i, '').trim();
+  return name || null;
 }
 
 // Exact allowed values per status type, scraped from the real site's own dropdown HTML
@@ -53,12 +65,25 @@ function detectStatusUpdateIntent(text, fallbackCode, { allowFuzzy = true } = {}
   if (fullMatch) return { code: fullMatch[0].toUpperCase(), exact: true };
   const bareMatch = text.match(BARE_NUMBER_RE);
   if (bareMatch) return { code: bareMatch[0], exact: false };
+  // No code in this message - try a guest name ("set invoice status for vandit to sent") before
+  // falling back to whatever booking was last discussed, since an explicit name here is a more
+  // specific signal than reusing older context.
+  const guestName = extractGuestNameForStatus(text);
+  if (guestName) return { guestName };
   if (fallbackCode) return { code: fallbackCode, exact: true };
   return null;
 }
 
 // Returns { status: 'not_found' } | { status: 'ambiguous', matches } | { status: 'ok', booking }.
 async function resolveBooking(intent) {
+  if (intent.guestName) {
+    // Same "ask, don't pick" standard as the same-code case below - a shared name can genuinely be
+    // two different real guests (see documents.js's resolveBookingByGuestName).
+    const matches = await resolveBookingByGuestName(intent.guestName);
+    if (matches.length === 0) return { status: 'not_found' };
+    if (matches.length > 1) return { status: 'ambiguous', matches };
+    return { status: 'ok', booking: matches[0] };
+  }
   if (intent.exact) {
     // QuotationId is NOT guaranteed unique (see documents.js's resolveBookingByCode, which this
     // reuses, for the confirmed live example of 3 rows sharing one code) - a bare TOP 1 here
@@ -152,7 +177,10 @@ async function startWithBooking(booking, userMessage) {
 async function start(intent, userMessage) {
   const resolved = await resolveBooking(intent);
   if (resolved.status === 'not_found') {
-    return { reply: `I couldn't uniquely find that booking. Please give the full booking code (e.g. FT07261782).`, pending: null };
+    const reply = intent.guestName
+      ? `I couldn't find any booking or quotation for a guest named "${intent.guestName}". Please give the exact booking code instead (e.g. FT07261782).`
+      : `I couldn't uniquely find that booking. Please give the full booking code (e.g. FT07261782).`;
+    return { reply, pending: null };
   }
   if (resolved.status === 'ambiguous') {
     return { ambiguous: true, matches: resolved.matches };

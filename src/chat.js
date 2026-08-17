@@ -2835,7 +2835,9 @@ async function handleChatInner(sessionId, userMessage) {
     }
     const result = await statusUpdate.start(statusIntent, userMessage);
     if (result.ambiguous) {
-      return askWhichRecord(sessionId, session, userMessage, statusIntent.code, result.matches, 'statusUpdate', { userMessage });
+      // statusIntent.code is undefined for a guest-name match (no code was ever typed) - fall back
+      // to the name itself so the "which one did you mean?" header has something to show.
+      return askWhichRecord(sessionId, session, userMessage, statusIntent.code || statusIntent.guestName, result.matches, 'statusUpdate', { userMessage });
     }
     session.pendingStatusChange = result.pending;
     pushTurn(sessionId, userMessage, result.reply);

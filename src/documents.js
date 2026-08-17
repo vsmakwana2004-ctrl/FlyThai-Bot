@@ -476,6 +476,7 @@ module.exports = {
   parseLogoChoice,
   resolveBookingByCode,
   resolveBookingByGuestName,
+  extractGuestName,
   buildInvoiceLink,
   buildItineraryLink,
   buildHotelVoucherLink,
