@@ -958,8 +958,17 @@ function setDisplayName(name) {
 //      security, not a bug), postMessage is the one sanctioned bridge across that boundary. The
 //      parent page needs a few lines of its own JS reading that input and posting it in - see the
 //      project notes for the exact snippet.
+// Both delivery paths also accept a `token`/`chatbot_token` alongside (or instead of) chatbotKey -
+// a short-lived, signed value once FlyThai's .NET side is updated to generate one (see
+// src/chatbotKeyToken.js). The server verifies it and ignores any chatbotKey sent alongside it.
+// Until then, neither path sends one and login keeps working exactly as it does today.
+// `extra.token`, when present (once FlyThai's .NET side generates one - see
+// src/chatbotKeyToken.js), is a short-lived signed value the server verifies instead of trusting
+// chatbotKey directly - see the SECURITY NOTE on server.js's /api/session-from-key. chatbotKey is
+// still sent alongside it today for backward compatibility, but the server ignores it whenever a
+// valid token is present.
 function loginWithChatbotKey(chatbotKey, extra = {}) {
-  if (!chatbotKey) return Promise.resolve(false);
+  if (!chatbotKey && !extra.token) return Promise.resolve(false);
   return fetch('/api/session-from-key', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -995,13 +1004,20 @@ const authReady = new Promise((resolve) => {
 // window) could postMessage a forged chatbot_key and get logged in as whichever user id it named.
 // Add an origin here for every environment that actually embeds this chatbot (production +
 // whatever local/test IPs are in real use) - a postMessage from anywhere else is silently ignored.
-const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323'];
+const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.18:44323'];
 
 window.addEventListener('message', (event) => {
-  if (!TRUSTED_PARENT_ORIGINS.includes(event.origin)) return;
+  if (!TRUSTED_PARENT_ORIGINS.includes(event.origin)) {
+    // Logged (not silent) specifically for this mismatch class - reproduced live: a postMessage
+    // from an untrusted-looking origin is otherwise dropped with zero signal, which reads as "the
+    // chatbot just isn't reading the key" when the real cause is a one-IP-off allowlist entry.
+    console.warn(`[chatbot auth] Ignored postMessage from untrusted origin "${event.origin}" - add it to TRUSTED_PARENT_ORIGINS in app.js if this is a real embedding environment.`);
+    return;
+  }
   const data = event.data;
-  if (!data || data.type !== 'flythai-chatbot-key' || !data.chatbotKey) return;
+  if (!data || data.type !== 'flythai-chatbot-key' || !(data.chatbotKey || data.token)) return;
   loginWithChatbotKey(data.chatbotKey, {
+    token: data.token,
     userName: data.userName,
     userDisplayName: data.userDisplayName,
     userOnline: data.userOnline,
@@ -1011,8 +1027,10 @@ window.addEventListener('message', (event) => {
 (async function initAuth() {
   const params = new URLSearchParams(window.location.search);
   const urlChatbotKey = params.get('chatbot_key');
-  if (urlChatbotKey) {
+  const urlToken = params.get('chatbot_token');
+  if (urlChatbotKey || urlToken) {
     await loginWithChatbotKey(urlChatbotKey, {
+      token: urlToken,
       userName: params.get('user_name'),
       userDisplayName: params.get('user_display_name'),
       userOnline: params.get('user_online'),

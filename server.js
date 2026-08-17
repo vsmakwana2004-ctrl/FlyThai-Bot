@@ -5,6 +5,7 @@ const path = require('path');
 const { handleChat, cancelFlows, setSessionLogin } = require('./src/chat');
 const { listAgents, listHotels, listPickups, listParticulars, listSightseeings, listRestaurants, listVehicles, listDestinations, listHotelRoomTypes } = require('./src/lookups');
 const { initRolePermissions, refreshPermissions, getRoleList, getUserById } = require('./src/rolePermissions');
+const { verifyChatbotKeyToken } = require('./src/chatbotKeyToken');
 
 const app = express();
 app.use(cors());
@@ -215,11 +216,19 @@ app.post('/api/roles/refresh', async (req, res) => {
 // already-logged-in user's own [User].Id as `chatbotKey` (its "chatbot_key" URL param), so the same
 // person never has to type their FlyThai username/password a second time inside the chatbot - their
 // name/role/permissions are looked up straight from the database (see rolePermissions.getUserById).
-// SECURITY NOTE: chatbotKey is a bare, small, sequential integer with no signature/expiry - anyone
-// who can reach this chatbot's own URL (it's on the public internet on Render, unlike the admin
-// panel it's embedded in) can pass any chatbotKey value and be treated as that user. This is only
-// safe as long as nobody relies on it for anything beyond convenience/permission-DISPLAY - it must
-// NOT be trusted as proof of identity for anything sensitive.
+// SECURITY NOTE: chatbotKey alone is a bare, small, sequential integer with no signature/expiry -
+// anyone who can reach this chatbot's own URL (it's on the public internet on Render, unlike the
+// admin panel it's embedded in) can pass any chatbotKey value and be treated as that user. This is
+// only safe as long as nobody relies on it for anything beyond convenience/permission-DISPLAY - it
+// must NOT be trusted as proof of identity for anything sensitive.
+//
+// `token` (optional, preferred once FlyThai's .NET side generates it - see src/chatbotKeyToken.js)
+// closes that gap: a short-lived value FlyThai's own server signs with a secret only it and this
+// server know, so it can't be guessed/forged and stops working a few minutes after being issued.
+// When present it's verified and its userId wins over any chatbotKey also sent in the same request
+// (a request can't claim to be one user via chatbotKey while presenting a valid token for another).
+// Until FlyThai's side is updated, requests keep sending only chatbotKey and this falls back to the
+// old, unverified behavior exactly as before - fully backward compatible during the migration.
 //
 // userName/userDisplayName/userOnline (all optional) are the exact 3 other values FlyThai's own
 // login sets as cookies today (UserName/UserId/UserDisplayName/UserOnline - verified live against
@@ -233,10 +242,19 @@ app.post('/api/roles/refresh', async (req, res) => {
 // before - fully backward compatible.
 app.post('/api/session-from-key', async (req, res) => {
   try {
-    const { chatbotKey, sessionId, userName, userDisplayName, userOnline } = req.body || {};
-    const userId = Number(chatbotKey);
-    if (!chatbotKey || !Number.isFinite(userId) || userId <= 0) {
-      return res.status(400).json({ error: 'Missing or invalid chatbot_key.' });
+    const { chatbotKey, token, sessionId, userName, userDisplayName, userOnline } = req.body || {};
+    let userId;
+    if (token) {
+      const verified = verifyChatbotKeyToken(token);
+      if (!verified) {
+        return res.status(401).json({ error: 'This login token is invalid or has expired. Please reopen the chatbot from the FlyThai admin panel.' });
+      }
+      userId = verified.userId;
+    } else {
+      userId = Number(chatbotKey);
+      if (!chatbotKey || !Number.isFinite(userId) || userId <= 0) {
+        return res.status(400).json({ error: 'Missing or invalid chatbot_key.' });
+      }
     }
     const user = await getUserById(userId);
     if (!user) {
