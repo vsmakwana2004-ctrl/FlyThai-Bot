@@ -263,10 +263,16 @@ app.post('/api/session-from-key', async (req, res) => {
     if (!user.roleName) {
       return res.status(500).json({ error: `Found the user, but their role isn't recognized yet - try again in a moment (role list may still be loading), or ask an Admin to check their role in Manage Users.` });
     }
+    // Prefer whatever the embedding page actually passed (it may know a fresher value than the
+    // database), but fall back to this same user's own Email/Name from the DB lookup above - those
+    // are the same UserName/UserDisplayName FlyThai's own login sets as cookies, so this alone is
+    // enough to build a real per-user cookie without depending on FlyThai's .NET side ever being
+    // updated to pass userName/userDisplayName/userOnline itself.
+    const resolvedUserName = (userName && typeof userName === 'string') ? userName : user.email;
     const flythaiCookie =
-      userName && typeof userName === 'string'
+      resolvedUserName
         ? [
-            `UserName=${encodeURIComponent(userName)}`,
+            `UserName=${encodeURIComponent(resolvedUserName)}`,
             `UserId=${userId}`,
             `UserDisplayName=${encodeURIComponent(userDisplayName || user.name)}`,
             `UserOnline=${encodeURIComponent(userOnline || userDisplayName || user.name)}`,
