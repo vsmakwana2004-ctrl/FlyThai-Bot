@@ -1004,7 +1004,7 @@ const authReady = new Promise((resolve) => {
 // window) could postMessage a forged chatbot_key and get logged in as whichever user id it named.
 // Add an origin here for every environment that actually embeds this chatbot (production +
 // whatever local/test IPs are in real use) - a postMessage from anywhere else is silently ignored.
-const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.18:44323'];
+const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.17:44323', 'https://192.168.1.18:44323'];
 
 window.addEventListener('message', (event) => {
   if (!TRUSTED_PARENT_ORIGINS.includes(event.origin)) {
