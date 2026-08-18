@@ -345,6 +345,29 @@ function nextBasicStep(draft) {
   });
 }
 
+// Called right before the 'agentName' step is about to be asked (from both basicNextPrompt and
+// stepBasic's own end-of-step transition) - if the pasted agent message named its own sender (see
+// agentNameHint on agentPasteSystemPrompt) and that resolves to exactly one confident real Agent
+// match, stages it for a yes/change confirm instead of the blank question, same "suggest, don't
+// silently apply" pattern stageHotelPreference already uses for a preferred hotel name. Tried only
+// once per draft (_agentNameHintTried) so answering "change" doesn't re-trigger the same suggestion.
+async function agentNameStepPrompt(draft) {
+  if (draft._agentNameHint && !draft._agentNameHintTried) {
+    draft._agentNameHintTried = true;
+    const agents = await findAgent(draft._agentNameHint);
+    // A single confident match only - several fuzzy hits (or none) fall straight through to the
+    // normal question below, exactly like a same-situation manual typed answer would (see stepBasic's
+    // own 'agentName' case).
+    if (agents.length === 1) {
+      draft._pendingAgentMatch = agents[0];
+      draft.basicCurrentStep = 'agentNameConfirm';
+      return `The message mentions **${agents[0].Name}** as the agent — is that correct, or would you like to select a different one?`;
+    }
+  }
+  draft.basicCurrentStep = 'agentName';
+  return basicStepPrompt('agentName', draft);
+}
+
 // ---------- phase: source (manual vs travel-agent-provided) ----------
 // The very first question of any new booking/quotation: was this typed in from scratch, or is it
 // based on a message a travel agent already sent with (partial) trip details? Previously asked as
@@ -396,7 +419,7 @@ async function stepSource(draft, userMessage) {
   // stepBasic below. The agent-paste flow keeps deriving/confirming it from the itinerary instead,
   // untouched.
   draft.viaManualEntry = true;
-  return { reply: basicNextPrompt(draft), draft };
+  return { reply: await basicNextPrompt(draft), draft };
 }
 
 // ---------- phase: agentPaste (pre-fill basic fields from a pasted travel-agent message) ----------
@@ -420,6 +443,7 @@ Known destinations in the system - match the agent's place names to these (close
 
 Fields:
 - guestName: the actual traveller/guest's name, ONLY if a specific person's name is clearly given as the traveller (not the travel agent's own name/company, and not guessed from context)
+- agentNameHint: the travel agent/company's OWN name if the message clearly identifies who sent it (often a heading/signature line at the very top or bottom, e.g. a company name ending in "Travels"/"Tours"/"Holidays"/similar) - this is the sender, never the traveller. Omit if the message doesn't clearly name the sending agent/company.
 - destinationNames: array of destination names (from the list above) the trip covers, in visiting order if determinable - only ones actually named in the message
 - travelDate: DD-MM-YYYY, only if clearly stated or unambiguously computable as described above
 - returnDate: DD-MM-YYYY, only if clearly stated or unambiguously computable as described above
@@ -429,7 +453,7 @@ Fields:
 - itineraryLines: if the message has a day-by-day plan ("Day 1: ...", "Day 2: ...", etc), one entry per day-line: {"day": <number>, "type": "transfer" | "sightseeing" | "leisure", "pickupHint": <short literal place name to search for as the start point - transfer only, else null>, "dropoffHint": <short literal place name to search for as the end point - transfer only, else null>, "transferNameHint": <a short generic transfer label like "Airport to Hotel", "Hotel to Airport", "Inter Hotel Transfer" - transfer only, else null>, "activityHint": <short literal name of the tour/activity - sightseeing only, else null>}. A day that's explicitly a free/leisure day is type "leisure" (no hints needed - and don't invent an activity for it). A day that moves between an airport and a hotel, or between two hotels/islands, is type "transfer". A day naming a specific activity/tour is type "sightseeing". If one day's line actually describes TWO separate movements (e.g. "X to Y transfer + A to B transfer"), emit TWO entries with that same day number. These hints are only used to search real records already in the system - if nothing matches, that one field is simply asked about normally afterwards, so keep each hint a short literal place/activity name, not a full sentence, and never invent one that isn't grounded in the text.
 - hotelPreferences: array of {"destinationName": <one of the known destinations above>, "hotelName": <the specific hotel name mentioned for that destination, with qualifiers like "or similar"/"or similar category" stripped off>} for each destination where the message names a preferred/requested hotel. Omit a destination entirely if no specific hotel name is given for it.
 
-Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "itineraryLines": [...], "hotelPreferences": [...]}`;
+Respond with ONLY JSON: {"guestName": ..., "agentNameHint": ..., "destinationNames": [...], "travelDate": ..., "returnDate": ..., "guestAdults": ..., "guestChildrens": ..., "guestInfants": ..., "itineraryLines": [...], "hotelPreferences": [...]}`;
 }
 
 // Builds the shared "what's still missing" prompt used both when the agent-provided extraction is
@@ -437,8 +461,9 @@ Respond with ONLY JSON: {"guestName": ..., "destinationNames": [...], "travelDat
 // same end-of-basic-phase logic stepBasic itself uses (nextBasicStep -> pax question -> hotel
 // choice), duplicated here rather than shared so stepBasic's own manual-flow code path is never
 // touched by this feature.
-function basicNextPrompt(draft) {
+async function basicNextPrompt(draft) {
   const next = nextBasicStep(draft);
+  if (next === 'agentName') return agentNameStepPrompt(draft);
   if (next) {
     draft.basicCurrentStep = next;
     return basicStepPrompt(next, draft);
@@ -494,6 +519,17 @@ async function stepAgentPaste(draft, userMessage) {
   if (parsed.guestName && String(parsed.guestName).trim()) {
     staged.guestName = String(parsed.guestName).trim();
     filled.push(`Guest Name: ${staged.guestName}`);
+  }
+
+  // Not a real field itself - kept out of `staged` (which gets Object.assign'd straight onto
+  // draft.fields on accept) since it's only a hint to try against real Agent records, not a value
+  // to save as-is. Actually resolved (findAgent) later, lazily, once the agentName basic step is
+  // about to be asked - see agentNameStepPrompt - same "suggest, don't apply outright" pattern
+  // stageHotelPreference already uses for a preferred hotel name.
+  let agentNameHint = null;
+  if (parsed.agentNameHint && String(parsed.agentNameHint).trim()) {
+    agentNameHint = String(parsed.agentNameHint).trim();
+    filled.push(`Agent: ${agentNameHint}`);
   }
 
   if (Array.isArray(parsed.destinationNames) && parsed.destinationNames.length > 0) {
@@ -567,11 +603,11 @@ async function stepAgentPaste(draft, userMessage) {
   if (filled.length === 0) {
     draft.basicStarted = true;
     draft.phase = 'basic';
-    const prompt = basicNextPrompt(draft);
+    const prompt = await basicNextPrompt(draft);
     return { reply: `I couldn't confidently pull any structured details from that message, so I'll ask for everything as usual.\n\n${prompt}`, draft };
   }
 
-  draft._pendingAgentExtract = { fields: staged, resolvedDestinations, basicPaxAsked: stagedPaxAsked, itineraryLines, hotelPreferences };
+  draft._pendingAgentExtract = { fields: staged, resolvedDestinations, basicPaxAsked: stagedPaxAsked, itineraryLines, hotelPreferences, agentNameHint };
   draft.phase = 'agentPasteConfirm';
   return {
     reply: `I read this from the message — please double-check it against what the agent actually sent before I use it:\n${filled.map((f) => `- ${f}`).join('\n')}\n\nUse these details? Reply "yes" to continue with them, or "no" to enter the basic details manually instead.`,
@@ -598,13 +634,14 @@ async function stepAgentPasteConfirm(draft, userMessage) {
     // stays a single cheap truthiness test and this is provably never present for a manual draft.
     if (Array.isArray(staged.itineraryLines) && staged.itineraryLines.length > 0) draft._agentItineraryQueue = staged.itineraryLines;
     if (Array.isArray(staged.hotelPreferences) && staged.hotelPreferences.length > 0) draft._agentHotelPrefs = staged.hotelPreferences;
+    if (staged.agentNameHint) draft._agentNameHint = staged.agentNameHint;
   }
   // yn === false: staged data is simply discarded - draft.fields is untouched, so every field just
   // gets asked about normally below, same as if nothing had ever been extracted.
 
   draft.basicStarted = true;
   draft.phase = 'basic';
-  const prompt = basicNextPrompt(draft);
+  const prompt = await basicNextPrompt(draft);
   return { reply: prompt, draft };
 }
 
@@ -951,6 +988,24 @@ async function stepBasic(draft, userMessage) {
       break;
     }
 
+    // The agent named in a pasted message (see agentNameStepPrompt), staged for a yes/change
+    // confirm rather than applied outright - same pattern as hotelCollect's own 'hotelPrefConfirm'.
+    case 'agentNameConfirm': {
+      const yn = parseYesNo(answer);
+      if (yn === true) {
+        draft.resolvedAgent = draft._pendingAgentMatch;
+        draft.fields.agentName = draft._pendingAgentMatch.Name;
+        delete draft._pendingAgentMatch;
+        break;
+      }
+      if (yn === false || /change|different|edit|select/i.test(answer)) {
+        delete draft._pendingAgentMatch;
+        draft.basicCurrentStep = 'agentName';
+        return { reply: basicStepPrompt('agentName', draft), draft };
+      }
+      return { reply: `Is **${draft._pendingAgentMatch.Name}** the right agent? Reply "yes" to keep it, or "change" to pick a different one.`, draft };
+    }
+
     case 'agentName': {
       const agents = await findAgent(answer);
       // findAgent tries an exact (case-insensitive) name match first and only falls back to a fuzzy
@@ -1039,6 +1094,7 @@ async function stepBasic(draft, userMessage) {
   }
 
   const next = nextBasicStep(draft);
+  if (next === 'agentName') return { reply: await agentNameStepPrompt(draft), draft };
   if (next) {
     draft.basicCurrentStep = next;
     return { reply: basicStepPrompt(next, draft), draft };
@@ -1140,7 +1196,7 @@ async function stepAgentCreate(draft, userMessage) {
     if (!created.Phone || !created.Email) {
       delete draft.agentCreateStep;
       draft.phase = 'basic';
-      return { reply: `${notice}\n\n${basicNextPrompt(draft)}`, draft };
+      return { reply: `${notice}\n\n${await basicNextPrompt(draft)}`, draft };
     }
 
     draft.agentCreateStep = 'sameAsGuest';
@@ -1158,7 +1214,7 @@ async function stepAgentCreate(draft, userMessage) {
   }
   delete draft.agentCreateStep;
   draft.phase = 'basic';
-  return { reply: basicNextPrompt(draft), draft };
+  return { reply: await basicNextPrompt(draft), draft };
 }
 
 // ---------- phase: hotel (fully deterministic - one field at a time, same reasoning as Basic) ----------

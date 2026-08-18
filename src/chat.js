@@ -986,6 +986,16 @@ function quickRepliesFor(draft) {
       { label: 'Change it', value: 'change', autoSend: true },
     ];
   }
+  // The agent/company named in a pasted message (e.g. "Ajay Modi Travels" as the sender) - see
+  // bookingFlow.js's agentNameStepPrompt - is only ever a suggestion, never applied outright.
+  // "Change it" drops straight into the normal agentName question, which already shows the live
+  // agent-search dropdown (see expectingField's own basic/agentName case).
+  if (draft && draft.phase === 'basic' && draft.basicCurrentStep === 'agentNameConfirm') {
+    return [
+      { label: `Yes, that's correct`, value: 'yes', autoSend: true },
+      { label: 'Change it', value: 'change', autoSend: true },
+    ];
+  }
   // A hotel the pasted agent message named for a destination (e.g. "Phuket: Andakira or similar
   // category") - see bookingFlow.js's stageHotelPreference - is only ever a suggestion, never
   // applied outright. "Change it" drops straight into the normal hotelName question, which already
@@ -2893,7 +2903,11 @@ async function handleChatInner(sessionId, userMessage) {
   // Handled deterministically against the real /Jobsheet/GetBookingById endpoint, never guessed.
   const jobSheetCopyIntent = jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST());
   if (jobSheetCopyIntent) {
-    const jobSheetPerm = requirePermission(session.role, 'Job Sheet', 'addedit');
+    // Copy-for-Customer/Copy-Booking only reads and formats existing job sheet text - it never
+    // changes anything, so either View OR Add/Edit access to Job Sheet is enough; a role with just
+    // one of the two checked shouldn't be blocked from a read-only action.
+    const jobSheetViewPerm = requirePermission(session.role, 'Job Sheet', 'view');
+    const jobSheetPerm = jobSheetViewPerm.allowed ? jobSheetViewPerm : requirePermission(session.role, 'Job Sheet', 'addedit');
     if (!jobSheetPerm.allowed) {
       pushTurn(sessionId, userMessage, jobSheetPerm.message);
       return { answer: jobSheetPerm.message, sql: null, rowCount: 0 };
