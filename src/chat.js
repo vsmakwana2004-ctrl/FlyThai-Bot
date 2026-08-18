@@ -143,6 +143,22 @@ const FREEFORM_OPTIONAL_COLLECT_PHASES = [
 function detectAnyFreshIntent(userMessage, session) {
   if (session.draft && FREEFORM_OPTIONAL_COLLECT_PHASES.includes(session.draft.phase)) return false;
 
+  // Selecting an item from a pendingRecordChoice/pendingAmbiguousDetail dropdown sends back that
+  // item's own BookingId/QuotationId as plain text - which is very often a DIFFERENT code from
+  // whatever the pending state itself is keyed on (a guest name for a name-based match, or no code
+  // at all for pendingAmbiguousDetail). Checked before anything else below, so picking a real
+  // candidate off the list is never mistaken for a fresh, unrelated code-bearing message. Reproduced
+  // live: selecting a status-change dropdown result for a name match ("vandit") got treated as
+  // switching context to a plain "show me this booking" lookup, silently dropping the pending status
+  // change and showing a Booking Summary instead.
+  const pendingChoice = session.pendingRecordChoice || session.pendingAmbiguousDetail;
+  if (pendingChoice) {
+    const pickedCodeMatch = userMessage.match(ANY_CODE_RE);
+    if (pickedCodeMatch && pendingChoice.matches.some((m) => (m.BookingId || m.QuotationId || '').toUpperCase() === pickedCodeMatch[0].toUpperCase())) {
+      return false;
+    }
+  }
+
   // A bare completion/status-value word ("done", "skip", "pending"...) is ambiguous between "finish
   // the step I'm already answering" and a fuzzy status-change follow-up - while a guided flow
   // (session.draft) is active, its own interpretation of that word wins; only an EXPLICIT change
@@ -1215,12 +1231,21 @@ async function handleChat(sessionId, userMessage, role) {
 // field-edit/itinerary-edit/status-change all hit this the same way - see documents.js's
 // resolveBookingByCode for why QuotationId isn't guaranteed unique). kind/extra are stashed on
 // session.pendingRecordChoice so the next message can resume the right flow via resumeRecordChoice.
+// Rendered as the same real dropdown popover respondAmbiguousDetail below uses (not a numbered text
+// list) - picking one is "select from these real records", not free text.
 function askWhichRecord(sessionId, session, userMessage, code, matches, kind, extra) {
-  const list = matches.map((m, i) => `${i + 1}. ${documents.describeMatch(m)}`).join('\n');
-  const reply = `More than one record matches **${code}** — which one did you mean?\n\n${list}\n\n(Reply with the number.)`;
+  const reply = `More than one record matches **${code}** — select the one you meant below.`;
   session.pendingRecordChoice = { code, matches, kind, extra };
   pushTurn(sessionId, userMessage, reply);
-  return { answer: reply, sql: null, rowCount: 0 };
+  return {
+    answer: reply,
+    sql: null,
+    rowCount: matches.length,
+    expecting: {
+      field: 'ambiguousDetail',
+      options: matches.map((m) => ({ Id: m.Id, Name: m.BookingId || m.QuotationId, ShortCode: m.GuestName })),
+    },
+  };
 }
 
 // Same "which one did you mean?" situation as askWhichRecord above, but for the two read-only
@@ -1876,7 +1901,7 @@ async function resumeRecordChoice(sessionId, session, pending, chosen, userMessa
   const result = await statusUpdate.startWithBooking(chosen, pending.extra.userMessage);
   session.pendingStatusChange = result.pending;
   pushTurn(sessionId, userMessage, result.reply);
-  return { answer: result.reply, sql: null, rowCount: 0 };
+  return { answer: result.reply, sql: null, rowCount: 0, quickReplies: result.pending && result.pending.awaitingConfirm ? YES_NO_CHIPS : undefined };
 }
 
 // FTQ... codes are quotations, FT... codes (no Q) are confirmed bookings (see schema.js's
@@ -1983,9 +2008,16 @@ async function handleChatInner(sessionId, userMessage) {
   if (codeInMessage) {
     const newCode = codeInMessage[0].toUpperCase();
     for (const key of ['pendingStatusChange', 'pendingDocChoice', 'pendingHotelChoice', 'pendingCodeChoice', 'pendingRecordChoice', 'pendingItinerary', 'pendingConvertConfirm', 'pendingFieldEditConfirm']) {
-      if (session[key] && session[key].code && session[key].code !== newCode) {
-        session[key] = null;
-      }
+      const state = session[key];
+      if (!state || !state.code || state.code === newCode) continue;
+      // pendingCodeChoice/pendingRecordChoice's own .code can be a placeholder (e.g. a guest name
+      // for a name-based match, not a real FT/FTQ code) rather than the record's actual code - if
+      // the new code is one of THIS state's own candidate matches, it's the answer to the pending
+      // "which one?" question, not a switch to a different record, so don't clear it (reproduced
+      // live: picking a status-change dropdown result for a name-based match wiped the pending flow
+      // because its "vandit" placeholder never equals a real code).
+      if (Array.isArray(state.matches) && state.matches.some((m) => (m.BookingId || m.QuotationId || '').toUpperCase() === newCode)) continue;
+      session[key] = null;
     }
     // An active itinerary-edit draft (session.draft with editMode true) carries its own record's
     // code the same way the pending-question states above do, but wasn't covered by this guard -
@@ -2003,7 +2035,7 @@ async function handleChatInner(sessionId, userMessage) {
     const { reply, pending } = await statusUpdate.step(session.pendingStatusChange, userMessage);
     session.pendingStatusChange = pending;
     pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    return { answer: reply, sql: null, rowCount: 0, quickReplies: pending && pending.awaitingConfirm ? YES_NO_CHIPS : undefined };
   }
 
   // Standalone "add a new agent/company" conversation (see agentCreate.js) - entirely separate
@@ -2144,12 +2176,24 @@ async function handleChatInner(sessionId, userMessage) {
   if (session.pendingRecordChoice) {
     const pending = session.pendingRecordChoice;
     const t = userMessage.trim();
-    const chosen = /^\d+$/.test(t) ? pending.matches[Number(t) - 1] : null;
+    // Selecting a dropdown item sends its own BookingId/QuotationId back as plain text - match that
+    // first. A bare number still works too (old-style typed reply, or if the dropdown didn't render
+    // for some reason), and a partial code/name that narrows to exactly one candidate commits
+    // directly - same fallback chain pendingAmbiguousDetail's own dropdown resolution uses below.
+    const codeMatch = t.match(ANY_CODE_RE);
+    let chosen = codeMatch ? pending.matches.find((m) => (m.BookingId || m.QuotationId || '').toUpperCase() === codeMatch[0].toUpperCase()) : null;
+    if (!chosen && /^\d+$/.test(t)) chosen = pending.matches[Number(t) - 1] || null;
+    if (!chosen && t) {
+      const q = t.toLowerCase();
+      const fuzzyMatches = pending.matches.filter((m) => {
+        const code = (m.BookingId || m.QuotationId || '').toLowerCase();
+        const name = (m.GuestName || '').toLowerCase();
+        return code.includes(q) || name.includes(q);
+      });
+      if (fuzzyMatches.length === 1) chosen = fuzzyMatches[0];
+    }
     if (!chosen) {
-      const list = pending.matches.map((m, i) => `${i + 1}. ${documents.describeMatch(m)}`).join('\n');
-      const reply = `Please reply with just the number of the record you meant:\n\n${list}`;
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
+      return askWhichRecord(sessionId, session, userMessage, pending.code, pending.matches, pending.kind, pending.extra);
     }
     session.pendingRecordChoice = null;
     return resumeRecordChoice(sessionId, session, pending, chosen, userMessage);
@@ -2841,7 +2885,7 @@ async function handleChatInner(sessionId, userMessage) {
     }
     session.pendingStatusChange = result.pending;
     pushTurn(sessionId, userMessage, result.reply);
-    return { answer: result.reply, sql: null, rowCount: 0 };
+    return { answer: result.reply, sql: null, rowCount: 0, quickReplies: result.pending && result.pending.awaitingConfirm ? YES_NO_CHIPS : undefined };
   }
 
   // A request for the real Job Sheet page's own "Copy For Customer"/"Copy Booking" text (see

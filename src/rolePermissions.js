@@ -14,6 +14,14 @@ const { getPool } = require('./db');
 // call or session cookie at all.
 
 const REFRESH_INTERVAL_MS = 20 * 60 * 1000;
+// A role/permission edit on FlyThai's own /Role/Index bumps Roles.UpdatedOn or
+// AdminPageRoleMapping.UpdatedOn - polling just MAX(that) every few seconds is a single cheap
+// aggregate (no join, no per-row data), so it can run far more often than a full cache rebuild
+// without meaningfully loading the database. The full refresh (fetchRolesAndPermissions) only runs
+// when this cheap check actually finds a newer timestamp than last seen - see
+// checkForChangesAndRefreshIfNeeded. REFRESH_INTERVAL_MS/isStale() below stay as a hard-ceiling
+// fallback in case this check ever misses something (e.g. a row edited without bumping UpdatedOn).
+const STALE_CHECK_INTERVAL_MS = 15 * 1000;
 // The one page whose permission gates whether a role can use the chatbot AT ALL - distinct from the
 // per-capability pages (Booking, Agents Configuration, ...) checked once past this gate.
 const CHAT_BOT_PAGE = 'Chat Bot System';
@@ -23,6 +31,7 @@ let roleList = []; // [{ id, roleName }]
 let lastRefreshedAt = 0;
 let lastRefreshError = null;
 let refreshing = null; // in-flight refresh promise, so concurrent staleness checks don't pile up requests
+let lastKnownChangeAt = null; // Date - the newest Roles/AdminPageRoleMapping UpdatedOn seen so far
 
 async function fetchRolesAndPermissions() {
   const pool = await getPool();
@@ -73,9 +82,43 @@ async function refreshPermissions() {
   return refreshing;
 }
 
+// The cheap half of the staleness check - just the newest UpdatedOn across the two tables an
+// Admin's role/permission edit actually touches, no role/page data itself. CreatedOn covers a
+// brand-new role/mapping row whose UpdatedOn is still NULL (never edited since insert).
+async function fetchLatestChangeTimestamp() {
+  const pool = await getPool();
+  const result = await pool.request().query(`
+    SELECT MAX(ts) AS latest FROM (
+      SELECT COALESCE(UpdatedOn, CreatedOn) AS ts FROM Roles WHERE IsDeleted = 0
+      UNION ALL
+      SELECT COALESCE(UpdatedOn, CreatedOn) AS ts FROM AdminPageRoleMapping
+    ) x
+  `);
+  return result.recordset[0] && result.recordset[0].latest ? new Date(result.recordset[0].latest) : null;
+}
+
+// Runs every STALE_CHECK_INTERVAL_MS - only triggers the real (heavier) refreshPermissions() when
+// the cheap check above actually finds something newer than last seen, so a role edit on FlyThai's
+// side is picked up within seconds instead of waiting out the full REFRESH_INTERVAL_MS.
+async function checkForChangesAndRefreshIfNeeded() {
+  try {
+    const latest = await fetchLatestChangeTimestamp();
+    if (latest && (!lastKnownChangeAt || latest > lastKnownChangeAt)) {
+      lastKnownChangeAt = latest;
+      await refreshPermissions();
+    }
+  } catch (err) {
+    console.error('Role-permission staleness check failed:', err.message);
+  }
+}
+
 // Called once at server startup - blocking, so the very first request never races an empty cache.
 async function initRolePermissions() {
   await refreshPermissions();
+  lastKnownChangeAt = await fetchLatestChangeTimestamp().catch(() => null);
+  setInterval(checkForChangesAndRefreshIfNeeded, STALE_CHECK_INTERVAL_MS);
+  // Kept as a hard-ceiling safety net alongside the fast check above - see isStale()'s own use in
+  // getRoleList()/canUseBot(), which this interval backs up in case a request arrives in between.
   setInterval(refreshPermissions, REFRESH_INTERVAL_MS);
 }
 
