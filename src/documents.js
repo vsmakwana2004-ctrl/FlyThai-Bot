@@ -1,4 +1,5 @@
 const { getPool } = require('./db');
+const { fuzzyWordMatch } = require('./fuzzyMatch');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 // Same guest-name extraction convention as bookingDetails.js/accountTransactions.js - "of"/"for"
@@ -16,52 +17,17 @@ function extractGuestName(text) {
   return name;
 }
 
-// Plain Levenshtein edit distance, used below so a typo'd trigger word ("downlode", "qutaion")
-// still matches instead of silently falling through to a completely different (wrong) response
-// path - reproduced live: "downlode qutaion of FTQ09260005" matched none of these words exactly,
-// so the message fell through to an ordinary detail lookup instead of offering a PDF link, with no
-// error or sign anything had gone wrong.
-function levenshtein(a, b) {
-  const m = a.length;
-  const n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
-    }
-  }
-  return dp[m][n];
-}
-
 // Known false-positive collisions: a common, unrelated English word that happens to fall within
-// the Levenshtein tolerance below for one of the fuzzy targets, so a blanket tolerance can't
-// exclude it without also losing genuine typo tolerance for that target - reproduced live:
-// "general" (as in "general remarks noted") is edit-distance 2 from "generate", the exact same
-// distance a real typo like "generat"/"genrate" needs to still match, so "general" was silently
-// treated as a typo'd "generate PDF" request and asked "which booking is that for?" on an
+// fuzzyWordMatch's (see ./fuzzyMatch) Levenshtein tolerance for one of the fuzzy targets, so a
+// blanket tolerance can't exclude it without also losing genuine typo tolerance for that target -
+// reproduced live: "general" (as in "general remarks noted") is edit-distance 2 from "generate", the
+// exact same distance a real typo like "generat"/"genrate" needs to still match, so "general" was
+// silently treated as a typo'd "generate PDF" request and asked "which booking is that for?" on an
 // unrelated job-sheet question. Checked as an exact-word denylist per target instead of loosening
 // the tolerance globally.
 const FUZZY_EXCLUDE = {
   generate: ['general', 'generally', 'generic', 'generous'],
 };
-
-// True if any word in `text` is an exact or near-exact (typo-tolerant) match for one of `targets`.
-// Tolerance scales with word length so short words ("pdf") still require an exact/near-exact hit
-// rather than matching almost anything.
-function fuzzyWordMatch(text, targets) {
-  const words = text.toLowerCase().match(/[a-z]+/g) || [];
-  for (const w of words) {
-    for (const target of targets) {
-      if (w === target) return true;
-      if ((FUZZY_EXCLUDE[target] || []).includes(w)) continue;
-      const maxDist = target.length <= 4 ? 1 : 2;
-      if (Math.abs(w.length - target.length) <= maxDist && levenshtein(w, target) <= maxDist) return true;
-    }
-  }
-  return false;
-}
 
 // "Invoice" and "quotation" both mean the same underlying cost-report PDF (GetReportPdf) - a
 // BookingMaster row is a Booking or a Quotation (IsBooking flag), and staff naturally call that
@@ -78,10 +44,10 @@ const DOWNLOAD_VERB_WORDS = ['download', 'pdf', 'generate'];
 // requests, even though they pair "give" with a report word - the word "details"/"info" is what
 // actually disambiguates them from "give me the quotation" (a real, if weakly-worded, PDF ask).
 const DETAIL_WORDS = ['detail', 'details', 'info', 'information'];
-const REPORT_RE = { test: (text) => fuzzyWordMatch(text, REPORT_WORDS) };
-const ITINERARY_RE = { test: (text) => fuzzyWordMatch(text, ITINERARY_WORDS) };
-const DOWNLOAD_VERB_RE = { test: (text) => fuzzyWordMatch(text, DOWNLOAD_VERB_WORDS) };
-const DETAIL_RE = { test: (text) => fuzzyWordMatch(text, DETAIL_WORDS) };
+const REPORT_RE = { test: (text) => fuzzyWordMatch(text, REPORT_WORDS, FUZZY_EXCLUDE) };
+const ITINERARY_RE = { test: (text) => fuzzyWordMatch(text, ITINERARY_WORDS, FUZZY_EXCLUDE) };
+const DOWNLOAD_VERB_RE = { test: (text) => fuzzyWordMatch(text, DOWNLOAD_VERB_WORDS, FUZZY_EXCLUDE) };
+const DETAIL_RE = { test: (text) => fuzzyWordMatch(text, DETAIL_WORDS, FUZZY_EXCLUDE) };
 
 // Verified against the real site's "Download PDF" popup (options query param on GetItineraryPdf):
 // 1 = With FlyThai Logo (also the old default before this 3-way choice existed), 2 = With Agent
@@ -106,7 +72,7 @@ function detectDocumentIntent(text, fallbackCode) {
   // details" is a normal text lookup, not a file request - so those only count when paired with a
   // specific document word (invoice/itinerary/hotel voucher) that removes the ambiguity.
   const hasStrongVerb = DOWNLOAD_VERB_RE.test(text);
-  const hasWeakVerb = (isHotelVoucher || isItinerary || isReport) && fuzzyWordMatch(text, ['give', 'send']) && !DETAIL_RE.test(text);
+  const hasWeakVerb = (isHotelVoucher || isItinerary || isReport) && fuzzyWordMatch(text, ['give', 'send'], FUZZY_EXCLUDE) && !DETAIL_RE.test(text);
   if (!hasStrongVerb && !hasWeakVerb) return null;
 
   // A real file request was made (strong or weak verb matched above) but there's no code to work

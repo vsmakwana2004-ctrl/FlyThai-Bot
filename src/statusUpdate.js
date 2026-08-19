@@ -2,14 +2,36 @@ const { getPool } = require('./db');
 const { updateBookingStatus } = require('./bookingApi');
 const { callLLM } = require('./llm');
 const { resolveBookingByCode, resolveBookingByGuestName, extractGuestName } = require('./documents');
+const { fuzzyWordMatch } = require('./fuzzyMatch');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 const BARE_NUMBER_RE = /\b\d{4,}\b/;
 // Needs a change-verb, AND either the word "status" or one of the real status values, so plain
 // read questions ("what is the payment status of FT...") never get routed into the write flow,
 // while short pronoun follow-ups ("change that to done") still get caught.
-const CHANGE_VERB_RE = /\b(change|update|set|mark|make)\b/i;
-const STATUS_WORD_RE = /\bstatus\b/i;
+// "set" is deliberately matched exactly, not fuzzily - it's only 3 letters, so a typo-tolerant
+// check on it would also match "sit"/"sat"/"get"/"yet"/"let"/"bet"/... (all edit-distance 1), which
+// would misfire on completely unrelated messages far more often than it'd catch a genuine "st"/"et"
+// typo of "set".
+const CHANGE_VERB_EXACT_RE = /\bset\b/i;
+const CHANGE_VERB_WORDS = ['change', 'update', 'mark', 'make'];
+// Real, common English words that happen to fall within fuzzyWordMatch's typo tolerance for one of
+// the words above - checked as an exact-word denylist per target (see documents.js's own
+// FUZZY_EXCLUDE for the same "generate"/"general" situation) so genuine typos of these words
+// ("chnge", "updat", "mak") still match without also treating "any chance", "a spark of", or "let's
+// grab a bite and cake" as a status-change instruction.
+const CHANGE_VERB_EXCLUDE = {
+  change: ['chance', 'chances'],
+  mark: ['park', 'parks', 'dark', 'bark', 'hark', 'spark', 'sparks'],
+  make: ['lake', 'lakes', 'cake', 'cakes', 'bake', 'bakes', 'take', 'takes', 'wake', 'wakes', 'fake', 'rake', 'sake', 'made'],
+};
+function matchesChangeVerb(text) {
+  return CHANGE_VERB_EXACT_RE.test(text) || fuzzyWordMatch(text, CHANGE_VERB_WORDS, CHANGE_VERB_EXCLUDE);
+}
+const STATUS_WORD_WORDS = ['status'];
+function matchesStatusWord(text) {
+  return fuzzyWordMatch(text, STATUS_WORD_WORDS);
+}
 const VALUE_WORD_RE = /\b(done|sent|pending|cancelled|canceled|closed|created|self\s*booked|partial[- ]?paid|on[- ]?tour|up[- ]?coming|upcoming)\b/i;
 // A message that's clearly asking something, not telling us to do something - never treat these
 // as an action even if they happen to contain a status value word (e.g. "is payment pending?").
@@ -48,8 +70,8 @@ const STATUS_TYPES = {
 // EXPLICIT change instruction (a real change-verb) is trusted to interrupt something else already
 // running. Real dispatch-time calls (nothing else active) keep the default fuzzy matching.
 function detectStatusUpdateIntent(text, fallbackCode, { allowFuzzy = true } = {}) {
-  const hasChangeVerb = CHANGE_VERB_RE.test(text);
-  const hasStatusWord = STATUS_WORD_RE.test(text);
+  const hasChangeVerb = matchesChangeVerb(text);
+  const hasStatusWord = matchesStatusWord(text);
   const hasValueWord = VALUE_WORD_RE.test(text);
 
   const explicitSignal = hasChangeVerb && (hasStatusWord || hasValueWord);

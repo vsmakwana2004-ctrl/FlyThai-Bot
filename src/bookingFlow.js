@@ -546,10 +546,45 @@ async function stepAgentPaste(draft, userMessage) {
     }
   }
 
+  // Day-by-day itinerary lines and per-destination hotel preferences - also staged, not applied,
+  // until the same yes/no gate below. Only well-formed entries are kept (a real day number and a
+  // recognised type) - anything the model returned outside that shape is dropped rather than risk
+  // acting on it. Actually resolving these against real hotel/pickup/transfer/sightseeing records
+  // happens later, lazily, once the itinerary/hotel phase is actually reached (see
+  // processAgentItineraryQueue and applyAgentHotelPreference) - never here, and never against
+  // anything other than the same lookup functions/matching rules the manual flow itself uses.
+  // Computed BEFORE travelDate below so its own day-count is available for the estimated-return-date
+  // preview shown right under Travel Date.
+  const itineraryLines = Array.isArray(parsed.itineraryLines)
+    ? parsed.itineraryLines.filter((l) => l && Number.isFinite(Number(l.day)) && ['transfer', 'sightseeing', 'leisure'].includes(l.type))
+    : [];
+  const hotelPreferences = Array.isArray(parsed.hotelPreferences)
+    ? parsed.hotelPreferences.filter((p) => p && p.destinationName && p.hotelName)
+    : [];
+  // itineraryLines.length counts LINE ITEMS, not days - a day whose line describes two movements
+  // ("X to Y transfer + A to B transfer") is deliberately split into two same-day entries above, so
+  // a 13-day trip with one such day yields 14 items. Showing that raw count read as if it were the
+  // day count ("14 day-item(s) detected" on a message that plainly says "Day 13: ...") looked like
+  // the trip length itself was miscounted - reproduced live. Use only the real day count (the
+  // highest day number actually seen), never the raw item count, so this can't happen again.
+  const itineraryDayCount = itineraryLines.length > 0 ? new Set(itineraryLines.map((l) => Number(l.day))).size : 0;
+
   const travelDateObj = parsed.travelDate ? parseDateDDMMYYYY(parsed.travelDate) : null;
   if (travelDateObj && travelDateObj >= todayDateObjIST()) {
     staged.travelDate = parsed.travelDate;
     filled.push(`Travel Date: ${parsed.travelDate}`);
+    // A preview only (not staged onto draft.fields.returnDate) - the itinerary-done step further
+    // into this same flow (askReturnDateConfirm/maxKnownItineraryDay) still asks the user to
+    // confirm or change it once the itinerary is actually built; this just surfaces that same
+    // estimate here too, right under the travel date, instead of only much later. Skipped when the
+    // message already gave an explicit return date (shown on its own line right below instead).
+    if (!parsed.returnDate && itineraryDayCount > 0) {
+      const estimatedReturnObj = new Date(travelDateObj);
+      estimatedReturnObj.setDate(estimatedReturnObj.getDate() + itineraryDayCount - 1);
+      const dd = String(estimatedReturnObj.getDate()).padStart(2, '0');
+      const mm = String(estimatedReturnObj.getMonth() + 1).padStart(2, '0');
+      filled.push(`Return Date (estimated from the ${itineraryDayCount}-day itinerary): ${dd}-${mm}-${estimatedReturnObj.getFullYear()}`);
+    }
   }
   const returnDateObj = parsed.returnDate ? parseDateDDMMYYYY(parsed.returnDate) : null;
   if (returnDateObj && staged.travelDate && returnDateObj > parseDateDDMMYYYY(staged.travelDate)) {
@@ -574,21 +609,8 @@ async function stepAgentPaste(draft, userMessage) {
     filled.push(`Infants: ${infantsNum}`);
   }
 
-  // Day-by-day itinerary lines and per-destination hotel preferences - also staged, not applied,
-  // until the same yes/no gate below. Only well-formed entries are kept (a real day number and a
-  // recognised type) - anything the model returned outside that shape is dropped rather than risk
-  // acting on it. Actually resolving these against real hotel/pickup/transfer/sightseeing records
-  // happens later, lazily, once the itinerary/hotel phase is actually reached (see
-  // processAgentItineraryQueue and applyAgentHotelPreference) - never here, and never against
-  // anything other than the same lookup functions/matching rules the manual flow itself uses.
-  const itineraryLines = Array.isArray(parsed.itineraryLines)
-    ? parsed.itineraryLines.filter((l) => l && Number.isFinite(Number(l.day)) && ['transfer', 'sightseeing', 'leisure'].includes(l.type))
-    : [];
-  const hotelPreferences = Array.isArray(parsed.hotelPreferences)
-    ? parsed.hotelPreferences.filter((p) => p && p.destinationName && p.hotelName)
-    : [];
   if (itineraryLines.length > 0) {
-    filled.push(`Itinerary: ${itineraryLines.length} day-item(s) detected — I'll try to build these automatically once we reach that step, and only ask about whatever doesn't match a real record.`);
+    filled.push(`Itinerary: ${itineraryDayCount} day(s) found — I'll try to build these automatically once we reach that step, and only ask about whatever doesn't match a real record.`);
   }
   if (hotelPreferences.length > 0) {
     filled.push(`Hotel preferences: ${hotelPreferences.map((p) => `${p.destinationName} → ${p.hotelName}`).join(', ')}`);

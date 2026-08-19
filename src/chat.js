@@ -176,7 +176,17 @@ function detectAnyFreshIntent(userMessage, session) {
     detectEditMenuIntent(userMessage, session.lastBookingCode) ||
     bookingFlow.detectCreateIntent(userMessage) ||
     agentCreate.detectAgentCreateIntent(userMessage) ||
-    statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode, { allowFuzzy: statusFuzzyOk }) ||
+    // Same "don't let a flow interrupt itself" reasoning as the session.draft check above, for the
+    // OTHER pending state this same detector can fire against - a status-change conversation already
+    // in progress (session.pendingStatusChange) is the correct, comprehensive handler for whatever
+    // comes next (statusUpdate.step matches known types/values and falls back to a full LLM extract
+    // for anything else), so this detector re-firing on a plain answer to its OWN question ("sent",
+    // "invoice") must never be treated as a fresh interrupting request. Reproduced live: answering
+    // the "which value?" step with "sent" (a bare value word, with the same booking code already in
+    // session.lastBookingCode) matched detectStatusUpdateIntent's fuzzy-follow-up signal, which
+    // paused/wiped the very statusChange conversation it was supposed to be answering and started a
+    // brand-new one with no statusType yet - an infinite Invoice/sent loop, never reaching confirm.
+    (!session.pendingStatusChange && statusUpdate.detectStatusUpdateIntent(userMessage, session.lastBookingCode, { allowFuzzy: statusFuzzyOk })) ||
     jobSheetCopy.detectJobSheetCopyIntent(userMessage, session.lastBookingCode, todayIST()) ||
     documents.detectDocumentIntent(userMessage, session.lastBookingCode) ||
     (!ANY_CODE_RE.test(userMessage) && financeReports.detectFinanceReportIntent(userMessage)) ||
@@ -313,6 +323,27 @@ function dedupeExactRows(rows) {
     result.push(row);
   }
   return result;
+}
+
+// The chatbot's own "View N records" side-drawer is a raw dump of whatever columns a query
+// selected - unlike the real admin panel's own grids, which never show a table's raw internal
+// primary key (BookingMaster.Id, Agents.Id, ...) to staff at all, only human-facing codes
+// (BookingId/QuotationId) or names. schema.js documents Id as the first column of every table, so
+// an LLM-written SELECT very often includes it - reproduced live: "list of booking done by priya"
+// showed a raw internal Id column (125, 169, 92, ...) in the results table that has no equivalent
+// column on the real Booking list page at all. Strips a literal `Id` key (case-insensitive) from
+// every row before it ever reaches the client, regardless of which table/query it came from.
+function stripInternalIdColumn(rows) {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row) => {
+    if (!row || typeof row !== 'object') return row;
+    const clean = {};
+    for (const key of Object.keys(row)) {
+      if (key.toLowerCase() === 'id') continue;
+      clean[key] = row[key];
+    }
+    return clean;
+  });
 }
 
 // A LEFT JOIN to Destination (or hotels/itinerary) returns one row per joined child, so the same
@@ -603,7 +634,7 @@ async function finishFullDetailAnswer(sessionId, userMessage, resolved) {
 // Same idea for a resolved (status 'ok') account-transactions lookup.
 function finishAcctTxnAnswer(sessionId, userMessage, result) {
   const reply = accountTransactions.formatAccountTransactionsAnswer(result);
-  const rows = [...result.salePurchase, ...result.receiptPayment];
+  const rows = stripInternalIdColumn([...result.salePurchase, ...result.receiptPayment]);
   pushTurn(sessionId, userMessage, reply);
   return { answer: reply, sql: null, rowCount: rows.length, rows: rows.length ? rows : undefined, rowsTruncated: false };
 }
@@ -3202,7 +3233,7 @@ async function handleChatInner(sessionId, userMessage) {
     answer,
     sql,
     rowCount: queryResult.rowCount,
-    rows: queryResult.rows,
+    rows: stripInternalIdColumn(queryResult.rows),
     rowsTruncated: queryResult.truncated,
   };
 }

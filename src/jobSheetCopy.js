@@ -2,6 +2,7 @@ const { getPool } = require('./db');
 const { safeFetch } = require('./bookingApi');
 const { resolveBookingByCode } = require('./documents');
 const { getFlythaiCookie } = require('./requestContext');
+const { fuzzyWordMatch } = require('./fuzzyMatch');
 
 const CODE_RE = /\bFTQ?\d+\b/i;
 
@@ -23,8 +24,14 @@ function buildHeaders() {
 // picks WHICH job sheet(s) - by a specific FT/FTQ code (every job sheet on that booking) or by a
 // date word (every job sheet whose itinerary item falls on that day) - "vendor copy" is accepted as
 // a synonym for "booking copy" since that's what the booking-copy template is actually used for.
-const CUSTOMER_COPY_RE = /\bcopy\b[\s\S]*\bcustomer\b|\bcustomer\b[\s\S]*\bcopy\b/i;
-const BOOKING_COPY_RE = /\bcopy\s*booking\b|\bbooking\s*copy\b|\bvendor\s*copy\b|\bcopy\s+for\s+vendor\b/i;
+// Typo-tolerant word presence (see ./fuzzyMatch) rather than the exact adjacent-phrase match this
+// used before - same word-presence-only trade-off documents.js's own fuzzy REPORT_RE/ITINERARY_RE/
+// DOWNLOAD_VERB_RE already make (no known false-positive collisions for these particular words yet,
+// so no exclude list needed). Lets a typo'd trigger ("cpoy for customer", "boking copy") still match
+// instead of silently falling through to a completely different response.
+function matchesCopyRequest(text, otherWords) {
+  return fuzzyWordMatch(text, ['copy']) && fuzzyWordMatch(text, otherWords);
+}
 const DATE_LITERAL_RE = /\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/;
 
 function addDaysISO(iso, days) {
@@ -53,8 +60,8 @@ function parseDateScope(text, todayISO) {
 // | { type: 'date', dateISO } | null }. scope is null when neither a code nor a date word/literal
 // was found and there's no lastBookingCode to fall back on - the caller must ask which one is meant.
 function detectJobSheetCopyIntent(text, lastBookingCode, todayISO) {
-  const isBookingCopy = BOOKING_COPY_RE.test(text);
-  const isCustomerCopy = !isBookingCopy && CUSTOMER_COPY_RE.test(text);
+  const isBookingCopy = matchesCopyRequest(text, ['booking', 'vendor']);
+  const isCustomerCopy = !isBookingCopy && matchesCopyRequest(text, ['customer']);
   if (!isBookingCopy && !isCustomerCopy) return null;
   const copyType = isBookingCopy ? 'booking' : 'customer';
 
