@@ -1002,16 +1002,32 @@ const authReady = new Promise((resolve) => {
 // Only the real FlyThai admin panel is trusted to postMessage a chatbot_key in - without this
 // check, ANY page that embeds this chatbot in an iframe (or opens it and holds a reference to its
 // window) could postMessage a forged chatbot_key and get logged in as whichever user id it named.
-// Add an origin here for every environment that actually embeds this chatbot (production +
-// whatever local/test IPs are in real use) - a postMessage from anywhere else is silently ignored.
-const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.17:44323', 'https://192.168.1.18:44323', 'https://localhost'];
+// Add an origin here for every real (non-local) environment that actually embeds this chatbot - a
+// postMessage from anywhere else not covered by isTrustedParentOrigin below is silently ignored.
+const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.17:44323', 'https://192.168.1.18:44323'];
+
+// Any localhost/127.0.0.1 origin, on ANY port, is trusted regardless of the fixed list above - a
+// page that can reach this browser's own localhost already means someone has code running on this
+// same machine, the same trust boundary a real dev/test server on a random port would need anyway,
+// so hardcoding one specific local port at a time (and re-adding it every time a test server picks
+// a new one) isn't worth the friction. Never extend this same leniency to a LAN IP (192.168.x.x) -
+// those are reachable by other devices on the network, so those still go through the fixed list.
+function isTrustedParentOrigin(origin) {
+  if (TRUSTED_PARENT_ORIGINS.includes(origin)) return true;
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === 'localhost' || hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
 
 window.addEventListener('message', (event) => {
-  if (!TRUSTED_PARENT_ORIGINS.includes(event.origin)) {
+  if (!isTrustedParentOrigin(event.origin)) {
     // Logged (not silent) specifically for this mismatch class - reproduced live: a postMessage
     // from an untrusted-looking origin is otherwise dropped with zero signal, which reads as "the
     // chatbot just isn't reading the key" when the real cause is a one-IP-off allowlist entry.
-    console.warn(`[chatbot auth] Ignored postMessage from untrusted origin "${event.origin}" - add it to TRUSTED_PARENT_ORIGINS in app.js if this is a real embedding environment.`);
+    console.warn(`[chatbot auth] Ignored postMessage from untrusted origin "${event.origin}" - add it to TRUSTED_PARENT_ORIGINS in app.js if this is a real (non-local) embedding environment.`);
     return;
   }
   const data = event.data;
