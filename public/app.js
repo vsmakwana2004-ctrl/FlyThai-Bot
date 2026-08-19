@@ -1004,7 +1004,7 @@ const authReady = new Promise((resolve) => {
 // window) could postMessage a forged chatbot_key and get logged in as whichever user id it named.
 // Add an origin here for every real (non-local) environment that actually embeds this chatbot - a
 // postMessage from anywhere else not covered by isTrustedParentOrigin below is silently ignored.
-const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.17:44323', 'https://192.168.1.18:44323'];
+const TRUSTED_PARENT_ORIGINS = ['https://flythai.arkinfosoft.in', 'https://192.168.1.11:44323', 'https://192.168.1.17:44323', 'https://192.168.1.18:44323','https://localhost:44323/'];
 
 // Any localhost/127.0.0.1 origin, on ANY port, is trusted regardless of the fixed list above - a
 // page that can reach this browser's own localhost already means someone has code running on this
