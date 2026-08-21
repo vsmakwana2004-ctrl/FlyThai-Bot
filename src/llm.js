@@ -32,13 +32,16 @@ function modelsToTry(preferredModel) {
   return [...new Set(list)];
 }
 
-// GROQ_API_KEY_2 / _3 belong to separate Groq accounts, so each one carries its OWN independent
+// GROQ_API_KEY_2 / _3 / _4 belong to separate Groq accounts, so each one carries its OWN independent
 // daily token quota - one account maxing out for the day does not touch the others. GROQ_API_KEY
 // is always tried first; the rest are fallback-only, used once every model has exhausted it.
 function keysToTry() {
-  const keys = [process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_2, process.env.GROQ_API_KEY_3].filter(
-    (k) => typeof k === 'string' && k.trim()
-  );
+  const keys = [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_2,
+    process.env.GROQ_API_KEY_3,
+    process.env.GROQ_API_KEY_4,
+  ].filter((k) => typeof k === 'string' && k.trim());
   return [...new Set(keys)];
 }
 
@@ -69,6 +72,9 @@ async function callOnce(model, apiKey, messages, temperature) {
   }
 
   const data = await res.json();
+  if (data.usage) {
+    console.log(`[groq usage] model=${model} prompt=${data.usage.prompt_tokens} completion=${data.usage.completion_tokens} total=${data.usage.total_tokens}`);
+  }
   let content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error(`Groq returned an empty response (model ${model})`);
   // Safety net: strip any stray <think>...</think> reasoning trace that slips through.

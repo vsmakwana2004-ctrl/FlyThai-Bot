@@ -76,11 +76,14 @@ const RECEIVABLE_RE =
 // to do with this cross-booking total.
 const PAYMENT_RECEIVED_RE = /\b(payments?\s+(?:received|came\s+in|collected)|receipts?\s+(?:received|total)|money\s+(?:received|came\s+in)|paisa\s+(?:mila|aaya))\b/i;
 // The real system's ProfitReport (hotel-selling-minus-hotel-cost + land-selling-minus-land-cost)
-// only ever exists per single FT/FTQ code (ReportsRepository.GetProfitReportById requires one) -
-// there is no period-total variant anywhere in the real code. Rather than invent a formula with no
-// real precedent (the same trap "quarter" would have been without a clear calendar definition),
-// this is caught separately so it gets an honest "not available as a total" answer instead of a
-// fabricated number from the general planner.
+// only ever exists per single FT/FTQ code (ReportsRepository.GetProfitReportById requires one), and
+// there's no period-total variant anywhere in the real code, nor a single "hotel cost"/"land cost"
+// column anywhere in the schema to reconstruct that exact formula from (hotel cost only exists as
+// scattered Purchase Form ledger legs; land cost only as per-adult/child/infant itinerary/restaurant
+// costs) - replicating it precisely would mean guessing backend logic we can't verify. So "profit"
+// is answered with the same Sale-minus-Purchase Net Revenue figure as "income" (see fetchIncomeReport
+// below) rather than a fabricated hotel/land breakdown - same number, just reachable via this wording
+// too. formatProfitAnswer is explicit that this isn't the real site's per-booking ProfitReport figure.
 const PROFIT_RE = /\b(profit|munafa|margin)\b/i;
 // Catches everything else finance/account-shaped that isn't one of the three specific asks above -
 // "total purchase", "total expenses", "how much did we pay hotels", "net balance", "cash flow" -
@@ -99,7 +102,7 @@ const ACCOUNT_SUMMARY_RE =
 function detectFinanceReportIntent(text) {
   if (RECEIVABLE_RE.test(text)) return { kind: 'receivable', period: null };
   if (PAYMENT_RECEIVED_RE.test(text)) return { kind: 'paymentReceived', period: parsePeriod(text) };
-  if (PROFIT_RE.test(text)) return { kind: 'profitUnsupported', period: null };
+  if (PROFIT_RE.test(text)) return { kind: 'profit', period: parsePeriod(text) };
   if (INCOME_RE.test(text)) return { kind: 'income', period: parsePeriod(text) };
   if (ACCOUNT_SUMMARY_RE.test(text)) return { kind: 'summary', period: parsePeriod(text) };
   return null;
@@ -208,8 +211,14 @@ ${rows}
 Combined, that's **₹${formatMoney(totalINR)}** in INR-equivalent terms (AccountTransaction stores every amount converted to INR internally — the table above undoes that per voucher's own ROE, so each currency shows its real native figure rather than a mislabeled INR amount).`;
 }
 
-function formatProfitUnsupportedAnswer() {
-  return `I don't have a "total profit" figure to give you here — the real site itself only computes profit per single booking/quotation (hotel selling price minus hotel cost, plus land selling minus land cost), never as a period total. If you give me a specific booking/quotation code I can look at what's available for it; otherwise this isn't something I can answer accurately, so I'd rather say that than guess.`;
+function formatProfitAnswer({ period, totalSale, totalPurchase, finalRevenue }) {
+  const periodLabel = period ? period.label : 'all time';
+  return `**Profit for ${periodLabel}** (amounts in INR — AccountTransaction always stores them converted to INR, regardless of the voucher's own currency):
+- Total Sale: ₹${formatMoney(totalSale)}
+- Total Purchase: ₹${formatMoney(totalPurchase)}
+- **Profit (Sale − Purchase): ₹${formatMoney(finalRevenue)}**
+
+Note: this is Net Revenue (Sale Form minus Purchase Form transaction legs), the same figure "income" gives you — the real site's own per-booking ProfitReport (hotel selling − hotel cost + land selling − land cost) has no period-total equivalent, and there's no single "cost" column in the database to rebuild that exact formula from across many bookings at once, so this is the closest accurate total available.`;
 }
 
 // Full breakdown matching dbo.GetAccountReport.sql's own CASE-based bucketing exactly (Sale/
@@ -325,6 +334,7 @@ This is the same Final Amount − Paid Amount calculation the real site's own Re
 module.exports = {
   detectFinanceReportIntent,
   extractPossibleAgentName,
+  parsePeriod,
   fetchIncomeReport,
   formatIncomeAnswer,
   fetchPaymentReceivedReport,
@@ -333,5 +343,5 @@ module.exports = {
   formatReceivableAnswer,
   fetchAccountSummary,
   formatAccountSummaryAnswer,
-  formatProfitUnsupportedAnswer,
+  formatProfitAnswer,
 };

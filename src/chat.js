@@ -1,6 +1,6 @@
 const { callLLM } = require('./llm');
 const { runReadOnlyQuery } = require('./db');
-const { SCHEMA_DOC } = require('./schema');
+const { TABLE_NAMES, buildTableOverview, buildSchemaDoc } = require('./schema');
 const bookingFlow = require('./bookingFlow');
 const documents = require('./documents');
 const bookingDetails = require('./bookingDetails');
@@ -325,21 +325,118 @@ function dedupeExactRows(rows) {
   return result;
 }
 
+// BookingMaster holds BOTH quotations and confirmed bookings in the same rows, split only by the
+// IsBooking bit (see schema.js). A query whose SQL has no explicit IsBooking filter can - as a real
+// bug proved live ("which bookings are travelling this month" returned a quotation among the
+// bookings) - silently mix both types into one answer, even though the user's own wording named
+// only one of them. Detects that mix from whatever the SELECT actually returned (an IsBooking
+// column if selected, or separate non-empty BookingId/QuotationId columns), so the caller can ask
+// for confirmation instead of silently guessing which type the user meant.
+function detectMixedBookingQuotation(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return false;
+  const first = rows[0];
+  const isTrue = (v) => v === true || v === 1 || v === '1';
+  const nonEmpty = (v) => v !== null && v !== undefined && v !== '';
+
+  if (Object.prototype.hasOwnProperty.call(first, 'IsBooking')) {
+    let sawBooking = false;
+    let sawQuotation = false;
+    for (const row of rows) {
+      if (isTrue(row.IsBooking)) sawBooking = true;
+      else sawQuotation = true;
+    }
+    return sawBooking && sawQuotation;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(first, 'BookingId') && Object.prototype.hasOwnProperty.call(first, 'QuotationId')) {
+    let sawBooking = false;
+    let sawQuotation = false;
+    for (const row of rows) {
+      if (nonEmpty(row.BookingId)) sawBooking = true;
+      if (nonEmpty(row.QuotationId)) sawQuotation = true;
+    }
+    return sawBooking && sawQuotation;
+  }
+
+  return false;
+}
+
+// The planner is told to use "TOP N" to keep results small (schema.js), but ANY explicit TOP in the
+// SQL - even "TOP 300", exactly matching the app's own fetch cap - can hide far more real matches
+// than it returns. runReadOnlyQuery's own truncation check only fires when the DB hands back MORE
+// than its 300-row cap, which can NEVER happen when the query's own TOP N already caps it at N <=
+// 300 - SQL Server simply never returns more than N rows, so that check silently never fires no
+// matter how many real rows exist beyond N. (A first version of this only handled N < 300, reasoning
+// "N == 300 will trip the app's own check instead" - that reasoning was wrong: TOP 300 caps the DB's
+// own return at exactly 300, so rows.length can never exceed maxRows(300) either, and the "complete
+// result" assumption goes uncaught exactly at that boundary. Reproduced live: "TOP 300" reported
+// "300 total" when 1,665 really matched.) Rewrites the planner's own SELECT into a COUNT(*) over the
+// same FROM/WHERE (dropping its TOP and any trailing ORDER BY, which SQL Server disallows unparented
+// inside a subquery) so the true total can be fetched directly - independent of how many rows the
+// model chose to display. Returns null only when there's no top-level "SELECT TOP N" prefix at all
+// (a bare SELECT with no LIMIT - the app's own 300-row truncation check already handles that case
+// correctly, since SQL Server then returns everything and lets that check see the real overflow).
+function buildCountVariant(sql) {
+  const topMatch = sql.match(/^\s*SELECT\s+TOP\s+(\d+)\s+/i);
+  if (!topMatch) return null;
+  const topN = parseInt(topMatch[1], 10);
+  if (!Number.isFinite(topN)) return null;
+  const withoutTop = `SELECT ${sql.slice(topMatch[0].length)}`;
+  const withoutOrderBy = withoutTop.replace(/\border\s+by\s+[\s\S]*$/i, '').trim().replace(/;\s*$/, '');
+  return `SELECT COUNT(*) AS TotalCount FROM (${withoutOrderBy}) AS CountSub`;
+}
+
+// buildCountVariant's companion COUNT(*) fixes the STATED TOTAL when a small "TOP N" hides more rows
+// than it returns, but the ROW DATA itself (queryResult.rows) still only ever holds those N rows -
+// and every downstream heuristic that decides HOW to count (hasSurrogateKeyColumn,
+// distinctRecordCount) works from that same limited sample. A small N can make those heuristics see
+// a falsely "clean" slice - e.g. no single booking happened to repeat among just the first 50 of 98
+// extra-bed charge rows, even though 44 distinct bookings really account for all 98 - and wrongly
+// conclude each row is already distinct. Raises any "TOP N" below the app's own 300-row fetch cap up
+// to TOP 300 before the row-fetch (not the COUNT(*) variant above, which must keep the model's own
+// N to stay a faithful rewrite of its query) so those heuristics see up to 300 REAL rows instead of
+// whatever arbitrary N the model picked - for anything under 300 total matches (the common case)
+// this eliminates the sampling bias entirely. Reproduced live: "which bookings have extra bed added"
+// (44 real distinct bookings, 98 raw rows) intermittently reported "98" instead of "44" depending on
+// whether the model's own TOP 50 happened to fetch 50 rows with no repeated booking in that slice.
+function raiseTopToAppCap(sql, cap) {
+  const topMatch = sql.match(/^(\s*SELECT\s+TOP\s+)(\d+)(\s+)/i);
+  if (!topMatch) return sql;
+  const topN = parseInt(topMatch[2], 10);
+  if (!Number.isFinite(topN) || topN >= cap) return sql;
+  return `${topMatch[1]}${cap}${topMatch[3]}${sql.slice(topMatch[0].length)}`;
+}
+
 // The chatbot's own "View N records" side-drawer is a raw dump of whatever columns a query
 // selected - unlike the real admin panel's own grids, which never show a table's raw internal
-// primary key (BookingMaster.Id, Agents.Id, ...) to staff at all, only human-facing codes
-// (BookingId/QuotationId) or names. schema.js documents Id as the first column of every table, so
-// an LLM-written SELECT very often includes it - reproduced live: "list of booking done by priya"
-// showed a raw internal Id column (125, 169, 92, ...) in the results table that has no equivalent
-// column on the real Booking list page at all. Strips a literal `Id` key (case-insensitive) from
-// every row before it ever reaches the client, regardless of which table/query it came from.
+// primary key (BookingMaster.Id, Agents.Id, JobSheetMaster.Id, ...) to staff at all, only
+// human-facing codes (BookingId/QuotationId) or names. schema.js documents Id as the first column
+// of every table, and separately (see the general-rules dedup-anchor rule) asks the planner to
+// SELECT it under whatever alias it likes purely so genuinely-different records don't look
+// byte-identical to dedupeExactRows/distinctRecordCount - reproduced live twice: (1) "list of
+// booking done by priya" showed a raw internal Id column (125, 169, 92, ...); (2) a job sheet query
+// aliased that same anchor column "JobSheetId" instead of leaving it as "Id", which a name-only
+// strip (matching literal "Id" only) never caught, leaking raw internal keys like 1909/2025 into
+// the side-drawer - the drawer showed job sheets tagged with numbers that mean nothing to staff and
+// have no equivalent column in the real Job Sheet page. Strips ANY column - regardless of what the
+// model chose to alias it - whose name ends in "Id" (case-insensitive) AND whose value in every row
+// is a genuine number, never a string. That reliably catches internal integer surrogate keys under
+// any alias while never touching the human-facing codes (BookingId/QuotationId, e.g. 'FT08261781')
+// which are always strings, not numbers.
 function stripInternalIdColumn(rows) {
-  if (!Array.isArray(rows)) return rows;
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const idLikeKeys = new Set();
+  for (const key of Object.keys(rows[0] || {})) {
+    if (!/id$/i.test(key)) continue;
+    if (rows.every((row) => row && (row[key] === null || row[key] === undefined || typeof row[key] === 'number'))) {
+      idLikeKeys.add(key);
+    }
+  }
   return rows.map((row) => {
     if (!row || typeof row !== 'object') return row;
     const clean = {};
     for (const key of Object.keys(row)) {
-      if (key.toLowerCase() === 'id') continue;
+      if (idLikeKeys.has(key)) continue;
       clean[key] = row[key];
     }
     return clean;
@@ -352,7 +449,33 @@ function stripInternalIdColumn(rows) {
 // away, but when it forgets, the answerer must still list each booking once. Counting the distinct
 // codes here is deterministic, so the model is given the exact number of rows to emit instead of
 // having to work it out from the JSON.
-function distinctRecordCount(rows) {
+// Not every repeat of a Booking/Quotation ID is a join fan-out of the SAME record - a query about a
+// child table with many rows per booking (JobSheetMaster: one row per itinerary item, each with its
+// own lunch/dinner status; PaymentMaster/AccountTransaction: one row per transaction) legitimately
+// returns several real, distinct records that just happen to share a booking code. A genuine
+// surrogate primary key column (JobSheetId, TransactionId, PaymentId, ...) is 100% unique across the
+// whole result set by definition - unlike a joined dimension's foreign key (DestinationId,
+// HotelId), which repeats whenever two different bookings share the same destination/hotel. If one
+// is present, each row is already its own distinct record - never collapse those by booking code.
+function hasSurrogateKeyColumn(rows) {
+  if (!rows.length) return false;
+  const sample = rows[0] || {};
+  for (const key of Object.keys(sample)) {
+    if (key === 'BookingId' || key === 'QuotationId' || !/Id$/.test(key)) continue;
+    const values = rows.map((r) => r && r[key]).filter((v) => v !== null && v !== undefined);
+    if (values.length !== rows.length) continue;
+    if (new Set(values.map(String)).size === rows.length) return true;
+  }
+  return false;
+}
+
+// forceCollapse (see computeExpectedCounts's own comment) skips the surrogate-key check entirely -
+// used when the user's OWN question named "booking(s)"/"quotation(s)" as what it wants counted, in
+// which case that's the right count even when the SQL touched a child/detail table with its own
+// perfectly genuine surrogate key (e.g. "which bookings have extra bed added" queries
+// BookingHotelAttributeMapping, whose own Id is real and unique, but the user is counting BOOKINGS,
+// not attribute-mapping rows).
+function distinctRecordCount(rows, forceCollapse) {
   const codes = new Set();
   let sawCodeColumn = false;
   for (const row of rows) {
@@ -363,24 +486,10 @@ function distinctRecordCount(rows) {
     }
   }
   if (!sawCodeColumn) return null;
-
-  // Not every repeat of a Booking/Quotation ID is a join fan-out of the SAME record - a query about
-  // a child table with many rows per booking (JobSheetMaster: one row per itinerary item, each with
-  // its own lunch/dinner status; PaymentMaster/AccountTransaction: one row per transaction) legitimately
-  // returns several real, distinct records that just happen to share a booking code. Collapsing those
-  // down to "1 per booking" (as below) previously turned "1632 job sheets pending" into a wrong "46
-  // bookings," contradicting the raw row count shown in the side drawer. A genuine surrogate primary
-  // key column (JobSheetId, TransactionId, PaymentId, ...) is 100% unique across the whole result set
-  // by definition - unlike a joined dimension's foreign key (DestinationId, HotelId), which repeats
-  // whenever two different bookings share the same destination/hotel. If one is present, each row is
-  // already its own distinct record - don't merge by booking code.
-  const sample = rows[0] || {};
-  for (const key of Object.keys(sample)) {
-    if (key === 'BookingId' || key === 'QuotationId' || !/Id$/.test(key)) continue;
-    const values = rows.map((r) => r && r[key]).filter((v) => v !== null && v !== undefined);
-    if (values.length !== rows.length) continue;
-    if (new Set(values.map(String)).size === rows.length) return null;
-  }
+  // Collapsing down to "1 per booking" below previously turned "1632 job sheets pending" into a
+  // wrong "46 bookings," contradicting the raw row count shown in the side drawer - see
+  // hasSurrogateKeyColumn's own comment for why a surrogate key column changes that.
+  if (!forceCollapse && hasSurrogateKeyColumn(rows)) return null;
 
   return codes.size;
 }
@@ -416,20 +525,80 @@ function buildSample(rows, limit) {
   return sample;
 }
 
-// The single source of truth for "how many rows should the answer's table have". Computed from the
-// FULL result set, never from the sample - deriving it from the sample is exactly what made the
-// model report the sample size as the total.
-function rowCountRule(sampleRows, allRows) {
-  const totalDistinct = distinctRecordCount(allRows);
-  const shownDistinct = distinctRecordCount(sampleRows);
+// The single source of truth for "what's the true total, and how many rows should the answer's
+// table have". Computed from the FULL result set, never from the sample - deriving it from the
+// sample is exactly what made the model report the sample size as the total.
+// knownTotal (optional) is the caller's own best-known true database total - queryResult.rowCount by
+// the time this is called, which by then already accounts for BOTH ways allRows can be a partial
+// view of the real result: (1) the app's own 300-row fetch cap (runReadOnlyQuery reports the raw
+// pre-slice count here), and (2) a small "TOP N" INSIDE the planner's own SQL, which the app-level
+// cap alone can't see past at all (buildCountVariant's companion COUNT(*) query fills this in - see
+// its own comment). Whenever knownTotal is bigger than allRows.length AND the rows carry a genuine
+// surrogate key (hasSurrogateKeyColumn - each row is its own real record), it OVERRIDES every branch
+// below, since none of them can see past whichever of those two capped the fetch - without this,
+// "TOP 50" on a filter matching 1,779 rows reported 35 (a dedup bug on top of the cap) or 50 (just
+// the cap), and separately, a 300-row app-level cap on 1,665 real rows reported "300" as the total.
+// WITHOUT a surrogate key, knownTotal is a raw COUNT(*) that can OVER-count a "how many bookings..."
+// style question - e.g. one booking with 2 hotels both needing an extra bed is 2 raw
+// BookingHotelAttributeMapping rows but 1 real booking. In that case fall through to the same
+// distinct-code counting the non-truncated path already does, on whatever rows were actually
+// fetched - an honest (if sometimes conservative) estimate beats confidently asserting a number
+// known to double-count.
+// userMessage (optional) adds a THIRD override on top of that: even a genuine surrogate key on a
+// child/detail table doesn't make its raw row count the right answer when the user's own question
+// named "booking(s)"/"quotation(s)" as the thing to count - that's a stronger signal of what's being
+// counted than the query's own incidental column choices. Reproduced live: "which bookings have
+// extra bed added" (44 real distinct bookings, 98 raw BookingHotelAttributeMapping rows, which DOES
+// have its own genuine unique Id) intermittently reported "98" whenever the model's SQL happened to
+// select that child table's own real Id alongside the booking code - a real surrogate key, but for
+// the wrong entity relative to what the question actually asked to count.
+function computeExpectedCounts(sampleRows, allRows, knownTotal, userMessage) {
+  const isTruncated = typeof knownTotal === 'number' && knownTotal > allRows.length;
+  // A code column with no surrogate key means rows CAN legitimately share a Booking/Quotation code
+  // (the extra-bed case above) - knownTotal is a raw row count that would double-count them, so it's
+  // only trustworthy when there's no such collapsing to worry about: either no code column at all
+  // (a pure aggregate has nothing to double-count), or a surrogate key confirms each row already is
+  // its own distinct record - AND the question itself didn't override that by naming bookings/
+  // quotations as what it wants counted.
+  const hasCodeColumn = allRows.some((r) => {
+    const code = r && (r.BookingId || r.QuotationId);
+    return typeof code === 'string' && ANY_CODE_RE.test(code);
+  });
+  const forceCollapse = typeof userMessage === 'string' && /\b(bookings?|quotations?)\b/i.test(userMessage);
+  const knownTotalIsTrustworthy = !forceCollapse && (!hasCodeColumn || hasSurrogateKeyColumn(allRows));
+
+  if (isTruncated && knownTotalIsTrustworthy) {
+    return { total: knownTotal, expectedRows: sampleRows.length, truncatedBeyondFetch: true };
+  }
+
+  const totalDistinct = distinctRecordCount(allRows, forceCollapse);
+  const shownDistinct = distinctRecordCount(sampleRows, forceCollapse);
 
   if (totalDistinct === null) {
     // Aggregates, counts, sums - no record codes to reason about.
+    return { total: allRows.length, expectedRows: sampleRows.length, truncatedBeyondFetch: false };
+  }
+  if (shownDistinct < totalDistinct) {
+    return { total: totalDistinct, expectedRows: shownDistinct, truncatedBeyondFetch: false };
+  }
+  return { total: totalDistinct, expectedRows: totalDistinct, truncatedBeyondFetch: false };
+}
+
+function rowCountRule(sampleRows, allRows, knownTotal, userMessage) {
+  const { total, expectedRows, truncatedBeyondFetch } = computeExpectedCounts(sampleRows, allRows, knownTotal, userMessage);
+
+  if (truncatedBeyondFetch) {
+    return `\n\nCOUNTS: only ${allRows.length} of ${total} total matching record(s) were even fetched from the database - the true total is BIGGER than what you're looking at. Your answer MUST state the true total of ${total}, show ${expectedRows} of them as a sample in exactly ${expectedRows} data row(s), and clearly say many more exist beyond what's shown. NEVER report ${allRows.length} or ${expectedRows} as the total.`;
+  }
+
+  const forceCollapse = typeof userMessage === 'string' && /\b(bookings?|quotations?)\b/i.test(userMessage);
+  const totalDistinct = distinctRecordCount(allRows, forceCollapse);
+  if (totalDistinct === null) {
     return `\n\nThe JSON above contains exactly ${sampleRows.length} row(s)${allRows.length > sampleRows.length ? ` out of ${allRows.length} total — state the true total of ${allRows.length}` : ''}. Do not repeat a row.`;
   }
 
-  if (shownDistinct < totalDistinct) {
-    return `\n\nCOUNTS: the query matched ${totalDistinct} distinct booking(s)/quotation(s) in total, but only ${shownDistinct} of them are included above. Your answer MUST state the true total of ${totalDistinct}, show the ${shownDistinct} included as a sample in exactly ${shownDistinct} data row(s), and say that more exist. NEVER report ${shownDistinct} as the total.`;
+  if (expectedRows < totalDistinct) {
+    return `\n\nCOUNTS: the query matched ${totalDistinct} distinct booking(s)/quotation(s) in total, but only ${expectedRows} of them are included above. Your answer MUST state the true total of ${totalDistinct}, show the ${expectedRows} included as a sample in exactly ${expectedRows} data row(s), and say that more exist. NEVER report ${expectedRows} as the total.`;
   }
 
   if (totalDistinct < allRows.length) {
@@ -439,11 +608,107 @@ function rowCountRule(sampleRows, allRows) {
   return `\n\nCOUNTS: there are exactly ${totalDistinct} record(s). State that total and give exactly ${totalDistinct} data row(s), each listed once, then stop.`;
 }
 
+// Deterministic post-hoc guard for the two documented answerer failure modes: (1) claiming to show
+// N rows but the actual markdown table has fewer/more, (2) never stating (or misstating) the true
+// total even though it was handed the exact number via rowCountRule's COUNTS note. Both are pure
+// LLM instruction-following slips, not data problems - so rather than trust the prose on faith, this
+// checks it against the numbers already computed deterministically above and, if wrong, the caller
+// gets ONE retry with an explicit correction (mirrors the existing SQL-error retry pattern). Assumes
+// a single markdown table in the whole answer, which holds for the MULTI-RECORD LIST format this is
+// meant to catch - not used for single-booking "DETAILS" answers, which use a different layout.
+function countMarkdownTableDataRows(text) {
+  const pipeLines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('|') && l.endsWith('|'));
+  if (pipeLines.length < 2) return 0;
+  const isSeparatorRow = (l) => /^\|[\s:|-]+\|$/.test(l);
+  let dataRows = 0;
+  let sawHeader = false;
+  let sawSeparator = false;
+  for (const line of pipeLines) {
+    if (!sawHeader) {
+      sawHeader = true;
+      continue;
+    }
+    if (!sawSeparator && isSeparatorRow(line)) {
+      sawSeparator = true;
+      continue;
+    }
+    dataRows++;
+  }
+  return dataRows;
+}
+
+function answerStatesTotal(text, total) {
+  const numbers = (text.match(/\d[\d,]*/g) || []).map((s) => parseInt(s.replace(/,/g, ''), 10));
+  return numbers.includes(total);
+}
+
+// Deterministic last resort when even the corrective retry (see its own call site's comment) still
+// doesn't state the true total - a wrong TOTAL is a worse failure than a short/wrong sample, so this
+// is never left to chance a second time. Patches only the SAME "Found <number>" opening the
+// answerer's own prompt rule always asks for (rowCountRule's "Open with the count, e.g. 'Found 3
+// bookings...'"), so it can only ever correct that one number, never touch anything else in the
+// prose. Leaves the text untouched if that exact opening pattern isn't found, rather than guess at
+// some other number to overwrite.
+function correctStatedTotal(answer, expectedTotal) {
+  const re = /(\bFound\s+\*{0,2})\d[\d,]*/i;
+  return re.test(answer) ? answer.replace(re, (_m, prefix) => `${prefix}${expectedTotal}`) : answer;
+}
+
 function pushTurn(sessionId, userText, assistantText) {
   const session = getSession(sessionId);
   session.history.push({ role: 'user', content: userText });
   session.history.push({ role: 'assistant', content: compactForHistory(assistantText) });
   while (session.history.length > MAX_TURNS * 2) session.history.shift();
+}
+
+// Shared by both routes into a company-wide finance answer: the fast regex match
+// (financeReports.detectFinanceReportIntent, wording-exact) and the semantic fallback parsed out of
+// the Understand step's own "FINANCE:" line (paraphrase-proof, catches wording the regex doesn't -
+// see understandSystemPrompt's own comment for why this exists: "how much money is still due from
+// customers" didn't match the regex, fell through to the general SQL planner, and got a materially
+// wrong ₹0 answer from querying the empty ReceivableMaster table instead of the real formula this
+// function always uses). Both routes end up running the exact same hardcoded calculation - only how
+// the *intent* got recognized differs, never how the number itself gets computed. Returns null (never
+// a reply) if the role lacks Account Report access, in which case the caller must send that message.
+async function dispatchFinanceIntent(sessionId, session, userMessage, financeIntent) {
+  const financePerm = requirePermission(session.role, 'Account Report', 'view');
+  if (!financePerm.allowed) {
+    pushTurn(sessionId, userMessage, financePerm.message);
+    return { answer: financePerm.message, sql: null, rowCount: 0 };
+  }
+  if (financeIntent.kind === 'income') {
+    const result = await financeReports.fetchIncomeReport(financeIntent.period);
+    const reply = financeReports.formatIncomeAnswer(result);
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (financeIntent.kind === 'paymentReceived') {
+    const result = await financeReports.fetchPaymentReceivedReport(financeIntent.period);
+    const reply = financeReports.formatPaymentReceivedAnswer(result);
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: result.byCurrency.length, rows: result.byCurrency.length ? result.byCurrency : undefined };
+  }
+  if (financeIntent.kind === 'receivable') {
+    const result = await financeReports.fetchReceivableReport();
+    const reply = financeReports.formatReceivableAnswer(result);
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  if (financeIntent.kind === 'profit') {
+    const result = await financeReports.fetchIncomeReport(financeIntent.period);
+    const reply = financeReports.formatProfitAnswer(result);
+    pushTurn(sessionId, userMessage, reply);
+    return { answer: reply, sql: null, rowCount: 0 };
+  }
+  // 'summary' - the catch-all for any other finance/account-shaped question (total purchase,
+  // expenses, net balance, ...) that isn't one of the three specific formats above.
+  const result = await financeReports.fetchAccountSummary(financeIntent.period);
+  const reply = financeReports.formatAccountSummaryAnswer(result);
+  pushTurn(sessionId, userMessage, reply);
+  return { answer: reply, sql: null, rowCount: 0 };
 }
 
 function todayIST() {
@@ -490,6 +755,42 @@ function extractSql(text) {
   return null;
 }
 
+const FINANCE_KINDS = ['income', 'receivable', 'profit', 'paymentReceived'];
+
+// Parses the Understand step's reply (understandSystemPrompt's required "TABLES: ..." / "FINANCE:
+// ..." first two lines, plus the plan text after them). Table names are matched case-insensitively
+// against the real TABLE_NAMES list and normalized to their exact casing, so a minor casing slip
+// from the model still resolves correctly; anything that doesn't match a real table name is
+// silently dropped rather than passed through (buildSchemaDoc's own fallback-to-everything then
+// kicks in if that leaves zero valid names). financeKind is matched the same way against
+// FINANCE_KINDS, case-insensitively; anything else (including "none") becomes null. If the model
+// didn't follow the "TABLES:" format at all, fail safe: treat the whole reply as a real plan needing
+// the full schema (tableNames: [], financeKind: null) rather than silently skipping the DB lookup -
+// a wrongly-skipped query is a much worse failure than an oversized one.
+function parseUnderstanding(understanding) {
+  const text = understanding.trim();
+  const match = text.match(/^\s*TABLES:\s*(.+?)\s*(?:\n|$)/i);
+  if (!match) return { hasPlan: true, tableNames: [], financeKind: null, plan: text };
+
+  const tablesRaw = match[1].trim();
+  const isNone = /^none$/i.test(tablesRaw);
+  const tableNames = isNone
+    ? []
+    : tablesRaw
+        .split(',')
+        .map((t) => t.trim())
+        .map((t) => TABLE_NAMES.find((n) => n.toLowerCase() === t.toLowerCase()))
+        .filter(Boolean);
+
+  let rest = text.slice(match[0].length);
+  const financeMatch = rest.match(/^\s*FINANCE:\s*(.+?)\s*(?:\n|$)/i);
+  const financeRaw = financeMatch ? financeMatch[1].trim() : '';
+  const financeKind = financeMatch ? FINANCE_KINDS.find((k) => k.toLowerCase() === financeRaw.toLowerCase()) || null : null;
+  if (financeMatch) rest = rest.slice(financeMatch[0].length);
+
+  return { hasPlan: !isNone, tableNames, financeKind, plan: rest.trim() };
+}
+
 // Runs BEFORE any SQL is written - asks the model to restate what the question is actually asking
 // for, grounded in the real schema (which table(s), which columns, which filters, how tables relate
 // if a join is needed), instead of jumping straight from question to query in one shot. Genuinely
@@ -499,32 +800,52 @@ function extractSql(text) {
 // already juggled across several models/keys (see llm.js) specifically because of that added load,
 // so this is deliberately only used for the read-only Q&A path, not the booking-creation/status
 // flows, which stay single-call and deterministic.
+// Reads only the compact TABLE_OVERVIEW (table name + one-line summary), not the full per-table
+// detail - the Planner step (below) needs the full detail, but this step only needs to know which
+// tables are RELEVANT, and asking it to also decide that up front lets the Planner get away with
+// full detail for just those tables instead of all 29 (see schema.js's own comment on why - request
+// size was creeping past the smallest fallback model's own token budget).
+//
+// TRIED AND REVERTED: merging this + the Planner below into a single call (with a medium-detail,
+// all-tables-always schema instead) was tested live and made things WORSE, not better - measured
+// ~6,185 tokens on a clean run (barely different from this two-call path's ~6,082) and up to
+// ~11,138 tokens when the merged call's leaner schema caused a first-attempt SQL error needing a
+// retry (reproduced live: "show bookings for agent Blue Star Travel and Tourism" hallucinated a
+// nonexistent bm.TotalAmount column 2 times out of 3 identical attempts). Keep the two-call design.
 function understandSystemPrompt() {
   return `You are FlyThai's internal database assistant. Before any SQL gets written, restate what this question is actually asking for, in concrete terms grounded in the real schema below - which table(s), which columns, which filters (dates, statuses, IDs, names), and how multiple tables relate if a join is needed. If the question is ambiguous, state the most reasonable interpretation and any assumption you're making explicit (e.g. "this month" -> the current calendar month, "top agents" -> ranked by count of their bookings).
 Today's date is ${todayIST()} and the current time is ${nowTimeIST()} (Asia/Kolkata timezone).
 
-DATABASE SCHEMA:
-${SCHEMA_DOC}
+DATABASE SCHEMA (table names and what each one holds - NOT full column/rule detail, that comes later for whichever tables you pick):
+${buildTableOverview()}
 
-Reply with a short plain-text plan only (3-6 lines) - table(s)/columns/filters/joins needed and why. Do NOT write SQL here. If the message is a greeting, thanks, or general chit-chat that clearly needs no DB lookup, reply with exactly: NONE`;
+Reply in exactly this shape:
+Line 1: TABLES: <comma-separated list of table names from the list above that this question needs - EVERY table any join/filter/column touches, not just the main one. When in doubt, include a table rather than leave it out - a missing table is a much worse failure than one extra. If the message is a greeting/thanks/chit-chat needing no DB lookup, this line must be exactly: TABLES: NONE
+Line 2: FINANCE: <income|receivable|profit|paymentReceived|none> - classifies ONLY a question asking for ONE company-wide TOTAL NUMBER, using what the question MEANS, not its exact wording (paraphrases must still classify correctly). A question asking to LIST/SHOW individual records (bookings, quotations, invoices, ...) - even ones about money or payment status - is NEVER one of these, always "none": it needs actual rows back (booking codes, guest names, ...), which none of these four give you, they only give one summary number. So is a specific booking/quotation's OWN payment status (question names an FT/FTQ code). Ask yourself: "does answering this need a single total, or a list of records?" - only the first is ever income/receivable/profit/paymentReceived. ALSO always "none" if the question scopes the number to one specific hotel/agent/vendor/account by name (e.g. "Grand Mercure Bangkok Atrium ka is saal ka hisaab kitna hai", "what's ABC Travels' balance this year") - these four kinds only ever compute a COMPANY-WIDE total with no per-entity filter, so routing a named-entity question through them silently drops the name and answers with the wrong (whole-company) number. A named-entity balance/account question needs its own query against that entity, which only the table-selection plan below can do - never one of these four.
+  - receivable: ONE total figure for money still owed TO the company BY customers, right now (never period-scoped) - e.g. "how much is due/pending/outstanding from customers", "what do customers still owe us in total", "kitna paisa lena baki hai". NOT "which quotations/bookings are pending payment" (that's a list of records - "none", handled by the tables above) even though it shares the word "pending". Reproduced live: (1) "how much money is still due from customers" was missed by an earlier exact-phrase-only check and got a wrong ₹0 answer from a general query that picked an unrelated, empty table - classify the MEANING, not the literal words; (2) "which quotations are still pending payment" was wrongly classified as receivable and answered with the company-wide total instead of the list of quotations the user actually asked for - watch for this "list vs total" distinction specifically.
+  - income: ONE total sale/revenue figure for a period (this month, last quarter, all time, ...).
+  - profit: the same total as income, just asked about using the word "profit"/"munafa"/"margin".
+  - paymentReceived: ONE total for money ALREADY collected (payments/receipts that came in) for a period - the opposite of receivable.
+  - none: anything else, including any list of records (even money-related ones) and any single booking's own details/status/payment.
+Then (skip entirely if TABLES: NONE): a short plain-text plan (3-6 lines) - table(s)/columns/filters/joins needed and why. Do NOT write SQL here.`;
 }
 
-function plannerSystemPrompt() {
+function plannerSystemPrompt(tableNames) {
   return `You are FlyThai's internal database assistant, used by travel-agency staff to look up quotations, bookings, hotels, job sheets, accounts, agents and inquiries.
 You must answer ONLY using real data fetched from the company's live SQL Server database. Never invent, guess, or assume data that isn't returned by a query.
 Today's date is ${todayIST()} and the current time is ${nowTimeIST()} (Asia/Kolkata timezone).
 
 DATABASE SCHEMA:
-${SCHEMA_DOC}
+${buildSchemaDoc(tableNames)}
 
 For every user message decide one of two things:
-1. If answering needs database data, reply with ONLY a single read-only T-SQL SELECT statement, wrapped exactly like this and nothing else (no explanation):
+1. If answering needs database data, reply with ONLY a single read-only T-SQL SELECT statement, wrapped exactly like this and NOTHING else - no explanation, no reasoning, no SQL comments (--), no earlier/alternative attempt you considered and rejected, not even as a "-- note:" aside. Work out which table/join/column is right BEFORE writing the code block, then write ONLY the one final, already-correct query inside it:
 \`\`\`sql
 SELECT ...
 \`\`\`
 2. If the message is a greeting, thanks, or general chit-chat that clearly needs no DB lookup, reply with a short plain-text reply (no SQL block).
 
-Rules: exactly one statement, must start with SELECT or WITH, never INSERT/UPDATE/DELETE/DROP/ALTER/EXEC/MERGE/TRUNCATE. Always filter soft-deleted rows (IsDelete=0 / IsDeleted=0) unless the user explicitly asks for deleted records.
+Rules: exactly one statement, must start with SELECT or WITH, never INSERT/UPDATE/DELETE/DROP/ALTER/EXEC/MERGE/TRUNCATE. Always filter soft-deleted rows (IsDelete=0 / IsDeleted=0) unless the user explicitly asks for deleted records. Reproduced live: a reply once worked through its own uncertainty about a table relationship as "--" comments directly inside the SQL code block, including an earlier wrong attempt at the query - the database ran that whole block as written, including the wrong first statement, not just the corrected one at the end.
 (Note: requests to create a new booking, or to change a booking's Travel/Invoice/Voucher/Itinerary/Payment status, are handled by separate flows before this prompt ever runs — you will not see those here.)
 CRITICAL: you have NO ability to write/update/change anything in the database or anywhere else from this point in the code. If a message reaches you asking to change/update/set/mark/create something and it wasn't intercepted before this prompt, that means it could NOT be handled automatically (e.g. the booking code was unclear). NEVER reply claiming you made a change, updated a status, or saved anything — that would be false. Instead reply honestly that you can't perform updates from here, and ask for the exact booking code so it can be handled correctly (e.g. "change payment status of FT07261782 to done").`;
 }
@@ -565,10 +886,11 @@ function answererSystemPrompt() {
   return `You are FlyThai's internal database assistant. You previously ran a SQL query against the live database to answer the staff member's question. Using ONLY the JSON data provided (never invent anything beyond it), write a clear, helpful answer.
 - Always reply in English, regardless of what language the question was asked in.
 - If there are multiple records, use a compact markdown table.
-- If there are more than ~15 records, do NOT dump every row into the table. Instead give the total count, any useful summary/breakdown, and show only the first 10-15 rows as a sample, mentioning that more exist.
+- If there are more than ~15 records, do NOT dump every row into the table. Instead give the total count, any useful summary/breakdown, and show only the first 10-15 rows as a sample, mentioning that more exist. (If a COUNTS note is appended after the data, it tells you the EXACT true total and EXACT number of sample rows to show — follow that number instead of picking your own 10-15.)
 
 MULTI-RECORD LIST ANSWERS — read this before writing any table with more than one data row:
-- The JSON you are given is the complete, already-deduplicated result. Write EXACTLY ONE table row per record in it. If the JSON holds 3 records, the table has exactly 3 data rows — no more, ever.
+- The JSON you are given is ALREADY the correct, complete answer to the question — every row in it already matches whatever the user asked for (including any date/period). NEVER re-filter, re-check, or drop rows of your own accord based on a column that looks like it doesn't match (e.g. a TravelDate outside the period named) — the row may have matched on a different date column (e.g. CreatedOn) that is exactly what the question meant, even if that reasoning isn't visible to you. When told to show only a sample, take a plain prefix of the array in the order given — never a re-filtered subset. Reproduced live: "booking done by priya in july" correctly matched 25 rows by CreatedOn, but the answer wrongly kept only the 6 whose TravelDate also fell in July and reported that as the total.
+- Write EXACTLY ONE table row per record in it. If the JSON holds 3 records, the table has exactly 3 data rows — no more, ever.
 - NEVER repeat a record. Two rows with the same Booking/Quotation ID is USUALLY a mistake — UNLESS the COUNTS note appended after the JSON explicitly says the total is a count of distinct records rather than distinct bookings (this happens for child-level data like job sheets, transactions, or payments, where a booking can genuinely have several of its own). In that case each row is its own real record and must get its own table row — do not merge them.
 - Otherwise (no such COUNTS override), if several JSON rows share the same Booking/Quotation ID, they are ONE booking that a join has split across rows (e.g. one row per destination or per hotel). Merge them into a single table row — combining the differing values into one cell where useful (e.g. "Bangkok, Pattaya") — never list that booking twice.
 - Open with the count, e.g. "Found 3 bookings travelling on 02-Aug-2026:", then the table.
@@ -3001,40 +3323,8 @@ async function handleChatInner(sessionId, userMessage) {
     }
   }
   if (financeIntent) {
-    const financePerm = requirePermission(session.role, 'Account Report', 'view');
-    if (!financePerm.allowed) {
-      pushTurn(sessionId, userMessage, financePerm.message);
-      return { answer: financePerm.message, sql: null, rowCount: 0 };
-    }
-    if (financeIntent.kind === 'income') {
-      const result = await financeReports.fetchIncomeReport(financeIntent.period);
-      const reply = financeReports.formatIncomeAnswer(result);
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
-    }
-    if (financeIntent.kind === 'paymentReceived') {
-      const result = await financeReports.fetchPaymentReceivedReport(financeIntent.period);
-      const reply = financeReports.formatPaymentReceivedAnswer(result);
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: result.byCurrency.length, rows: result.byCurrency.length ? result.byCurrency : undefined };
-    }
-    if (financeIntent.kind === 'receivable') {
-      const result = await financeReports.fetchReceivableReport();
-      const reply = financeReports.formatReceivableAnswer(result);
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
-    }
-    if (financeIntent.kind === 'profitUnsupported') {
-      const reply = financeReports.formatProfitUnsupportedAnswer();
-      pushTurn(sessionId, userMessage, reply);
-      return { answer: reply, sql: null, rowCount: 0 };
-    }
-    // 'summary' - the catch-all for any other finance/account-shaped question (total purchase,
-    // expenses, net balance, ...) that isn't one of the three specific formats above.
-    const result = await financeReports.fetchAccountSummary(financeIntent.period);
-    const reply = financeReports.formatAccountSummaryAnswer(result);
-    pushTurn(sessionId, userMessage, reply);
-    return { answer: reply, sql: null, rowCount: 0 };
+    const dispatched = await dispatchFinanceIntent(sessionId, session, userMessage, financeIntent);
+    if (dispatched) return dispatched;
   }
 
   // A request for a booking's ledger/account transactions - handled deterministically end to end
@@ -3095,36 +3385,41 @@ async function handleChatInner(sessionId, userMessage) {
 
   // Understand-then-query: figure out what's actually needed before ever attempting SQL (see
   // understandSystemPrompt's own comment for why). Same conversation history as the planner gets,
-  // so a follow-up ("and for last week?") is understood in context too. A plain "NONE" (chit-chat,
-  // no DB lookup) is passed through unchanged - the planner below still makes that call itself, this
-  // just saves folding a useless plan into its prompt.
+  // so a follow-up ("and for last week?") is understood in context too.
   const understandMessages = [
     { role: 'system', content: understandSystemPrompt() },
     ...session.history,
     { role: 'user', content: userMessage },
   ];
-  // FAST_STRUCTURED_MODEL: the understand and initial-SQL steps are structured/mechanical (restate
-  // intent against a known schema, then translate an already-worked-out plan into SQL syntax) - a
-  // small fast model handles that reliably, and by the time SQL gets written the hard reasoning
-  // (what does this question actually need) has already been done by the understand step. The
-  // default GROQ_MODEL stays on for the SQL-repair retry below and the final answerer call, so a
-  // wrong query still gets corrected by the more capable model, and the actual prose the user reads
-  // is never written by the fast model - this is a latency optimization, not an accuracy trade.
-  const FAST_STRUCTURED_MODEL = 'llama-3.1-8b-instant';
+  // Understand and planner both use the default model (GROQ_MODEL, falling back through
+  // FALLBACK_MODELS the same way the answerer call does) instead of a smaller fast model, so the
+  // schema reasoning and SQL it writes get the full model's accuracy, not just the final prose.
+  const understanding = await callLLM(understandMessages);
+  const { hasPlan, tableNames, financeKind, plan } = parseUnderstanding(understanding);
 
-  const understanding = await callLLM(understandMessages, { model: FAST_STRUCTURED_MODEL });
-  const hasPlan = !/^\s*none\s*$/i.test(understanding.trim());
+  // Semantic fallback for the same company-wide finance intents the regex check above already
+  // covers (financeReports.detectFinanceReportIntent) - catches paraphrases the exact-wording regex
+  // missed (see understandSystemPrompt's own "FINANCE:" instructions for why this exists), while
+  // still running through the exact same dispatchFinanceIntent/hardcoded-formula path, never the
+  // general SQL planner below. Skipped whenever the regex already matched (financeIntent truthy up
+  // above already returned) or the message names a specific FT/FTQ code (a single booking's own
+  // finances, not a company-wide question - same exclusion the regex path applies).
+  if (financeKind && !ANY_CODE_RE.test(userMessage)) {
+    const period = financeKind === 'receivable' ? null : financeReports.parsePeriod(userMessage);
+    const dispatched = await dispatchFinanceIntent(sessionId, session, userMessage, { kind: financeKind, period });
+    if (dispatched) return dispatched;
+  }
 
   const plannerMessages = [
-    { role: 'system', content: plannerSystemPrompt() },
+    { role: 'system', content: plannerSystemPrompt(tableNames) },
     ...session.history,
     {
       role: 'user',
-      content: hasPlan ? `${userMessage}\n\n(Internal plan of what's needed, already worked out - use this to write accurate SQL: ${understanding.trim()})` : userMessage,
+      content: hasPlan ? `${userMessage}\n\n(Internal plan of what's needed, already worked out - use this to write accurate SQL: ${plan})` : userMessage,
     },
   ];
 
-  let plannerReply = await callLLM(plannerMessages, { model: FAST_STRUCTURED_MODEL });
+  let plannerReply = await callLLM(plannerMessages);
   let sql = extractSql(plannerReply);
 
   if (!sql) {
@@ -3169,15 +3464,19 @@ async function handleChatInner(sessionId, userMessage) {
   for (let attempt = 0; attempt < 2 && !queryResult; attempt++) {
     try {
       // Fetch a generous number of rows so the UI's "Show more" table has real data to expand into,
-      // but only a small sample of that goes into the LLM prompt below (see SAMPLE_ROWS_FOR_LLM) -
-      // Groq's free tier has a tokens-per-minute limit, so we keep what we send the model small.
+      // and so the counting heuristics below see as much real data as possible (see
+      // raiseTopToAppCap's own comment for why that matters) - but only a small sample of that goes
+      // into the LLM prompt below (see SAMPLE_ROWS_FOR_LLM), since Groq's free tier has a
+      // tokens-per-minute limit and we keep what we send the model small.
+      sql = raiseTopToAppCap(sql, 300);
       queryResult = await runReadOnlyQuery(sql, 300);
     } catch (err) {
       lastError = err;
+      console.log(`[sql retry] attempt=${attempt} error=${err.message} sql=${sql.slice(0, 300)}`);
       if (attempt === 0) {
         // give the model one chance to fix its query
         const fixReply = await callLLM([
-          { role: 'system', content: plannerSystemPrompt() },
+          { role: 'system', content: plannerSystemPrompt(tableNames) },
           { role: 'user', content: userMessage },
           { role: 'assistant', content: plannerReply },
           { role: 'user', content: `That query failed with this database error: "${err.message}". Please reply with ONLY a corrected single SELECT query in a \`\`\`sql code block.` },
@@ -3213,8 +3512,61 @@ async function handleChatInner(sessionId, userMessage) {
     rowCount: queryResult.truncated ? queryResult.rowCount : dedupedRows.length,
   };
 
+  // See buildCountVariant's own comment - a small "TOP N" in the planner's own SQL can silently hide
+  // far more real matches than got fetched, with no other signal catching it. Best-effort: if the
+  // rewritten COUNT(*) query fails for any reason (SQL this rewrite couldn't handle safely), fall
+  // back to whatever was already fetched rather than let this break the main answer.
+  const countVariantSql = buildCountVariant(sql);
+  if (countVariantSql) {
+    try {
+      const countResult = await runReadOnlyQuery(countVariantSql, 1);
+      const trueTotal = countResult.rows[0] && Number(Object.values(countResult.rows[0])[0]);
+      if (Number.isFinite(trueTotal) && trueTotal > queryResult.rows.length) {
+        queryResult = { ...queryResult, rowCount: trueTotal, truncated: true };
+      }
+    } catch (err) {
+      // Best-effort only - proceed with the count already derived from the fetched rows.
+    }
+  }
+
+  // The user asked specifically about "booking(s)" or "quotation(s)" (not both), the SQL had no
+  // explicit IsBooking filter to scope it (isBookingFilter, computed above for the permission
+  // check), and the actual result mixes both types in anyway - rather than spend an answerer call
+  // presenting that mix as if it were a clean answer to "bookings", ask which the user actually
+  // wants. Deliberately checked only against the real result (not just "no filter"), so an
+  // unfiltered query whose data happens to be all one type never triggers an unnecessary prompt.
+  const mentionsBooking = /\bbookings?\b/i.test(userMessage);
+  const mentionsQuotation = /\bquotations?\b/i.test(userMessage);
+  if (mentionsBooking !== mentionsQuotation && !isBookingFilter && detectMixedBookingQuotation(queryResult.rows)) {
+    const wanted = mentionsBooking ? 'confirmed bookings' : 'quotations';
+    const other = mentionsBooking ? 'quotations' : 'confirmed bookings';
+    const reply = `You asked about **${wanted}**, but BookingMaster holds both confirmed bookings and quotations together, and this result actually mixes in some ${other} too. Could you confirm — do you want just ${wanted}, just ${other}, or both?`;
+    pushTurn(sessionId, userMessage, reply);
+    // Tap-to-answer chips instead of asking the user to retype the whole question - the picked
+    // chip's value is sent as the next message and resolved using the ORIGINAL question from
+    // session.history (same "follow-up in context" handling every other short reply already gets,
+    // e.g. "and its payment status?"), so the planner sees both the original question and this
+    // narrowing answer together next turn.
+    return {
+      answer: reply,
+      sql,
+      rowCount: queryResult.rowCount,
+      quickReplies: [
+        { label: `Just ${wanted}`, value: `just ${wanted}, not ${other}`, autoSend: true },
+        { label: `Just ${other}`, value: `just ${other}, not ${wanted}`, autoSend: true },
+        { label: 'Both', value: `both ${wanted} and ${other}`, autoSend: true },
+      ],
+    };
+  }
+
   const SAMPLE_ROWS_FOR_LLM = 20;
-  const sampleRows = buildSample(queryResult.rows, SAMPLE_ROWS_FOR_LLM);
+  // Stripped the same way the client-facing rows are (stripInternalIdColumn) - Fix A's own schema.js
+  // rule has the planner select a raw, unaliased internal Id purely so genuinely-different records
+  // don't look byte-identical to dedupeExactRows/distinctRecordCount; it must never reach the
+  // model's own prose, or it risks being mislabeled the way JobSheetMaster.Id once was (see the
+  // "MUST JOIN BookingMaster" rule in schema.js). dedup/counting above already ran on the
+  // unstripped rows, so this only affects what the answerer itself sees.
+  const sampleRows = buildSample(stripInternalIdColumn(queryResult.rows), SAMPLE_ROWS_FOR_LLM);
 
   // The old wording ("N row(s) total, only the first M are shown") described raw rows, which after
   // a join fan-out is not the number of bookings and contradicted the counting rule appended
@@ -3223,10 +3575,36 @@ async function handleChatInner(sessionId, userMessage) {
     { role: 'system', content: answererSystemPrompt() },
     {
       role: 'user',
-      content: `User's question: ${userMessage}\n\nQuery result rows:\n${JSON.stringify(sampleRows)}${rowCountRule(sampleRows, queryResult.rows)}`,
+      content: `User's question: ${userMessage}\n\nQuery result rows:\n${JSON.stringify(sampleRows)}${rowCountRule(sampleRows, queryResult.rows, queryResult.rowCount, userMessage)}`,
     },
   ];
-  const answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
+  let answer = dedupeMarkdownTableRows(await callLLM(answererMessages, { temperature: 0.2 }));
+
+  // Verify the two documented answerer failure modes deterministically (countMarkdownTableDataRows/
+  // answerStatesTotal's own comment) - reproduced live twice: a "137 total" question answered "136",
+  // and a "20 of 50" instruction was followed by a table with only 4 rows. Only checked for
+  // multi-record list answers (sampleRows.length > 1) - a single-booking "DETAILS" answer uses a
+  // different layout this check isn't meant for. One corrective retry only, same bound as the
+  // existing SQL-error retry above - if the model still gets it wrong twice, ship what it produced
+  // rather than loop.
+  if (sampleRows.length > 1) {
+    const { total: expectedTotal, expectedRows } = computeExpectedCounts(sampleRows, queryResult.rows, queryResult.rowCount, userMessage);
+    const actualRows = countMarkdownTableDataRows(answer);
+    if (actualRows !== expectedRows || !answerStatesTotal(answer, expectedTotal)) {
+      const correction = `Your answer above is wrong about the counts - it showed ${actualRows} table row(s) and ${answerStatesTotal(answer, expectedTotal) ? 'did state' : 'did NOT clearly state'} the true total of ${expectedTotal}. Rewrite the COMPLETE answer from scratch, using ONLY the data already given above (never invent rows): show EXACTLY ${expectedRows} data row(s) in the table (no more, no fewer, no repeats), and clearly state the true total as ${expectedTotal}.`;
+      const retryMessages = [...answererMessages, { role: 'assistant', content: answer }, { role: 'user', content: correction }];
+      answer = dedupeMarkdownTableRows(await callLLM(retryMessages, { temperature: 0.2 }));
+    }
+    // Last-resort deterministic fix if even the retry above still doesn't state the true total -
+    // reproduced live: "which bookings have extra bed added" retried once and still opened with
+    // "Found 44" (the true total was 98) - a wrong TOTAL is a worse failure than a short sample, so
+    // this never just ships it. Patches the SAME "Found <number>" opening the answerer's own prompt
+    // rule always asks for (rowCountRule's "Open with the count, e.g. 'Found 3 bookings...'"), so
+    // this only ever corrects that one opening number, never touches anything else in the prose.
+    if (!answerStatesTotal(answer, expectedTotal)) {
+      answer = correctStatedTotal(answer, expectedTotal);
+    }
+  }
 
   pushTurn(sessionId, userMessage, answer);
   return {
